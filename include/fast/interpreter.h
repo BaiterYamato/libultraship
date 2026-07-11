@@ -229,6 +229,12 @@ struct RawTexMetadata {
     std::string sourcePath;
 };
 
+struct ShaderMod {
+    bool enabled = false;
+    int16_t id;
+    uint8_t type;
+};
+
 #define MAX_LIGHTS 32
 #define MAX_VERTICES 64
 
