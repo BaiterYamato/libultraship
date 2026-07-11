@@ -44,10 +44,11 @@ struct ShaderProgram {
 struct FramebufferOGL {
     uint32_t width, height;
     bool has_depth_buffer;
+    bool can_extract_depth;
     uint32_t msaa_level;
     bool invertY;
 
-    GLuint fbo, clrbuf, clrbufMsaa, rbo;
+    GLuint fbo, clrbuf, clrbufMsaa, rbo, depthTex;
 };
 
 struct TextureInfo {
@@ -82,6 +83,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void Init() override;
     void OnResize() override;
     void StartFrame() override;
+    void ApplyAmbientOcclusion() override;
+    void ApplyVolumetrics() override;
     void EndFrame() override;
     void FinishRender() override;
     int CreateFramebuffer() override;
@@ -104,11 +107,23 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool IsAmbientOcclusionSupported() const override;
+    int32_t GetAmbientOcclusionFallbackCode() const override;
+    void ClearAmbientOcclusionFallbackCode() override;
+    bool IsVolumetricsSupported() const override;
+    int32_t GetVolumetricsFallbackCode() const override;
+    void ClearVolumetricsFallbackCode() override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
+    bool EnsureAmbientOcclusionResources(uint32_t width, uint32_t height);
+    bool EnsureAmbientOcclusionPrograms();
+    void CleanupAmbientOcclusionResources();
+    bool EnsureVolumetricsResources(uint32_t fullWidth, uint32_t fullHeight);
+    bool EnsureVolumetricsPrograms();
+    void CleanupVolumetricsResources();
 
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
@@ -138,6 +153,34 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+    struct AmbientOcclusionResources {
+        GLuint aoProgram = 0;
+        GLuint blurProgram = 0;
+        GLuint compositeProgram = 0;
+        GLuint aoTexture = 0;
+        GLuint blurTexture = 0;
+        GLuint aoFbo = 0;
+        GLuint blurFbo = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        int32_t fallbackCode = 0;
+    } mAmbientOcclusion;
+
+    struct VolumetricsResources {
+        GLuint raymarchProgram = 0;
+        GLuint compositeProgram = 0;
+        GLuint volumeTextures[2] = { 0, 0 };
+        GLuint depthTextures[2] = { 0, 0 };
+        GLuint fbos[2] = { 0, 0 };
+        uint32_t fullWidth = 0;
+        uint32_t fullHeight = 0;
+        uint32_t lowWidth = 0;
+        uint32_t lowHeight = 0;
+        uint8_t historyIndex = 0;
+        bool historyValid = false;
+        int32_t fallbackCode = 0;
+    } mVolumetrics;
 };
 
 } // namespace Fast

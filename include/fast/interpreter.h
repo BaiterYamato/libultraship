@@ -226,6 +226,7 @@ struct RawTexMetadata {
     float h_byte_scale = 1, v_pixel_scale = 1;
     std::shared_ptr<Fast::Texture> resource;
     Fast::TextureType type;
+    std::string sourcePath;
 };
 
 #define MAX_LIGHTS 32
@@ -562,3 +563,31 @@ extern "C" void gfx_texture_cache_clear();
 extern "C" void gfx_shader_cache_clear();
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize, bool forceFixedAspect = false);
+extern "C" void gfx_set_force_depth_aware_fog(uint8_t enabled);
+extern "C" void gfx_set_ambient_occlusion_enabled(uint8_t enabled);
+extern "C" void gfx_set_ambient_occlusion_debug_view(uint8_t enabled);
+extern "C" void gfx_set_ambient_occlusion_config(float radius, float intensity, float bias, float power, float maxDistance,
+                                                 int32_t blurPasses, uint8_t quality);
+extern "C" int32_t gfx_get_ambient_occlusion_fallback_reason();
+extern "C" void gfx_clear_ambient_occlusion_fallback_reason();
+extern "C" void gfx_set_volumetrics_enabled(uint8_t enabled);
+extern "C" void gfx_set_volumetrics_debug_view(uint8_t enabled);
+extern "C" void gfx_set_volumetrics_debug_mode(uint8_t mode);
+extern "C" void gfx_set_volumetrics_appearance(float colorR, float colorG, float colorB, float ambientIntensity);
+extern "C" void gfx_set_volumetrics_config(float density, float anisotropy, float startDistance, float maxDistance,
+                                           uint8_t quality, uint8_t shadowQuality, float baseHeight, float heightFalloff,
+                                           uint8_t performanceMode, uint8_t heightFogEnabled, float lightShaftIntensity, float shadowIntensity,
+                                           float temporalBlend, float jitterScale, float aerialPerspectiveStrength,
+                                           float macroNoiseStrength, float valleyFogStrength, float edgeHazeStrength,
+                                           float depthExtinctionStrength, float depthExtinctionExponent,
+                                           float horizonFogStrength, float skyFallbackStrength,
+                                           float directionalShadowBias, float directionalShadowNormalBias,
+                                           float directionalShadowSoftness, uint8_t maxShadowedLights,
+                                           uint8_t resetHistory);
+extern "C" void gfx_set_volumetrics_camera(const float* currentViewProjection, const float* inverseViewProjection,
+                                           const float* previousViewProjection, float cameraX, float cameraY,
+                                           float cameraZ, float nearPlane, float farPlane);
+extern "C" void gfx_set_volumetric_lights(const Fast::GfxVolumetricLight* lights, size_t count);
+extern "C" int32_t gfx_get_volumetrics_fallback_reason();
+extern "C" void gfx_clear_volumetrics_fallback_reason();
+extern "C" void gfx_get_volumetrics_runtime_stats(Fast::GfxVolumetricsRuntimeStats* outStats);

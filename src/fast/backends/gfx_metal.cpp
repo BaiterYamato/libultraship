@@ -574,6 +574,42 @@ void GfxRenderingAPIMetal::StartFrame() {
     mFrameAutoreleasePool = NS::AutoreleasePool::alloc()->init();
 }
 
+void GfxRenderingAPIMetal::ApplyAmbientOcclusion() {
+    if (mAmbientOcclusionConfig.enabled && mAmbientOcclusionConfig.quality > 0) {
+        mAmbientOcclusionFallbackCode = 1; // AO_BACKEND_UNSUPPORTED_METAL
+    }
+}
+
+bool GfxRenderingAPIMetal::IsAmbientOcclusionSupported() const {
+    return false;
+}
+
+int32_t GfxRenderingAPIMetal::GetAmbientOcclusionFallbackCode() const {
+    return mAmbientOcclusionFallbackCode;
+}
+
+void GfxRenderingAPIMetal::ClearAmbientOcclusionFallbackCode() {
+    mAmbientOcclusionFallbackCode = 0;
+}
+
+void GfxRenderingAPIMetal::ApplyVolumetrics() {
+    if (mVolumetricsConfig.enabled && mVolumetricsConfig.quality > 0) {
+        mVolumetricsFallbackCode = 1; // VOLUMETRICS_BACKEND_UNSUPPORTED_METAL
+    }
+}
+
+bool GfxRenderingAPIMetal::IsVolumetricsSupported() const {
+    return false;
+}
+
+int32_t GfxRenderingAPIMetal::GetVolumetricsFallbackCode() const {
+    return mVolumetricsFallbackCode;
+}
+
+void GfxRenderingAPIMetal::ClearVolumetricsFallbackCode() {
+    mVolumetricsFallbackCode = 0;
+}
+
 void GfxRenderingAPIMetal::EndFrame() {
     std::set<int>::iterator it = mDrawnFramebuffers.begin();
     it++;

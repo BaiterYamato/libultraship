@@ -97,6 +97,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void Init() override;
     void OnResize() override;
     void StartFrame() override;
+    void ApplyAmbientOcclusion() override;
+    void ApplyVolumetrics() override;
     void EndFrame() override;
     void FinishRender() override;
     int CreateFramebuffer() override;
@@ -118,6 +120,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool IsAmbientOcclusionSupported() const override;
+    int32_t GetAmbientOcclusionFallbackCode() const override;
+    void ClearAmbientOcclusionFallbackCode() override;
+    bool IsVolumetricsSupported() const override;
+    int32_t GetVolumetricsFallbackCode() const override;
+    void ClearVolumetricsFallbackCode() override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -128,6 +136,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
   private:
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
+    bool EnsureAmbientOcclusionResources(uint32_t width, uint32_t height);
+    bool EnsureAmbientOcclusionShaders();
+    bool EnsureVolumetricsResources(uint32_t fullWidth, uint32_t fullHeight, uint32_t lowWidth, uint32_t lowHeight);
+    bool EnsureVolumetricsShaders();
 
     HMODULE mDX11Module;
 
@@ -142,6 +154,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerPrimDepthCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mAoParamsCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -150,6 +163,13 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShader;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShaderMsaa;
     Microsoft::WRL::ComPtr<ID3DBlob> mComputeShaderMsaaBlob;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mAoVertexShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mAoPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mAoPixelShaderMsaa;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mAoBlurPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mAoCompositePixelShader;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mAoSamplerState;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mAoMultiplyBlendState;
     size_t mCoordBufferSize;
 
 #if DEBUG_D3D
@@ -185,11 +205,136 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
 
     D3D_PRIMITIVE_TOPOLOGY mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-
     // Cached staging texture for ReadFramebufferToCPU — avoids CreateTexture2D/Release per frame
     Microsoft::WRL::ComPtr<ID3D11Texture2D> mReadbackStaging;
     uint32_t mReadbackStagingW = 0;
     uint32_t mReadbackStagingH = 0;
+
+    int32_t mAmbientOcclusionFallbackCode = 0;
+    int32_t mVolumetricsFallbackCode = 0;
+
+    struct AoParams {
+        float invResolution[2] = { 0.0f, 0.0f };
+        float radiusPixels = 4.0f;
+        float intensity = 1.0f;
+        float bias = 0.01f;
+        float power = 1.0f;
+        float maxDistance = 1200.0f;
+        uint32_t sampleCount = 8;
+        uint32_t debugView = 0;
+        float blurDirection[2] = { 1.0f, 0.0f };
+    } mAoParams;
+
+    struct AoRenderTargets {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+    };
+    AoRenderTargets mAoPrimary;
+    AoRenderTargets mAoBlur;
+    uint32_t mAoWidth = 0;
+    uint32_t mAoHeight = 0;
+
+    struct VolumetricsParams {
+        float invFullResolution[2] = { 0.0f, 0.0f };
+        float invLowResolution[2] = { 0.0f, 0.0f };
+        float cameraWorldPosition[3] = { 0.0f, 0.0f, 0.0f };
+        float density = 0.0f;
+        float fogColor[3] = { 1.0f, 1.0f, 1.0f };
+        float ambientIntensity = 0.35f;
+        float anisotropy = 0.0f;
+        float startDistance = 0.0f;
+        float maxDistance = 0.0f;
+        float baseHeight = 0.0f;
+        float heightFalloff = 0.0f;
+        float lightShaftIntensity = 0.0f;
+        float shadowIntensity = 0.0f;
+        float temporalBlend = 0.0f;
+        float jitterScale = 0.0f;
+        float nearPlane = 0.0f;
+        float farPlane = 0.0f;
+        float paddingAfterFarPlane = 0.0f;
+        float depthNdcParams[2] = { 2.0f, -1.0f };
+        float ndcDepthParams[2] = { 0.5f, 0.5f };
+        float debugDensityScale = 1.0f;
+        float debugLightScale = 1.0f;
+        float debugFinalScale = 1.0f;
+        float debugPreviewBlend = 1.0f;
+        float debugDensityBias = 0.0f;
+        float debugLightBias = 0.0f;
+        float debugFinalBias = 0.0f;
+        float debugMediumBias = 0.0f;
+        float aerialPerspectiveStrength = 1.0f;
+        float macroNoiseStrength = 1.0f;
+        float valleyFogStrength = 1.0f;
+        float edgeHazeStrength = 1.0f;
+        float depthExtinctionStrength = 1.0f;
+        float depthExtinctionExponent = 1.25f;
+        float horizonFogStrength = 1.0f;
+        float skyFallbackStrength = 0.18f;
+        float directionalShadowBias = 0.01f;
+        float directionalShadowNormalBias = 0.02f;
+        float directionalShadowSoftness = 1.0f;
+        float padding3 = 0.0f;
+        uint32_t stepCount = 0;
+        uint32_t lightCount = 0;
+        uint32_t shadowQuality = 0;
+        uint32_t historyValid = 0;
+        uint32_t heightFogEnabled = 0;
+        uint32_t debugMode = 0;
+        uint32_t resetHistory = 0;
+        uint32_t performanceMode = GFX_VOLUMETRICS_PERF_BALANCED;
+        uint32_t raymarchEnabled = 1;
+        uint32_t depthFogPathEnabled = 1;
+        uint32_t shadowMode = GFX_VOLUMETRICS_SHADOW_OFF;
+        uint32_t padding1 = 0;
+        float currViewProj[16] = { 0.0f };
+        float invViewProj[16] = { 0.0f };
+        float prevViewProj[16] = { 0.0f };
+        uint32_t directionalShadowEnabled = 0;
+        uint32_t directionalShadowLightIndex = 0;
+        uint32_t directionalShadowMapSize = 0;
+        uint32_t padding2 = 0;
+        float directionalShadowViewProj[16] = { 0.0f };
+        float lightPositionRadius[GFX_MAX_VOLUMETRIC_LIGHTS][4] = {};
+        float lightDirectionIntensity[GFX_MAX_VOLUMETRIC_LIGHTS][4] = {};
+        float lightColorVolumetric[GFX_MAX_VOLUMETRIC_LIGHTS][4] = {};
+        float lightConeShadow[GFX_MAX_VOLUMETRIC_LIGHTS][4] = {};
+        float lightShadowParams[GFX_MAX_VOLUMETRIC_LIGHTS][4] = {};
+    } mVolumetricsParams;
+
+    struct VolumetricsRenderTargets {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> volumeTexture;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> volumeRtv;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> volumeSrv;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTexture;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> depthRtv;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> depthSrv;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> metricsTexture;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> metricsRtv;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> metricsSrv;
+    };
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mVolumetricsParamsCb;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mVolumetricsVertexShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mVolumetricsRaymarchPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mVolumetricsCompositePixelShader;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mVolumetricsDirectionalShadowComputeShader;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mVolumetricsSamplerState;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mVolumetricsAdditiveBlendState;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mVolumetricsMetricsReadback;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mVolumetricsDirectionalShadowTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mVolumetricsDirectionalShadowSrv;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mVolumetricsDirectionalShadowUav;
+    VolumetricsRenderTargets mVolumetricsTargets[2];
+    uint32_t mVolumetricsFullWidth = 0;
+    uint32_t mVolumetricsFullHeight = 0;
+    uint32_t mVolumetricsLowWidth = 0;
+    uint32_t mVolumetricsLowHeight = 0;
+    uint32_t mVolumetricsDirectionalShadowSize = 0;
+    uint32_t mVolumetricsHistoryIndex = 0;
+    uint32_t mVolumetricsStatsReadbackFrame = 0;
+    bool mVolumetricsHistoryValid = false;
+    bool mVolumetricsMetricsReadbackPending = false;
 };
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,

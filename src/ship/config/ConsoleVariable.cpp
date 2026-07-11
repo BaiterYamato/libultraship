@@ -1,5 +1,6 @@
 #include "ship/config/ConsoleVariable.h"
 
+#include <algorithm>
 #include <functional>
 #include "ship/utils/filesystemtools/DiskFile.h"
 #include "ship/utils/Utils.h"
@@ -11,6 +12,32 @@
 #endif
 
 namespace Ship {
+namespace {
+bool TryReadColorComponent(const nlohmann::json& value, const char* key, uint8_t& out) {
+    if (!value.contains(key)) {
+        return false;
+    }
+
+    const auto& component = value[key];
+    if (!component.is_number_integer() && !component.is_number_unsigned()) {
+        return false;
+    }
+
+    int raw = component.get<int>();
+    raw = std::clamp(raw, 0, 255);
+    out = static_cast<uint8_t>(raw);
+    return true;
+}
+
+bool TryReadColorType(const nlohmann::json& value, std::string& typeOut) {
+    if (!value.contains("Type") || !value["Type"].is_string()) {
+        return false;
+    }
+
+    typeOut = value["Type"].get<std::string>();
+    return true;
+}
+} // namespace
 
 ConsoleVariable::ConsoleVariable() {
     Load();
@@ -300,25 +327,34 @@ void ConsoleVariable::LoadFromPath(
         switch (value.type()) {
             case nlohmann::detail::value_t::array:
                 break;
-            case nlohmann::detail::value_t::object:
-                if (value.contains("Type") && value["Type"].get<std::string>() == "RGBA") {
-                    Color_RGBA8 clr;
-                    clr.r = value["R"].get<uint8_t>();
-                    clr.g = value["G"].get<uint8_t>();
-                    clr.b = value["B"].get<uint8_t>();
-                    clr.a = value["A"].get<uint8_t>();
-                    SetColor(itemPath.c_str(), clr);
-                } else if (value.contains("Type") && value["Type"].get<std::string>() == "RGB") {
-                    Color_RGB8 clr;
-                    clr.r = value["R"].get<uint8_t>();
-                    clr.g = value["G"].get<uint8_t>();
-                    clr.b = value["B"].get<uint8_t>();
-                    SetColor24(itemPath.c_str(), clr);
-                } else {
-                    LoadFromPath(itemPath, value.items());
+            case nlohmann::detail::value_t::object: {
+                try {
+                    std::string colorType;
+                    if (TryReadColorType(value, colorType) && colorType == "RGBA") {
+                        Color_RGBA8 clr;
+                        if (TryReadColorComponent(value, "R", clr.r) && TryReadColorComponent(value, "G", clr.g) &&
+                            TryReadColorComponent(value, "B", clr.b) && TryReadColorComponent(value, "A", clr.a)) {
+                            SetColor(itemPath.c_str(), clr);
+                        } else {
+                            SPDLOG_WARN("Skipping malformed RGBA CVar block at {}", itemPath);
+                        }
+                    } else if (TryReadColorType(value, colorType) && colorType == "RGB") {
+                        Color_RGB8 clr;
+                        if (TryReadColorComponent(value, "R", clr.r) && TryReadColorComponent(value, "G", clr.g) &&
+                            TryReadColorComponent(value, "B", clr.b)) {
+                            SetColor24(itemPath.c_str(), clr);
+                        } else {
+                            SPDLOG_WARN("Skipping malformed RGB CVar block at {}", itemPath);
+                        }
+                    } else {
+                        LoadFromPath(itemPath, value.items());
+                    }
+                } catch (const std::exception& ex) {
+                    SPDLOG_ERROR("Failed loading CVar block at {}: {}", itemPath, ex.what());
                 }
 
                 break;
+            }
             case nlohmann::detail::value_t::string:
                 SetString(itemPath.c_str(), value.get<std::string>().c_str());
                 break;
