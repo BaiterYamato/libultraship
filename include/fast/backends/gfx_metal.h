@@ -138,6 +138,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void Init() override;
     void OnResize() override;
     void StartFrame() override;
+    void ApplyAmbientOcclusion() override;
+    void ApplyVolumetrics() override;
     void EndFrame() override;
     void FinishRender() override;
     int CreateFramebuffer() override;
@@ -159,6 +161,12 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool IsAmbientOcclusionSupported() const override;
+    int32_t GetAmbientOcclusionFallbackCode() const override;
+    void ClearAmbientOcclusionFallbackCode() override;
+    bool IsVolumetricsSupported() const override;
+    int32_t GetVolumetricsFallbackCode() const override;
+    void ClearVolumetricsFallbackCode() override;
 
     void NewFrame();
     void SetupFloatingFrame();
@@ -209,6 +217,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     bool mNonUniformThreadgroupSupported;
+    int32_t mAmbientOcclusionFallbackCode = 0;
+    int32_t mVolumetricsFallbackCode = 0;
 };
 
 } // namespace Fast

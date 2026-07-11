@@ -11,6 +11,7 @@
 #include <any>
 #include <map>
 #include <set>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 #include <list>
@@ -40,6 +41,10 @@
 #include <spdlog/fmt/fmt.h>
 
 std::stack<std::string> currentDir;
+
+extern "C" const char* gfx_external_mods_resolve_material_albedo_override(const char* texturePath);
+extern "C" uint32_t gfx_external_mods_get_material_fallback_generation_flags(const char* texturePath);
+extern "C" float gfx_external_mods_get_material_fallback_normal_scale(const char* texturePath);
 
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
 #define SUPPORT_CHECK(x) assert(x)
@@ -119,6 +124,33 @@ Interpreter::~Interpreter() {
 }
 
 static std::weak_ptr<Interpreter> mInstance;
+static bool gForceDepthAwareFog = false;
+static GfxAmbientOcclusionConfig gAmbientOcclusionConfig{};
+static int32_t gAmbientOcclusionFallbackReason = 0;
+static GfxVolumetricsConfig gVolumetricsConfig{};
+static std::array<GfxVolumetricLight, GFX_MAX_VOLUMETRIC_LIGHTS> gVolumetricLights{};
+static size_t gVolumetricLightCount = 0;
+static int32_t gVolumetricsFallbackReason = 0;
+enum {
+    GFX_AO_FALLBACK_NONE = 0,
+    GFX_AO_FALLBACK_BACKEND_UNSUPPORTED_METAL = 1,
+    GFX_AO_FALLBACK_SHADER_COMPILE_FAILED = 2,
+    GFX_AO_FALLBACK_RUNTIME_UNSUPPORTED = 3,
+};
+enum {
+    GFX_VOLUMETRICS_FALLBACK_NONE = 0,
+    GFX_VOLUMETRICS_FALLBACK_BACKEND_UNSUPPORTED_METAL = 1,
+    GFX_VOLUMETRICS_FALLBACK_SHADER_COMPILE_FAILED = 2,
+    GFX_VOLUMETRICS_FALLBACK_RUNTIME_UNSUPPORTED = 3,
+};
+
+static void SetIdentityMatrix(float* matrix) {
+    memset(matrix, 0, sizeof(float) * 16);
+    matrix[0] = 1.0f;
+    matrix[5] = 1.0f;
+    matrix[10] = 1.0f;
+    matrix[15] = 1.0f;
+}
 // Set a cached pointer to the instance so we don't need to go through the window every time
 void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
@@ -460,6 +492,237 @@ std::string Interpreter::GetBaseTexturePath(const std::string& path) {
     return path;
 }
 
+enum : uint32_t {
+    kMaterialFallbackGenerateNormal = 1u << 0,
+    kMaterialFallbackGenerateOrm = 1u << 1,
+};
+
+static constexpr const char* kGeneratedMaterialTexturePrefix = "__generated__/external_mods/material_fallbacks/";
+static std::unordered_map<std::string, std::shared_ptr<Fast::Texture>> gGeneratedMaterialTextures;
+static std::set<std::string> gGeneratedMaterialTextureLogKeys;
+
+static uint64_t HashGeneratedMaterialKey(const std::string& text) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const unsigned char ch : text) {
+        hash ^= ch;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static std::string GetTextureResourcePath(const std::shared_ptr<Fast::Texture>& texture) {
+    if (texture == nullptr) {
+        return {};
+    }
+
+    const auto initData = texture->GetInitData();
+    if (initData == nullptr) {
+        return {};
+    }
+
+    return initData->Path;
+}
+
+static std::string GetRequestedMaterialTexturePath(const RawTexMetadata* metadata) {
+    if (metadata == nullptr) {
+        return {};
+    }
+    if (!metadata->sourcePath.empty()) {
+        return metadata->sourcePath;
+    }
+    return GetTextureResourcePath(metadata->resource);
+}
+
+static std::string GetResolvedMaterialTexturePath(const RawTexMetadata* metadata) {
+    if (metadata == nullptr) {
+        return {};
+    }
+
+    const auto resourcePath = GetTextureResourcePath(metadata->resource);
+    if (!resourcePath.empty()) {
+        return resourcePath;
+    }
+    return GetRequestedMaterialTexturePath(metadata);
+}
+
+static std::string BuildGeneratedMaterialTexturePath(const std::string& requestedPath, const std::string& resolvedPath,
+                                                     uint32_t width, uint32_t height, const char* mapKind,
+                                                     float normalScale = 1.0f) {
+    const std::string key =
+        fmt::format("{}|{}|{}x{}|{}|{:.3f}", requestedPath, resolvedPath, width, height, mapKind, normalScale);
+    return fmt::format("{}{:016x}_{}_{}x{}.rgba32", kGeneratedMaterialTexturePrefix, HashGeneratedMaterialKey(key),
+                       mapKind, width, height);
+}
+
+static std::shared_ptr<Fast::Texture> LookupGeneratedMaterialTexture(const std::string& path) {
+    const auto it = gGeneratedMaterialTextures.find(path);
+    return it != gGeneratedMaterialTextures.end() ? it->second : nullptr;
+}
+
+static std::shared_ptr<Fast::Texture> CreateGeneratedTexture(const std::string& syntheticPath, const std::vector<uint8_t>& rgba32,
+                                                             uint32_t width, uint32_t height) {
+    auto initData = std::make_shared<Ship::ResourceInitData>();
+    initData->Path = syntheticPath;
+    initData->ByteOrder = Ship::Endianness::Native;
+    initData->Type = 0;
+    initData->ResourceVersion = 0;
+    initData->Id = 0;
+    initData->IsCustom = true;
+    initData->Format = RESOURCE_FORMAT_BINARY;
+
+    auto texture = std::make_shared<Fast::Texture>(initData);
+    texture->Type = Fast::TextureType::RGBA32bpp;
+    texture->Width = static_cast<uint16_t>(width);
+    texture->Height = static_cast<uint16_t>(height);
+    texture->Flags = TEX_FLAG_LOAD_AS_IMG;
+    texture->ImageDataSize = static_cast<uint32_t>(rgba32.size());
+    texture->ImageData = new uint8_t[texture->ImageDataSize];
+    if (!rgba32.empty()) {
+        memcpy(texture->ImageData, rgba32.data(), rgba32.size());
+    }
+    return texture;
+}
+
+static std::vector<uint8_t> GenerateNormalMapFromRgba32(const uint8_t* rgba32, uint32_t width, uint32_t height,
+                                                        float normalScale) {
+    std::vector<float> heightField(width * height, 0.0f);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const size_t index = static_cast<size_t>(y) * width + x;
+            const uint8_t* pixel = rgba32 + index * 4;
+            const float alpha = pixel[3] / 255.0f;
+            const float luminance =
+                ((0.2126f * pixel[0]) + (0.7152f * pixel[1]) + (0.0722f * pixel[2])) / 255.0f;
+            heightField[index] = luminance * alpha;
+        }
+    }
+
+    const float strength = std::max(0.05f, normalScale);
+    std::vector<uint8_t> output(static_cast<size_t>(width) * height * 4, 255);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint32_t yPrev = y > 0 ? y - 1 : y;
+        const uint32_t yNext = y + 1 < height ? y + 1 : y;
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint32_t xPrev = x > 0 ? x - 1 : x;
+            const uint32_t xNext = x + 1 < width ? x + 1 : x;
+            const float hLeft = heightField[static_cast<size_t>(y) * width + xPrev];
+            const float hRight = heightField[static_cast<size_t>(y) * width + xNext];
+            const float hUp = heightField[static_cast<size_t>(yPrev) * width + x];
+            const float hDown = heightField[static_cast<size_t>(yNext) * width + x];
+
+            float nx = -(hRight - hLeft) * strength;
+            float ny = -(hDown - hUp) * strength;
+            float nz = 1.0f;
+            const float length = std::sqrt((nx * nx) + (ny * ny) + (nz * nz));
+            if (length > 0.0001f) {
+                nx /= length;
+                ny /= length;
+                nz /= length;
+            }
+
+            const size_t outputIndex = (static_cast<size_t>(y) * width + x) * 4;
+            output[outputIndex + 0] = static_cast<uint8_t>(std::round((nx * 0.5f + 0.5f) * 255.0f));
+            output[outputIndex + 1] = static_cast<uint8_t>(std::round((ny * 0.5f + 0.5f) * 255.0f));
+            output[outputIndex + 2] = static_cast<uint8_t>(std::round((nz * 0.5f + 0.5f) * 255.0f));
+            output[outputIndex + 3] = rgba32[outputIndex + 3];
+        }
+    }
+
+    return output;
+}
+
+static std::vector<uint8_t> GenerateOrmFallbackFromRgba32(const uint8_t* rgba32, uint32_t width, uint32_t height) {
+    std::vector<uint8_t> output(static_cast<size_t>(width) * height * 4, 255);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const size_t index = (static_cast<size_t>(y) * width + x) * 4;
+            const float luminance =
+                ((0.2126f * rgba32[index + 0]) + (0.7152f * rgba32[index + 1]) + (0.0722f * rgba32[index + 2])) /
+                255.0f;
+            const float roughness = std::max(0.35f, std::min(1.0f, 0.65f + 0.35f * (1.0f - luminance)));
+            output[index + 0] = 255;
+            output[index + 1] = static_cast<uint8_t>(std::round(roughness * 255.0f));
+            output[index + 2] = 0;
+            output[index + 3] = 255;
+        }
+    }
+    return output;
+}
+
+static void EnsureGeneratedMaterialFallbackMaps(const RawTexMetadata* metadata, const uint8_t* rgba32, uint32_t width,
+                                                uint32_t height) {
+    if (metadata == nullptr || rgba32 == nullptr || width == 0 || height == 0) {
+        return;
+    }
+
+    const std::string requestedPath = GetRequestedMaterialTexturePath(metadata);
+    if (requestedPath.empty()) {
+        return;
+    }
+
+    const uint32_t generationFlags = gfx_external_mods_get_material_fallback_generation_flags(requestedPath.c_str());
+    if (generationFlags == 0) {
+        return;
+    }
+
+    const std::string resolvedPath = GetResolvedMaterialTexturePath(metadata);
+
+    if ((generationFlags & kMaterialFallbackGenerateNormal) != 0u) {
+        const float normalScale = gfx_external_mods_get_material_fallback_normal_scale(requestedPath.c_str());
+        const std::string syntheticPath =
+            BuildGeneratedMaterialTexturePath(requestedPath, resolvedPath, width, height, "normal", normalScale);
+        if (!LookupGeneratedMaterialTexture(syntheticPath)) {
+            gGeneratedMaterialTextures[syntheticPath] =
+                CreateGeneratedTexture(syntheticPath, GenerateNormalMapFromRgba32(rgba32, width, height, normalScale),
+                                       width, height);
+            if (gGeneratedMaterialTextureLogKeys.insert(syntheticPath).second) {
+                SPDLOG_INFO("[ExternalMods] Generated fallback normal map for {} (resolved={})", requestedPath,
+                            resolvedPath.empty() ? requestedPath : resolvedPath);
+            }
+        }
+    }
+
+    if ((generationFlags & kMaterialFallbackGenerateOrm) != 0u) {
+        const std::string syntheticPath =
+            BuildGeneratedMaterialTexturePath(requestedPath, resolvedPath, width, height, "orm");
+        if (!LookupGeneratedMaterialTexture(syntheticPath)) {
+            gGeneratedMaterialTextures[syntheticPath] =
+                CreateGeneratedTexture(syntheticPath, GenerateOrmFallbackFromRgba32(rgba32, width, height), width, height);
+            if (gGeneratedMaterialTextureLogKeys.insert(syntheticPath).second) {
+                SPDLOG_INFO("[ExternalMods] Generated fallback ORM map for {} (resolved={})", requestedPath,
+                            resolvedPath.empty() ? requestedPath : resolvedPath);
+            }
+        }
+    }
+}
+
+static std::shared_ptr<Fast::Texture> LoadTextureWithMaterialOverride(const char* fileName, const char** outResolvedPath) {
+    if (outResolvedPath != nullptr) {
+        *outResolvedPath = fileName;
+    }
+    if (fileName == nullptr || fileName[0] == '\0') {
+        return nullptr;
+    }
+
+    if (const auto generatedTexture = LookupGeneratedMaterialTexture(fileName); generatedTexture != nullptr) {
+        return generatedTexture;
+    }
+
+    const char* overridePath = gfx_external_mods_resolve_material_albedo_override(fileName);
+    if (overridePath != nullptr && overridePath[0] != '\0') {
+        auto overrideTexture =
+            std::static_pointer_cast<Fast::Texture>(Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(overridePath));
+        if (overrideTexture != nullptr) {
+            if (outResolvedPath != nullptr) {
+                *outResolvedPath = overridePath;
+            }
+            return overrideTexture;
+        }
+    }
+
+    return std::static_pointer_cast<Fast::Texture>(Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(fileName));
+}
+
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
     while (mTextureCache.map.bucket_count() > 0) {
         TextureCacheKey key = { origAddr, { 0 }, 0, 0, 0 }; // bucket index only depends on the address
@@ -519,6 +782,7 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         }
     }
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -536,6 +800,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
 
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes / 2;
     uint32_t height = (size_bytes / 2) / mRdp->texture_tile[tile].line_size_bytes;
+    EnsureGeneratedMaterialFallbackMaps(metadata, addr, width, height);
     mRapi->UploadTexture(addr, width, height);
 }
 
@@ -568,6 +833,7 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes * 2;
     uint32_t height = sizeBytes / mRdp->texture_tile[tile].line_size_bytes;
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -598,6 +864,7 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes;
     uint32_t height = sizeBytes / mRdp->texture_tile[tile].line_size_bytes;
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -640,6 +907,7 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
         }
     }
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -684,6 +952,7 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
         }
     }
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -709,6 +978,7 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes;
     uint32_t height = sizeBytes / mRdp->texture_tile[tile].line_size_bytes;
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -755,6 +1025,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     uint32_t width = resultLineSizeBytes * 2;
     uint32_t height = sizeBytes / resultLineSizeBytes;
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -793,6 +1064,7 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     uint32_t width = resultLineSizeBytes;
     uint32_t height = sizeBytes / resultLineSizeBytes;
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -805,6 +1077,7 @@ void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
 
     uint16_t width = metadata->width;
     uint16_t height = metadata->height;
+    EnsureGeneratedMaterialFallbackMaps(metadata, addr, width, height);
     mRapi->UploadTexture(addr, width, height);
 }
 
@@ -847,6 +1120,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 
     if (resultNewLineSize == 4 * width && resultNewHeight == height) {
         // Can use the texture directly since it has the correct dimensions
+        EnsureGeneratedMaterialFallbackMaps(metadata, addr, width, height);
         mRapi->UploadTexture(addr, width, height);
         return;
     }
@@ -880,6 +1154,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
     }
 
+    EnsureGeneratedMaterialFallbackMaps(metadata, mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
     mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
 }
 
@@ -1322,7 +1597,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         d->z = z;
         d->w = w;
 
-        if (mRsp->geometry_mode & G_FOG) {
+        if ((mRsp->geometry_mode & G_FOG) || gForceDepthAwareFog) {
             if (fabsf(w) < 0.001f) {
                 // To avoid division by zero
                 w = 0.001f;
@@ -1441,7 +1716,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                       (mRdp->other_mode_l & (3 << 16)) == (G_BL_1MA << 16)) ||
                      ((mRdp->other_mode_l & (3 << 22)) == (G_BL_CLR_MEM << 22) &&
                       (mRdp->other_mode_l & (3 << 18)) == (G_BL_1MA << 18));
-    bool use_fog = (mRdp->other_mode_l >> 30) == G_BL_CLR_FOG;
+    bool use_fog = ((mRdp->other_mode_l >> 30) == G_BL_CLR_FOG) || gForceDepthAwareFog;
     bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
     bool use_noise = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_DITHER;
     bool use_2cyc = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
@@ -1957,6 +2232,9 @@ void Interpreter::GfxDpSetTextureImage(uint32_t format, uint32_t size, uint32_t 
                                        uint32_t texFlags, RawTexMetadata rawTexMetdata, const void* addr) {
     // fprintf(stderr, "GfxDpSetTextureImage: %s (width=%d; size=0x%X)\n",
     //         rawTexMetdata.resource ? rawTexMetdata.resource->GetInitData()->Path.c_str() : nullptr, width, size);
+    if (rawTexMetdata.sourcePath.empty() && texPath != nullptr) {
+        rawTexMetdata.sourcePath = texPath;
+    }
     mRdp->texture_to_load.addr = (const uint8_t*)addr;
     mRdp->texture_to_load.siz = size;
     mRdp->texture_to_load.width = width;
@@ -3372,6 +3650,7 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
     uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (uint64_t)(*cmd0)->words.w1;
 
     const char* fileName = Ship::Context::GetInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash);
+    const char* resolvedTexturePath = fileName;
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
@@ -3380,9 +3659,7 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         return false;
     }
 
-    std::shared_ptr<Fast::Texture> texture =
-        std::static_pointer_cast<Fast::Texture>(Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(
-            Ship::Context::GetInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash)));
+    std::shared_ptr<Fast::Texture> texture = LoadTextureWithMaterialOverride(fileName, &resolvedTexturePath);
     if (texture != nullptr) {
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
@@ -3391,6 +3668,7 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.v_pixel_scale = texture->VPixelScale;
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
+        rawTexMetadata.sourcePath = fileName;
 
         // OTRTODO: We have disabled caching for now to fix a texture corruption issue with HD texture
         // support. In doing so, there is a potential performance hit since we are not caching lookups. We
@@ -3432,12 +3710,12 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
 bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     const char* fileName = (char*)cmd->words.w1;
+    const char* resolvedTexturePath = fileName;
 
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(fileName));
+    std::shared_ptr<Fast::Texture> texture = LoadTextureWithMaterialOverride(fileName, &resolvedTexturePath);
     if (texture != nullptr) {
         Interpreter* gfx = mInstance.lock().get();
         texFlags = texture->Flags;
@@ -3447,6 +3725,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.v_pixel_scale = texture->VPixelScale;
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
+        rawTexMetadata.sourcePath = fileName;
 
         uint32_t fmt = C0(21, 3);
         uint32_t size = C0(19, 2);
@@ -4249,6 +4528,10 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 }
 
 void Interpreter::StartFrame() {
+    mRapi->SetAmbientOcclusionConfig(gAmbientOcclusionConfig);
+    mRapi->SetVolumetricsConfig(gVolumetricsConfig);
+    mRapi->SetVolumetricLights(gVolumetricLights.data(), gVolumetricLightCount);
+
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
     if (mCurDimensions.height == 0) {
@@ -4277,18 +4560,44 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    const bool aoEnabled = gAmbientOcclusionConfig.enabled && gAmbientOcclusionConfig.quality > 0;
+    const bool aoSupported = mRapi->IsAmbientOcclusionSupported();
+    const bool volumetricsEnabled = gVolumetricsConfig.quality > 0 &&
+                                    (gVolumetricsConfig.enabled ||
+                                     gVolumetricsConfig.debugMode != Fast::GFX_VOLUMETRICS_DEBUG_OFF);
+    const bool volumetricsSupported = mRapi->IsVolumetricsSupported();
+    uint32_t effectiveMsaaLevel = mMsaaLevel;
+    if (aoEnabled && aoSupported) {
+        // AO post-process requires single-sample depth extraction in current implementation.
+        effectiveMsaaLevel = 1;
+    } else if (aoEnabled && !aoSupported) {
+        gAmbientOcclusionFallbackReason = GFX_AO_FALLBACK_RUNTIME_UNSUPPORTED;
+    }
+    if (volumetricsEnabled && volumetricsSupported) {
+        // Volumetrics currently rely on single-sample depth extraction and temporal reprojection.
+        effectiveMsaaLevel = 1;
+        gVolumetricsFallbackReason = GFX_VOLUMETRICS_FALLBACK_NONE;
+    } else if (volumetricsEnabled && !volumetricsSupported) {
+        gVolumetricsFallbackReason = GFX_VOLUMETRICS_FALLBACK_RUNTIME_UNSUPPORTED;
+    } else {
+        gVolumetricsFallbackReason = GFX_VOLUMETRICS_FALLBACK_NONE;
+    }
+
+    if (!ViewportMatchesRendererResolution() || effectiveMsaaLevel > 1 || (aoEnabled && aoSupported) ||
+        (volumetricsEnabled && volumetricsSupported)) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution()) {
-            mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
+            mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, effectiveMsaaLevel,
+                                               true,
                                                true, true, true);
         } else {
             // MSAA framebuffer needs to be resolved to an equally sized target when complete, which must therefore
             // match the window size
             mRapi->UpdateFramebufferParameters(mGameFb, mGfxCurrentWindowDimensions.width,
-                                               mGfxCurrentWindowDimensions.height, mMsaaLevel, false, true, true, true);
+                                               mGfxCurrentWindowDimensions.height, effectiveMsaaLevel, false, true, true,
+                                               true);
         }
-        if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
+        if (effectiveMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
                                                false, false, false, false);
         }
@@ -4317,6 +4626,8 @@ void Interpreter::RunGuiOnly() {
     mRenderingState.scissor = {};
 
     Flush();
+    mRapi->ApplyAmbientOcclusion();
+    mRapi->ApplyVolumetrics();
     mGfxFrameBuffer = 0;
 
     if (mRendersToFb) {
@@ -4381,6 +4692,8 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+    mRapi->ApplyAmbientOcclusion();
+    mRapi->ApplyVolumetrics();
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
@@ -4687,4 +5000,294 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 
 extern "C" void gfx_texture_cache_clear() {
     Fast::mInstance.lock().get()->TextureCacheClear();
+}
+
+extern "C" void gfx_set_force_depth_aware_fog(uint8_t enabled) {
+    Fast::gForceDepthAwareFog = enabled != 0;
+}
+
+extern "C" void gfx_set_ambient_occlusion_enabled(uint8_t enabled) {
+    Fast::gAmbientOcclusionConfig.enabled = enabled != 0;
+    if (!Fast::gAmbientOcclusionConfig.enabled) {
+        Fast::gAmbientOcclusionConfig.quality = 0;
+    } else if (Fast::gAmbientOcclusionConfig.quality == 0) {
+        Fast::gAmbientOcclusionConfig.quality = 2;
+    }
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetAmbientOcclusionConfig(Fast::gAmbientOcclusionConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_ambient_occlusion_debug_view(uint8_t enabled) {
+    Fast::gAmbientOcclusionConfig.debugView = enabled != 0;
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetAmbientOcclusionConfig(Fast::gAmbientOcclusionConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_ambient_occlusion_config(float radius, float intensity, float bias, float power, float maxDistance,
+                                                 int32_t blurPasses, uint8_t quality) {
+    Fast::gAmbientOcclusionConfig.radius = Ship::Math::clamp(radius, 0.05f, 3.0f);
+    Fast::gAmbientOcclusionConfig.intensity = Ship::Math::clamp(intensity, 0.0f, 3.0f);
+    Fast::gAmbientOcclusionConfig.bias = Ship::Math::clamp(bias, 0.0f, 0.2f);
+    Fast::gAmbientOcclusionConfig.power = Ship::Math::clamp(power, 0.1f, 4.0f);
+    Fast::gAmbientOcclusionConfig.maxDistance = Ship::Math::clamp(maxDistance, 50.0f, 5000.0f);
+    Fast::gAmbientOcclusionConfig.blurPasses = Ship::Math::clamp(blurPasses, 0, 4);
+    Fast::gAmbientOcclusionConfig.quality =
+        static_cast<uint8_t>(Ship::Math::clamp(static_cast<int32_t>(quality), static_cast<int32_t>(0), static_cast<int32_t>(3)));
+    Fast::gAmbientOcclusionConfig.enabled = Fast::gAmbientOcclusionConfig.quality > 0;
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetAmbientOcclusionConfig(Fast::gAmbientOcclusionConfig);
+        }
+    }
+}
+
+extern "C" int32_t gfx_get_ambient_occlusion_fallback_reason() {
+    const auto instance = Fast::mInstance.lock();
+    if (!instance) {
+        return Fast::GFX_AO_FALLBACK_NONE;
+    }
+    const auto* api = instance->GetCurrentRenderingAPI();
+    if (api == nullptr) {
+        return Fast::GFX_AO_FALLBACK_NONE;
+    }
+    const int32_t backendReason = api->GetAmbientOcclusionFallbackCode();
+    if (backendReason != Fast::GFX_AO_FALLBACK_NONE) {
+        return backendReason;
+    }
+    return Fast::gAmbientOcclusionFallbackReason;
+}
+
+extern "C" void gfx_clear_ambient_occlusion_fallback_reason() {
+    Fast::gAmbientOcclusionFallbackReason = Fast::GFX_AO_FALLBACK_NONE;
+    const auto instance = Fast::mInstance.lock();
+    if (!instance) {
+        return;
+    }
+    auto* api = instance->GetCurrentRenderingAPI();
+    if (api != nullptr) {
+        api->ClearAmbientOcclusionFallbackCode();
+    }
+}
+
+extern "C" void gfx_set_volumetrics_enabled(uint8_t enabled) {
+    Fast::gVolumetricsConfig.enabled = enabled != 0;
+    if (!Fast::gVolumetricsConfig.enabled) {
+        Fast::gVolumetricsConfig.quality = 0;
+    } else if (Fast::gVolumetricsConfig.quality == 0) {
+        Fast::gVolumetricsConfig.quality = 2;
+    }
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetVolumetricsConfig(Fast::gVolumetricsConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_volumetrics_debug_view(uint8_t enabled) {
+    Fast::gVolumetricsConfig.debugView = enabled != 0;
+    Fast::gVolumetricsConfig.debugMode =
+        Fast::gVolumetricsConfig.debugView ? Fast::GFX_VOLUMETRICS_DEBUG_FINAL_VOLUME : Fast::GFX_VOLUMETRICS_DEBUG_OFF;
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetVolumetricsConfig(Fast::gVolumetricsConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_volumetrics_debug_mode(uint8_t mode) {
+    const uint8_t clampedMode =
+        static_cast<uint8_t>(Ship::Math::clamp(static_cast<int32_t>(mode), static_cast<int32_t>(Fast::GFX_VOLUMETRICS_DEBUG_OFF),
+                                               static_cast<int32_t>(Fast::GFX_VOLUMETRICS_DEBUG_SHADOW_OCCLUSION)));
+    Fast::gVolumetricsConfig.debugMode = clampedMode;
+    Fast::gVolumetricsConfig.debugView = clampedMode != Fast::GFX_VOLUMETRICS_DEBUG_OFF;
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetVolumetricsConfig(Fast::gVolumetricsConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_volumetrics_appearance(float colorR, float colorG, float colorB, float ambientIntensity) {
+    Fast::gVolumetricsConfig.color[0] = Ship::Math::clamp(colorR, 0.0f, 16.0f);
+    Fast::gVolumetricsConfig.color[1] = Ship::Math::clamp(colorG, 0.0f, 16.0f);
+    Fast::gVolumetricsConfig.color[2] = Ship::Math::clamp(colorB, 0.0f, 16.0f);
+    Fast::gVolumetricsConfig.ambientIntensity = Ship::Math::clamp(ambientIntensity, 0.0f, 8.0f);
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetVolumetricsConfig(Fast::gVolumetricsConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_volumetrics_config(float density, float anisotropy, float startDistance, float maxDistance,
+                                           uint8_t quality, uint8_t shadowQuality, float baseHeight, float heightFalloff,
+                                           uint8_t performanceMode, uint8_t heightFogEnabled, float lightShaftIntensity, float shadowIntensity,
+                                           float temporalBlend, float jitterScale, float aerialPerspectiveStrength,
+                                           float macroNoiseStrength, float valleyFogStrength, float edgeHazeStrength,
+                                           float depthExtinctionStrength, float depthExtinctionExponent,
+                                           float horizonFogStrength, float skyFallbackStrength,
+                                           float directionalShadowBias, float directionalShadowNormalBias,
+                                           float directionalShadowSoftness, uint8_t maxShadowedLights,
+                                           uint8_t resetHistory) {
+    Fast::gVolumetricsConfig.density = Ship::Math::clamp(density, 0.0f, 2.0f);
+    Fast::gVolumetricsConfig.anisotropy = Ship::Math::clamp(anisotropy, -0.95f, 0.95f);
+    Fast::gVolumetricsConfig.startDistance = Ship::Math::clamp(startDistance, 0.0f, 4000.0f);
+    Fast::gVolumetricsConfig.maxDistance =
+        Ship::Math::clamp(maxDistance, Fast::gVolumetricsConfig.startDistance + 1.0f, 12000.0f);
+    Fast::gVolumetricsConfig.quality =
+        static_cast<uint8_t>(Ship::Math::clamp(static_cast<int32_t>(quality), static_cast<int32_t>(0), static_cast<int32_t>(3)));
+    Fast::gVolumetricsConfig.shadowQuality = static_cast<uint8_t>(
+        Ship::Math::clamp(static_cast<int32_t>(shadowQuality), static_cast<int32_t>(0), static_cast<int32_t>(3)));
+    Fast::gVolumetricsConfig.performanceMode = static_cast<uint8_t>(Ship::Math::clamp(
+        static_cast<int32_t>(performanceMode), static_cast<int32_t>(Fast::GFX_VOLUMETRICS_PERF_PERFORMANCE),
+        static_cast<int32_t>(Fast::GFX_VOLUMETRICS_PERF_QUALITY)));
+    Fast::gVolumetricsConfig.baseHeight = Ship::Math::clamp(baseHeight, -20000.0f, 20000.0f);
+    Fast::gVolumetricsConfig.heightFalloff = Ship::Math::clamp(heightFalloff, 0.0f, 0.05f);
+    Fast::gVolumetricsConfig.heightFogEnabled = heightFogEnabled != 0;
+    Fast::gVolumetricsConfig.lightShaftIntensity = Ship::Math::clamp(lightShaftIntensity, 0.0f, 8.0f);
+    Fast::gVolumetricsConfig.shadowIntensity = Ship::Math::clamp(shadowIntensity, 0.0f, 1.0f);
+    Fast::gVolumetricsConfig.temporalBlend = Ship::Math::clamp(temporalBlend, 0.0f, 0.99f);
+    Fast::gVolumetricsConfig.jitterScale = Ship::Math::clamp(jitterScale, 0.0f, 4.0f);
+    Fast::gVolumetricsConfig.aerialPerspectiveStrength = Ship::Math::clamp(aerialPerspectiveStrength, 0.0f, 4.0f);
+    Fast::gVolumetricsConfig.macroNoiseStrength = Ship::Math::clamp(macroNoiseStrength, 0.0f, 3.0f);
+    Fast::gVolumetricsConfig.valleyFogStrength = Ship::Math::clamp(valleyFogStrength, 0.0f, 3.0f);
+    Fast::gVolumetricsConfig.edgeHazeStrength = Ship::Math::clamp(edgeHazeStrength, 0.0f, 3.0f);
+    Fast::gVolumetricsConfig.depthExtinctionStrength = Ship::Math::clamp(depthExtinctionStrength, 0.0f, 8.0f);
+    Fast::gVolumetricsConfig.depthExtinctionExponent = Ship::Math::clamp(depthExtinctionExponent, 0.25f, 6.0f);
+    Fast::gVolumetricsConfig.horizonFogStrength = Ship::Math::clamp(horizonFogStrength, 0.0f, 4.0f);
+    Fast::gVolumetricsConfig.skyFallbackStrength = Ship::Math::clamp(skyFallbackStrength, 0.0f, 2.0f);
+    Fast::gVolumetricsConfig.directionalShadowBias = Ship::Math::clamp(directionalShadowBias, 0.0f, 0.1f);
+    Fast::gVolumetricsConfig.directionalShadowNormalBias =
+        Ship::Math::clamp(directionalShadowNormalBias, 0.0f, 0.2f);
+    Fast::gVolumetricsConfig.directionalShadowSoftness = Ship::Math::clamp(directionalShadowSoftness, 0.0f, 4.0f);
+    Fast::gVolumetricsConfig.maxShadowedLights =
+        static_cast<uint8_t>(Ship::Math::clamp(static_cast<int32_t>(maxShadowedLights), static_cast<int32_t>(0),
+                                               static_cast<int32_t>(Fast::GFX_MAX_VOLUMETRIC_LIGHTS)));
+    Fast::gVolumetricsConfig.resetHistory = resetHistory != 0;
+    Fast::gVolumetricsConfig.enabled = Fast::gVolumetricsConfig.quality > 0;
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetVolumetricsConfig(Fast::gVolumetricsConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_volumetrics_camera(const float* currentViewProjection, const float* inverseViewProjection,
+                                           const float* previousViewProjection, float cameraX, float cameraY,
+                                           float cameraZ, float nearPlane, float farPlane) {
+    if (currentViewProjection != nullptr) {
+        memcpy(Fast::gVolumetricsConfig.currentViewProjection, currentViewProjection, sizeof(float) * 16);
+    } else {
+        Fast::SetIdentityMatrix(Fast::gVolumetricsConfig.currentViewProjection);
+    }
+    if (inverseViewProjection != nullptr) {
+        memcpy(Fast::gVolumetricsConfig.inverseViewProjection, inverseViewProjection, sizeof(float) * 16);
+    } else {
+        Fast::SetIdentityMatrix(Fast::gVolumetricsConfig.inverseViewProjection);
+    }
+    if (previousViewProjection != nullptr) {
+        memcpy(Fast::gVolumetricsConfig.previousViewProjection, previousViewProjection, sizeof(float) * 16);
+    } else {
+        Fast::SetIdentityMatrix(Fast::gVolumetricsConfig.previousViewProjection);
+    }
+    Fast::gVolumetricsConfig.cameraWorldPosition[0] = cameraX;
+    Fast::gVolumetricsConfig.cameraWorldPosition[1] = cameraY;
+    Fast::gVolumetricsConfig.cameraWorldPosition[2] = cameraZ;
+    Fast::gVolumetricsConfig.nearPlane = Ship::Math::clamp(nearPlane, 1.0f, 5000.0f);
+    Fast::gVolumetricsConfig.farPlane = Ship::Math::clamp(farPlane, Fast::gVolumetricsConfig.nearPlane + 1.0f, 50000.0f);
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetVolumetricsConfig(Fast::gVolumetricsConfig);
+        }
+    }
+}
+
+extern "C" void gfx_set_volumetric_lights(const Fast::GfxVolumetricLight* lights, size_t count) {
+    Fast::gVolumetricLightCount = std::min(count, Fast::gVolumetricLights.size());
+    for (size_t i = 0; i < Fast::gVolumetricLightCount; ++i) {
+        Fast::gVolumetricLights[i] = lights[i];
+    }
+    for (size_t i = Fast::gVolumetricLightCount; i < Fast::gVolumetricLights.size(); ++i) {
+        Fast::gVolumetricLights[i] = {};
+    }
+    const auto instance = Fast::mInstance.lock();
+    if (instance) {
+        if (auto* api = instance->GetCurrentRenderingAPI(); api != nullptr) {
+            api->SetVolumetricLights(Fast::gVolumetricLights.data(), Fast::gVolumetricLightCount);
+        }
+    }
+}
+
+extern "C" int32_t gfx_get_volumetrics_fallback_reason() {
+    const auto instance = Fast::mInstance.lock();
+    if (!instance) {
+        return Fast::GFX_VOLUMETRICS_FALLBACK_NONE;
+    }
+    const auto* api = instance->GetCurrentRenderingAPI();
+    if (api == nullptr) {
+        return Fast::GFX_VOLUMETRICS_FALLBACK_NONE;
+    }
+    const int32_t backendReason = api->GetVolumetricsFallbackCode();
+    if (backendReason != Fast::GFX_VOLUMETRICS_FALLBACK_NONE) {
+        return backendReason;
+    }
+    return Fast::gVolumetricsFallbackReason;
+}
+
+extern "C" void gfx_get_volumetrics_runtime_stats(Fast::GfxVolumetricsRuntimeStats* outStats) {
+    if (outStats == nullptr) {
+        return;
+    }
+
+    *outStats = {};
+    const auto instance = Fast::mInstance.lock();
+    if (!instance) {
+        return;
+    }
+
+    const auto* api = instance->GetCurrentRenderingAPI();
+    if (api == nullptr) {
+        return;
+    }
+
+    *outStats = api->GetVolumetricsRuntimeStats();
+}
+
+extern "C" void gfx_clear_volumetrics_fallback_reason() {
+    Fast::gVolumetricsFallbackReason = Fast::GFX_VOLUMETRICS_FALLBACK_NONE;
+    const auto instance = Fast::mInstance.lock();
+    if (!instance) {
+        return;
+    }
+    auto* api = instance->GetCurrentRenderingAPI();
+    if (api != nullptr) {
+        api->ClearVolumetricsFallbackCode();
+    }
+}
+
+extern "C" const char* gfx_get_current_backend_name() {
+    const auto instance = Fast::mInstance.lock();
+    if (!instance) {
+        return "none";
+    }
+    auto* api = instance->GetCurrentRenderingAPI();
+    if (api == nullptr || api->GetName() == nullptr || api->GetName()[0] == '\0') {
+        return "none";
+    }
+    return api->GetName();
 }
