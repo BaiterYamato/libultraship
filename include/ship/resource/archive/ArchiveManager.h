@@ -106,6 +106,13 @@ class ArchiveManager {
     std::shared_ptr<File> LoadFile(const std::string& filePath);
 
     /**
+     * @brief Loads every mounted copy of a virtual path.
+     * @param filePath Virtual path of the file.
+     * @return Loaded files from lowest to highest archive priority.
+     */
+    std::vector<std::shared_ptr<File>> LoadFileFromAllLayers(const std::string& filePath);
+
+    /**
      * @brief Loads raw file bytes by 64-bit hash from the highest-priority matching archive.
      * @param hash CRC/hash of the file path.
      * @return Loaded File, or nullptr if not found.
