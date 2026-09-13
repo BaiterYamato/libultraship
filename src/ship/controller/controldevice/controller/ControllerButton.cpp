@@ -134,6 +134,12 @@ void ControllerButton::ClearAllButtonMappingsForDeviceType(PhysicalDeviceType ph
     SaveButtonMappingIdsToConfig();
 }
 
+void ControllerButton::ClearAllButtonMappingsForDeviceTypeTransient(PhysicalDeviceType physicalDeviceType) {
+    std::erase_if(mButtonMappings, [physicalDeviceType](const auto& entry) {
+        return entry.second->GetPhysicalDeviceType() == physicalDeviceType;
+    });
+}
+
 void ControllerButton::UpdatePad(CONTROLLERBUTTONS_T& padButtons) {
     for (const auto& [id, mapping] : mButtonMappings) {
         mapping->UpdatePad(padButtons);

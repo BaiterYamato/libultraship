@@ -97,6 +97,14 @@ class ControllerButton {
     void ClearAllButtonMappingsForDeviceType(PhysicalDeviceType physicalDeviceType);
 
     /**
+     * @brief Removes in-memory mappings for a device type without changing Config.
+     *
+     * Intended for reversible runtime overlays such as external mods. Calling
+     * ReloadAllMappingsFromConfig() restores the user's persisted mappings.
+     */
+    void ClearAllButtonMappingsForDeviceTypeTransient(PhysicalDeviceType physicalDeviceType);
+
+    /**
      * @brief Listens for the next raw physical input and adds or replaces a mapping for it.
      *
      * If @p id is non-empty, the existing mapping with that ID is replaced; otherwise
