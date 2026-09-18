@@ -142,6 +142,14 @@ endif()
 #=================== Compile Options & Defs ===================
 
 target_compile_definitions(libultraship PRIVATE ${GBI_UCODE})
+if (GBI_FLOAT_MTX)
+    # PUBLIC: Mtx is a typedef in a public header, so consumers must see the same definition
+    target_compile_definitions(libultraship PUBLIC GBI_FLOAT_MTX=1)
+endif()
+if (GBI_S32_VTX)
+    # PUBLIC: Vtx is a struct in a public header, so consumers must see the same definition
+    target_compile_definitions(libultraship PUBLIC GBI_S32_VTX=1)
+endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(${PROJECT_NAME} PRIVATE

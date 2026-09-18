@@ -1,4 +1,6 @@
 #include "ship/resource/ResourceLoader.h"
+#include <string_view>
+#include <cstdlib>
 #include "ship/resource/ResourceFactory.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/resource/Resource.h"
@@ -41,6 +43,10 @@ bool ResourceLoader::RegisterResourceFactory(std::shared_ptr<ResourceFactory> fa
 
     ResourceFactoryKey key{ .resourceFormat = format, .resourceType = type, .resourceVersion = version };
     if (mFactories.contains(key)) {
+        // Registering the same factory instance again under another type name only adds the name alias.
+        if (mFactories[key] == factory) {
+            return true;
+        }
         SPDLOG_ERROR("Failed to register resource factory: factory with key {}{}{} already exists", format, type,
                      version);
         return false;
@@ -84,7 +90,10 @@ std::shared_ptr<ResourceFactory> ResourceLoader::GetFactory(uint32_t format, std
 
 std::shared_ptr<ResourceInitData> ResourceLoader::ReadResourceInitDataLegacy(const std::string& filePath,
                                                                              std::shared_ptr<File> fileToLoad) {
-    // Determine if file is binary or XML...
+    // Determine if file is binary, XML or JSON...
+    if (fileToLoad->Buffer->at(0) == '{') {
+        return ReadResourceInitDataJson(filePath, fileToLoad);
+    }
     if (fileToLoad->Buffer->at(0) == '<') {
         // File is XML
         // Read the xml document
@@ -261,6 +270,8 @@ std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, st
         case RESOURCE_FORMAT_XML:
             fileToLoad->Reader = CreateXMLReader(fileToLoad, initData);
             break;
+        case RESOURCE_FORMAT_JSON:
+            break; // JSON factories parse the buffer (and any lower archive layers) themselves
     }
 
     // initData->Parent = shared_from_this();
@@ -315,6 +326,45 @@ ResourceLoader::ReadResourceInitDataBinary(const std::string& filePath, std::sha
     // OTR HEADER END
 
     headerReader->Seek(0, SeekOffsetType::Start);
+    return resourceInitData;
+}
+
+/**
+ * JSON resources declare their type as a top-level "$schema": "<type name>/<version>", e.g. "unbound/scene/1".
+ * A patch layer may omit it, so every mounted layer is searched, topmost first. Only that one key is read here;
+ * the factory parses the document.
+ */
+static std::string FindJsonSchema(const std::vector<std::shared_ptr<File>>& layers) {
+    for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+        auto doc = nlohmann::json::parse((*it)->Buffer->begin(), (*it)->Buffer->end(), nullptr, false, true);
+        if (doc.is_object() && doc.contains("$schema") && doc["$schema"].is_string()) {
+            return doc["$schema"].get<std::string>();
+        }
+    }
+    return "";
+}
+
+std::shared_ptr<ResourceInitData> ResourceLoader::ReadResourceInitDataJson(const std::string& filePath,
+                                                                           std::shared_ptr<File> fileToLoad) {
+    auto resourceInitData = CreateDefaultResourceInitData();
+    resourceInitData->Path = filePath;
+    resourceInitData->Format = RESOURCE_FORMAT_JSON;
+
+    std::string schema = FindJsonSchema({ fileToLoad });
+    if (schema.empty()) {
+        auto archives = Context::GetRawInstance()->GetResourceManager()->GetArchiveManager();
+        schema = FindJsonSchema(archives->LoadFileFromAllLayers(filePath));
+    }
+    if (schema.empty()) {
+        SPDLOG_ERROR("JSON resource {} has no \"$schema\" string in any layer", filePath);
+        return resourceInitData;
+    }
+    auto slash = schema.find_last_of('/');
+    std::string typeName = slash == std::string::npos ? schema : schema.substr(0, slash);
+    int32_t version = slash == std::string::npos ? 0 : std::atoi(schema.c_str() + slash + 1);
+
+    resourceInitData->Type = GetResourceType(typeName);
+    resourceInitData->ResourceVersion = version;
     return resourceInitData;
 }
 

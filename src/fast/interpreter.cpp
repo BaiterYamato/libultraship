@@ -19,6 +19,7 @@
 #include <list>
 #include <stack>
 #include "fast/resource/type/Light.h"
+#include "fast/resource/type/Vertex.h"
 
 #ifndef _LANGUAGE_C
 #define _LANGUAGE_C
@@ -69,7 +70,7 @@ std::stack<std::string> currentDir;
 #define RATIO_Y(activeFb, dims) \
     ((mFbActive ? activeFb->second.applied_height : dims.height) / (2.0f * HALF_SCREEN_HEIGHT(activeFb)))
 
-#define TEXTURE_CACHE_MAX_SIZE 1024
+#define TEXTURE_CACHE_MAX_SIZE 8192 // SOH [Unbound] was 1024
 
 namespace Fast {
 
@@ -1486,6 +1487,10 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
     if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
+#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
+        // Float matrices: no fixed-point quantisation (the int cast below overflows past +/-32767).
+        memcpy(matrix, it->second.mf, sizeof(matrix));
+#else
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 float v = it->second.mf[i][j];
@@ -1493,8 +1498,12 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
                 matrix[i][j] = as_int * (1.0f / 65536.0f);
             }
         }
+#endif
     } else {
-#ifndef GBI_FLOATS
+#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
+        // For a modified GBI where fixed point values are replaced with floats
+        memcpy(matrix, addr, sizeof(matrix));
+#else
         // Original GBI where fixed point matrices are used
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j += 2) {
@@ -1504,9 +1513,6 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
                 matrix[i][j + 1] = (int32_t)((int_part << 16) | (frac_part & 0xffff)) / 65536.0f;
             }
         }
-#else
-        // For a modified GBI where fixed point values are replaced with floats
-        memcpy(matrix, addr, sizeof(matrix));
 #endif
     }
 
@@ -3228,6 +3234,27 @@ void* Interpreter::SegAddr(uintptr_t w1) {
     }
 }
 
+// Vertices reached through a segment (a runtime vertex buffer, e.g. the Skin system's segment 8) are addressed
+// by a BYTE offset that was encoded when a vertex was 16 bytes. sizeof(F3DVtx) is larger under GBI_S32_VTX,
+// so the offset must be converted to an element index and re-scaled, or every vertex past the first is
+// misaligned. Identical to SegAddr when the two sizes agree.
+// Only correct for offsets authored in 16-byte units, i.e. every ROM-exported display list. A runtime-built
+// segmented address computed with sizeof(Vtx) (e.g. the unused z_fbdemo.c TransitionTile) would be rescaled
+// wrongly; such code must reference its vertices by raw pointer instead.
+F3DVtx* Interpreter::SegAddrVtx(uintptr_t w1) {
+    if (w1 & 1) {
+        uint32_t segNum = (uint32_t)(w1 >> 24);
+
+        uint32_t offset = w1 & 0x00FFFFFE;
+
+        if (mSegmentPointers[segNum] != 0) {
+            return (F3DVtx*)(mSegmentPointers[segNum] +
+                             (size_t)(offset / OTR_EXPORTED_VTX_SIZE) * sizeof(F3DVtx));
+        }
+    }
+    return (F3DVtx*)w1;
+}
+
 #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
 #define C1(pos, width) ((cmd->words.w1 >> (pos)) & ((1U << width) - 1))
 
@@ -3597,7 +3624,7 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), gfx->SegAddrVtx(cmd->words.w1));
 
     return false;
 }
@@ -3605,7 +3632,7 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), gfx->SegAddrVtx(cmd->words.w1));
 
     return false;
 }
@@ -3614,7 +3641,8 @@ bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    // The packed length is a byte count over the archive's vertex size, not the runtime struct's.
+    gfx->GfxSpVertex((C0(0, 16)) / OTR_EXPORTED_VTX_SIZE, C0(16, 4), gfx->SegAddrVtx(cmd->words.w1));
 
     return false;
 }
@@ -3636,10 +3664,20 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
         gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (F3DVtx*)offset);
         (*cmd0)++;
     } else {
-        F3DVtx* vtx = (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        // The exported offset is a BYTE offset into the vertex resource. Its unit is that resource's own
+        // on-disk record size (16 for vanilla v0, 22 for the s32 v1 form) - never sizeof(F3DVtx), which is
+        // the padded runtime struct. Ask the resource rather than assuming.
+        auto resourceMgr = Ship::Context::GetRawInstance()->GetResourceManager();
+        auto res = resourceMgr->LoadResource(hash);
+        F3DVtx* vtx = (F3DVtx*)resourceMgr->GetResourceRawPointer(res);
 
         if (vtx != NULL) {
-            vtx = (F3DVtx*)((char*)vtx + offset);
+            // dynamic_cast, not static: a hash that resolved to some other resource type would otherwise be
+            // undefined behaviour. Falls back to the vanilla record size, which is what this assumed before.
+            auto vertexRes = std::dynamic_pointer_cast<Fast::Vertex>(res);
+            const uint32_t recordSize =
+                (vertexRes != nullptr && vertexRes->RecordSize != 0) ? vertexRes->RecordSize : OTR_EXPORTED_VTX_SIZE;
+            vtx += offset / recordSize;
 
             (*cmd0)--;
             F3DGfx* cmd = *cmd0;
@@ -4619,6 +4657,20 @@ bool gfx_extra_geometry_mode_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// SOH [Unbound] OTR_G_FOGF: fog factor as two floats (w1 points at { mul, offset }). Same math as G_MW_FOG
+// (fog = ndcZ * mul + offset, 0..255) without the s16 packing, which capped where fog could start.
+bool gfx_fog_factor_float_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *(cmd0);
+    const float* f = (const float*)gfx->SegAddr(cmd->words.w1);
+
+    if (f != nullptr) {
+        gfx->mRsp->fog_mul = f[0];
+        gfx->mRsp->fog_offset = f[1];
+    }
+    return false;
+}
+
 bool gfx_stubbed_command_handler(F3DGfx** cmd0) {
     return false;
 }
@@ -4719,6 +4771,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_REGBLENDEDTEX,
       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
+    { OTR_G_FOGF, { "G_FOGF", gfx_fog_factor_float_handler_custom } },              // G_FOGF (0x41)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },

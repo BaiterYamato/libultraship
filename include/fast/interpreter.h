@@ -246,7 +246,7 @@ struct RSP {
     bool lights_changed;
 
     uint32_t geometry_mode;
-    int16_t fog_mul, fog_offset;
+    float fog_mul, fog_offset; // SOH [Unbound] float so fog can start beyond the s16 range (OTR_G_FOGF)
 
     uint32_t extra_geometry_mode;
 
@@ -493,6 +493,9 @@ class Interpreter {
 
     void SpReset();
     void* SegAddr(uintptr_t w1);
+    // Same, for vertex references: the encoded offset is in units of the archive's 16-byte vertex,
+    // which is not sizeof(F3DVtx) under GBI_S32_VTX. See OTR_EXPORTED_VTX_SIZE.
+    F3DVtx* SegAddrVtx(uintptr_t w1);
 
     static const char* CCMUXtoStr(uint32_t ccmux);
     static const char* ACMUXtoStr(uint32_t acmux);

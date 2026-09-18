@@ -150,6 +150,8 @@ class ResourceLoader {
      */
     static std::shared_ptr<ResourceInitData> ReadResourceInitDataXml(const std::string& filePath,
                                                                      std::shared_ptr<tinyxml2::XMLDocument> document);
+    std::shared_ptr<ResourceInitData> ReadResourceInitDataJson(const std::string& filePath,
+                                                               std::shared_ptr<File> fileToLoad);
 
     /**
      * @brief Reads a PNG image header to produce ResourceInitData.

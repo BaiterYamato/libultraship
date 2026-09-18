@@ -40,6 +40,8 @@ set(ADDITIONAL_LIB_INCLUDES "")
 # ========= Configuration Options =========
 option(INCLUDE_MPQ_SUPPORT "Enable StormLib and MPQ archive support" OFF)
 option(GBI_UCODE "Specify the GBI ucode version" F3DEX_GBI_2)
+option(GBI_FLOAT_MTX "Float matrices (MtxF as Mtx) with s16 vertices; lifts the +/-32767 translation cap" OFF)
+option(GBI_S32_VTX "s32 vertex positions (Vtx.ob); lifts the 65535-unit cap on one display list" OFF)
 
 # =========== Dependencies =============
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")

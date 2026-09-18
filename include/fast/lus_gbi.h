@@ -66,6 +66,7 @@ constexpr int8_t OTR_G_DL_INDEX = OPCODE(0x3d);
 constexpr int8_t OTR_G_READFB = OPCODE(0x3e);
 constexpr int8_t OTR_G_REGBLENDEDTEX = OPCODE(0x3f);
 constexpr int8_t OTR_G_SETINTENSITY = OPCODE(0x40);
+constexpr int8_t OTR_G_FOGF = OPCODE(0x41); // SOH [Unbound] float fog factor: w1 -> { float mul, float offset }
 constexpr int8_t OTR_G_MOVEMEM_HASH = OPCODE(0x42);
 constexpr int8_t OTR_G_PUSH_SHADER = OPCODE(0x43);
 constexpr int8_t OTR_G_POP_SHADER = OPCODE(0x44);
@@ -857,10 +858,12 @@ constexpr int8_t RDP_G_SETTILESIZE_LERP = OPCODE(0x4a);
  * Vertex (set up for use with colors)
  */
 typedef struct {
-#ifndef GBI_FLOATS
-    short ob[3]; /* x, y, z */
-#else
+#if defined(GBI_FLOATS)
     float ob[3]; /* x, y, z */
+#elif defined(GBI_S32_VTX)
+    int32_t ob[3]; /* x, y, z */
+#else
+    short ob[3]; /* x, y, z */
 #endif
     unsigned short flag;
     short tc[2];         /* texture coord */
@@ -871,10 +874,12 @@ typedef struct {
  * Vertex (set up for use with normals)
  */
 typedef struct {
-#ifndef GBI_FLOATS
-    short ob[3]; /* x, y, z */
-#else
+#if defined(GBI_FLOATS)
     float ob[3]; /* x, y, z */
+#elif defined(GBI_S32_VTX)
+    int32_t ob[3]; /* x, y, z */
+#else
+    short ob[3]; /* x, y, z */
 #endif
     unsigned short flag;
     short tc[2];      /* texture coord */
@@ -887,6 +892,11 @@ typedef union F3DVtx {
     F3DVtx_tn n; /* Use this one for normals */
     long long int force_structure_alignment;
 } F3DVtx;
+
+// Vertices are stored in OTR/O2R archives in the original 16-byte N64 layout (s16 positions), and exported
+// display lists carry BYTE offsets into that data. sizeof(F3DVtx) is not that size when GBI_S32_VTX is on,
+// so an exported byte offset must be divided by this - never by sizeof(F3DVtx) - to get an element index.
+#define OTR_EXPORTED_VTX_SIZE 16
 
 /*
  * Sprite structure
