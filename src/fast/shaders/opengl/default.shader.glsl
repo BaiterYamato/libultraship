@@ -37,6 +37,12 @@
         @{update_floats(4)}
     @end
 
+    @if(o_toon)
+        @{attr} vec3 aNormal;
+        @{out} vec3 vNormal;
+        @{update_floats(3)}
+    @end
+
     @for(i in 0..o_inputs)
         @if(o_alpha)
             @{attr} vec4 aInput@{i + 1};
@@ -70,6 +76,9 @@
         @if(o_grayscale)
             vGrayscaleColor = aGrayscaleColor;
         @end
+        @if(o_toon)
+            vNormal = aNormal;
+        @end
         @for(i in 0..o_inputs)
             vInput@{i + 1} = aInput@{i + 1};
         @end
@@ -100,6 +109,7 @@
 
     @if(o_fog) @{attr} vec4 vFog;
     @if(o_grayscale) @{attr} vec4 vGrayscaleColor;
+    @if(o_toon) @{attr} vec3 vNormal;
 
     @for(i in 0..o_inputs)
         @if(o_alpha)
@@ -123,6 +133,17 @@
 
     @if(o_prim_depth)
     uniform float prim_depth;
+    @end
+
+    @if(o_toon)
+    uniform vec3 toon_light_dir;
+    uniform vec3 toon_light_color;
+    uniform vec3 toon_ambient;
+    uniform float toon_ramp_center;
+    uniform float toon_ramp_softness;
+    uniform float toon_highlight_intensity;
+    uniform float toon_shadow_intensity;
+    uniform float toon_debug;
     @end
 
     uniform int texture_width[2];
@@ -252,6 +273,21 @@
         texel = WRAP(texel, -0.51, 1.51);
         texel = clamp(texel, 0.0, 1.0);
         // TODO discard if alpha is 0?
+
+        @if(o_toon)
+            vec3 toonN = normalize(vNormal);
+            float toonNL = dot(toonN, normalize(toon_light_dir)) * 0.5 + 0.5;
+            float toonRamp = smoothstep(toon_ramp_center - toon_ramp_softness,
+                                        toon_ramp_center + toon_ramp_softness, toonNL);
+            vec3 toonLit = toon_ambient + toon_light_color * toon_highlight_intensity;
+            vec3 toonShadow = mix(toonLit, toon_ambient, toon_shadow_intensity);
+            if (toon_debug > 0.5) {
+                texel.rgb = vec3(toonRamp);
+            } else {
+                texel.rgb = clamp(texel.rgb * mix(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+            }
+        @end
+
         @if(o_fog)
             @if(o_alpha)
                 texel = vec4(mix(texel.rgb, vFog.rgb, vFog.a), texel.a);

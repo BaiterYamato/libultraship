@@ -18,6 +18,22 @@ struct PerFrameCB {
     uint32_t padding[2]; // constant buffers must be multiples of 16 bytes in size
 };
 
+// SOH [Enhancement] Toon lighting: the per-object dominant light + frame-global ramp shape. Kept in
+// its own constant buffer (register b2) rather than PerFrameCB so that buffer stays purely frame-global;
+// this one is re-uploaded per toon draw. The padding keeps each float3 on a 16-byte boundary so the
+// layout matches the HLSL cbuffer packing rules. Total size 64 bytes (multiple of 16).
+struct PerToonCB {
+    float toon_light_dir[3];
+    float toon_ramp_center;
+    float toon_light_color[3];
+    float toon_ramp_softness;
+    float toon_ambient[3];
+    float toon_highlight_intensity;
+    float toon_shadow_intensity;
+    float toon_debug;
+    float _toon_pad[2];
+};
+
 struct PerDrawCB {
     struct Texture {
         uint32_t width;
@@ -65,6 +81,7 @@ struct ShaderProgramD3D11 {
     uint8_t numInputs;
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
+    bool opt_toon = false; // SOH [Enhancement] toon lighting variant
 };
 
 class GfxWindowBackendDXGI;
@@ -137,11 +154,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT];
 
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilState;
+    // SOH [Enhancement] Depth-stencil states, created lazily and cached for the device's lifetime (the
+    // stencil features flip the mode many times per frame, and each flip used to re-run
+    // CreateDepthStencilState). Key: depthTest | depthMask<<1 | zmodeDecal<<2 | stencilMode<<3 — same
+    // scheme as the Metal backend's cache.
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilStates[64];
+    int mLastStencilMode = -1; // SOH [Enhancement] world light casting: cache tracker for mStencilMode
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerPrimDepthCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerToonCb; // Wind Waker Style toon lighting (register b3)
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -159,6 +182,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerFrameCB mPerFrameCbData;
     PerDrawCB mPerDrawCbData;
     PerPrimDepthCB mPerPrimDepthCbData;
+    PerToonCB mPerToonCbData; // Wind Waker Style toon lighting
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 
