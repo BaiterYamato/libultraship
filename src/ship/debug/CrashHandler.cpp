@@ -80,6 +80,11 @@ void CrashHandler::AppendLine(const char* str) {
 void CrashHandler::PrintCommon() {
     if (mCallback != nullptr) {
         mCallback(mOutBuffer.get(), &mOutBuffersize);
+        // The callback has no capacity contract: keep the position and terminator inside the buffer before logging.
+        if (mOutBuffersize >= gMaxBufferSize) {
+            mOutBuffersize = gMaxBufferSize - 1;
+        }
+        mOutBuffer[mOutBuffersize] = '\0';
     }
 
     SPDLOG_CRITICAL(mOutBuffer.get());
