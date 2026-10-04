@@ -30,14 +30,23 @@ namespace Ship {
     AppendStr(varValue);
 
 bool CrashHandler::CheckStrLen(const char* str) {
-    if (strlen(str) + mOutBuffersize >= gMaxBufferSize) {
+    if (mOutBuffersize >= gMaxBufferSize) {
         return false;
     }
-    return true;
+    size_t remaining = gMaxBufferSize - 1 - mOutBuffersize;
+    while (remaining != 0 && *str != '\0') {
+        --remaining;
+        ++str;
+    }
+    return *str == '\0';
 }
 
 void CrashHandler::AppendStrTrunc(const char* str) {
-    while (mOutBuffersize < gMaxBufferSize - 1) {
+    // Nunca use uma posição fora do buffer, mesmo após callback inconsistente.
+    if (mOutBuffersize >= gMaxBufferSize) {
+        mOutBuffersize = gMaxBufferSize - 1;
+    }
+    while (mOutBuffersize < gMaxBufferSize - 1 && *str != '\0') {
         mOutBuffer[mOutBuffersize++] = *str++;
     }
     mOutBuffer[mOutBuffersize] = '\0';
@@ -52,11 +61,15 @@ void CrashHandler::AppendStr(const char* str) {
     while (*str != '\0') {
         mOutBuffer[mOutBuffersize++] = *str++;
     }
+    mOutBuffer[mOutBuffersize] = '\0';
 }
 
 void CrashHandler::AppendLine(const char* str) {
     AppendStr(str);
-    mOutBuffer[mOutBuffersize++] = '\n';
+    if (mOutBuffersize < gMaxBufferSize - 1) {
+        mOutBuffer[mOutBuffersize++] = '\n';
+    }
+    mOutBuffer[mOutBuffersize] = '\0';
 }
 
 /**
