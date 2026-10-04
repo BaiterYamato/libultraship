@@ -1542,13 +1542,30 @@ void Interpreter::SelectToonLight() {
     mRsp->toon_light_color[2] = mRsp->toon_key_color[2];
 }
 
+// SOH [Link-Span] OOT-VANILLA-001: o host liga quando o jogo roda sem mods; a matriz de interpolação passa então pela
+// mesma quantização s16.16 do GBI original.
+static bool sQuantizeFloatMtx = false;
+extern "C" void Fast_SetQuantizeFloatMtx(bool on) {
+    sQuantizeFloatMtx = on;
+}
+
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
     if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
 #if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
         // Float matrices: no fixed-point quantisation (the int cast below overflows past +/-32767).
-        memcpy(matrix, it->second.mf, sizeof(matrix));
+        if (sQuantizeFloatMtx) {
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                    float v = it->second.mf[i][j];
+                    int as_int = (int)(v * 65536.0f);
+                    matrix[i][j] = as_int * (1.0f / 65536.0f);
+                }
+            }
+        } else {
+            memcpy(matrix, it->second.mf, sizeof(matrix));
+        }
 #else
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
