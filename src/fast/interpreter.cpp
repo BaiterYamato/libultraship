@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
 #include <any>
 #include <map>
 #include <set>
@@ -510,15 +511,18 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     }
 
     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
-        // Remove the texture that was least recently used
-        it = mTextureCache.lru.front().it;
-        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
-        for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
-            if (mRenderingState.mTextures[j] == &*it)
-                mRenderingState.mTextures[j] = nullptr;
+        // A bound texture must keep its ID/content until its slot is replaced.
+        // With more cache entries than slots, an unbound victim always exists.
+        static_assert(TEXTURE_CACHE_MAX_SIZE > SHADER_MAX_TEXTURES);
+        auto lru_it = mTextureCache.lru.begin();
+        while (std::find(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures),
+                         &*lru_it->it) != std::end(mRenderingState.mTextures)) {
+            ++lru_it;
         }
+        it = lru_it->it;
+        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+        mTextureCache.lru.erase(lru_it);
         mTextureCache.map.erase(it);
-        mTextureCache.lru.pop_front();
     }
 
     uint32_t texture_id;
