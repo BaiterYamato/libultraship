@@ -163,6 +163,8 @@ class Fast3dGui : public Ship::Gui {
     GuiWindowInitData mImpl;                 ///< Backend-specific window/context handles passed to Init().
 
   private:
+    bool mImGuiBackendReady = false;
+
     /** @brief Applies any pending resolution or MSAA changes to the render target. */
     void ApplyResolutionChanges();
 

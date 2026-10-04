@@ -46,8 +46,10 @@ Fast3dGui::Fast3dGui(std::vector<std::shared_ptr<Ship::GuiWindow>> guiWindows) :
 }
 
 void Fast3dGui::Init(GuiWindowInitData windowImpl) {
+    mImGuiBackendReady = false;
     mImpl = windowImpl;
     Gui::Init();
+    mImGuiBackendReady = true;
 }
 
 bool Fast3dGui::SupportsViewports() {
@@ -66,6 +68,12 @@ bool Fast3dGui::SupportsViewports() {
 }
 
 void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
+    // A WndProc pode ser chamada antes de Init() atribuir mImpl.
+    if (!mImGuiBackendReady || ImGui::GetCurrentContext() == nullptr ||
+        ImGui::GetIO().BackendPlatformUserData == nullptr) {
+        return;
+    }
+
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
@@ -117,6 +125,8 @@ void Fast3dGui::ImGuiWMInit() {
 }
 
 void Fast3dGui::ImGuiWMShutdown() {
+    // Bloqueia eventos reentrantes durante o encerramento dos backends.
+    mImGuiBackendReady = false;
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
