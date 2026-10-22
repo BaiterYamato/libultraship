@@ -1851,15 +1851,15 @@ typedef union Gfx {
     { (_SHIFTL(G_VTX, 24, 8) | _SHIFTL((n), 12, 8) | _SHIFTL((v0) + (n), 1, 7)), (uintptr_t)(v)MakeTrace() }
 
 #elif (defined(F3DEX_GBI) || defined(F3DLP_GBI))
-                 /*
-                  * F3DEX_GBI: G_VTX GBI format was changed to support 64 vertice.
-                  *
-                  *        +--------+--------+------+----------+
-                  *  G_VTX |  cmd:8 |  v0:8  |  n:6 |length:10 |
-                  *        +-+---+--+--------+------+----------+
-                  *        | |seg|          address            |
-                  *        +-+---+-----------------------------+
-                  */
+                   /*
+                    * F3DEX_GBI: G_VTX GBI format was changed to support 64 vertice.
+                    *
+                    *        +--------+--------+------+----------+
+                    *  G_VTX |  cmd:8 |  v0:8  |  n:6 |length:10 |
+                    *        +-+---+--+--------+------+----------+
+                    *        | |seg|          address            |
+                    *        +-+---+-----------------------------+
+                    */
 #define __gSPVertex(pkt, v, n, v0) gDma1p((pkt), G_VTX, (v), ((n) << 10) | (sizeof(Vtx) * (n)-1), (v0)*2)
 #define gsSPVertex(v, n, v0) gsDma1p(G_VTX, (v), ((n) << 10) | (sizeof(Vtx) * (n)-1), (v0)*2)
 #else
@@ -2860,13 +2860,13 @@ typedef union Gfx {
 
 // SOH [Enhancement] Toon lighting per-object key light. dx/dy/dz are the signed key direction
 // (world space, * 127) and r/g/b the key light color, packed into the two command words.
-#define gSPToonKey(pkt, dx, dy, dz, r, g, b)                                                                     \
-    {                                                                                                            \
-        Gfx* _g = (Gfx*)(pkt);                                                                                   \
-                                                                                                                \
-        _g->words.w0 = _SHIFTL(G_SETTOONKEY, 24, 8) | _SHIFTL((dx) & 0xFF, 16, 8) | _SHIFTL((dy) & 0xFF, 8, 8) | \
-                       _SHIFTL((dz) & 0xFF, 0, 8);                                                              \
-        _g->words.w1 = _SHIFTL((r) & 0xFF, 16, 8) | _SHIFTL((g) & 0xFF, 8, 8) | _SHIFTL((b) & 0xFF, 0, 8);      \
+#define gSPToonKey(pkt, dx, dy, dz, r, g, b)                                                                 \
+    {                                                                                                        \
+        Gfx* _g = (Gfx*)(pkt);                                                                               \
+                                                                                                             \
+        _g->words.w0 = _SHIFTL(G_SETTOONKEY, 24, 8) | _SHIFTL((dx)&0xFF, 16, 8) | _SHIFTL((dy)&0xFF, 8, 8) | \
+                       _SHIFTL((dz)&0xFF, 0, 8);                                                             \
+        _g->words.w1 = _SHIFTL((r)&0xFF, 16, 8) | _SHIFTL((g)&0xFF, 8, 8) | _SHIFTL((b)&0xFF, 0, 8);         \
     }
 
 // SOH [Enhancement] Actor shadow per-object marker (low-level primitive; prefer gSPToonShadowArm to arm).
@@ -2874,17 +2874,17 @@ typedef union Gfx {
 // are an arm channel: nz is the arm marker (any nonzero byte arms the shadow; all-zero disarms it), and nx:ny
 // carry an s16 "feet-clamp" world Y (see gSPToonShadowArm). Blend strength + length are global (pushed once
 // per frame, not per object). The shadow direction reuses the object's gSPToonKey, so emit this AFTER the key.
-#define gSPToonShadow(pkt, nx, ny, nz, planeD)                                                     \
-    {                                                                                              \
-        Gfx* _g = (Gfx*)(pkt);                                                                     \
-        union {                                                                                    \
-            f32 f;                                                                                 \
-            u32 u;                                                                                 \
-        } _pd;                                                                                     \
-        _pd.f = (f32)(planeD);                                                                     \
-        _g->words.w0 = _SHIFTL(G_SETTOONSHADOW, 24, 8) | _SHIFTL((nx) & 0xFF, 16, 8) |             \
-                       _SHIFTL((ny) & 0xFF, 8, 8) | _SHIFTL((nz) & 0xFF, 0, 8);                    \
-        _g->words.w1 = _pd.u;                                                                      \
+#define gSPToonShadow(pkt, nx, ny, nz, planeD)                                                                  \
+    {                                                                                                           \
+        Gfx* _g = (Gfx*)(pkt);                                                                                  \
+        union {                                                                                                 \
+            f32 f;                                                                                              \
+            u32 u;                                                                                              \
+        } _pd;                                                                                                  \
+        _pd.f = (f32)(planeD);                                                                                  \
+        _g->words.w0 = _SHIFTL(G_SETTOONSHADOW, 24, 8) | _SHIFTL((nx)&0xFF, 16, 8) | _SHIFTL((ny)&0xFF, 8, 8) | \
+                       _SHIFTL((nz)&0xFF, 0, 8);                                                                \
+        _g->words.w1 = _pd.u;                                                                                   \
     }
 
 // SOH [Enhancement] Actor shadow: arm this object's drop shadow with an eased `size` (0..1) and an optional
@@ -2894,8 +2894,8 @@ typedef union Gfx {
 // TOON_SHADOW_NO_CLAMP to leave the feet at the captured geometry (the default for normal actors). nz holds
 // the arm marker so the shadow arms even when the clamp bytes are zero.
 #define TOON_SHADOW_NO_CLAMP (-32768)
-#define gSPToonShadowArm(pkt, feetClampY, size)                                                    \
-    gSPToonShadow(pkt, ((s32)(feetClampY) >> 8) & 0xFF, (s32)(feetClampY) & 0xFF, 0x7F, (size))
+#define gSPToonShadowArm(pkt, feetClampY, size) \
+    gSPToonShadow(pkt, ((s32)(feetClampY) >> 8) & 0xFF, (s32)(feetClampY)&0xFF, 0x7F, (size))
 
 // SOH [Enhancement] Actor shadow: render the frame's accumulated shadow volumes now. Emitted at the pre-actor
 // hook (after the room, before actors) so the shadows land only on the environment. A zero normal + the
@@ -2910,7 +2910,6 @@ typedef union Gfx {
         _g->words.w0 = _SHIFTL(G_SETSTENCIL, 24, 8); \
         _g->words.w1 = (mode);                       \
     }
-
 
 #define gSPPushShader(pkt, shader)                     \
     {                                                  \

@@ -615,20 +615,20 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
 
     if (textures_changed || mPrimDepthDirty || mShaderProgram->opt_toon) {
         mDrawUniforms.prim_depth = mCurrentPrimDepth;
-    // Toon lighting: feed the per-object dominant light + frame-global ramp shape,
-    // both pushed in by the application (SetToonLighting / SetToonRamp). No config reads here.
-    if (mShaderProgram->opt_toon) {
-        for (int j = 0; j < 3; j++) {
-            mDrawUniforms.toonLightDir[j] = mToonLightDir[j];
-            mDrawUniforms.toonLightColor[j] = mToonLightColor[j];
-            mDrawUniforms.toonAmbient[j] = mToonAmbient[j];
+        // Toon lighting: feed the per-object dominant light + frame-global ramp shape,
+        // both pushed in by the application (SetToonLighting / SetToonRamp). No config reads here.
+        if (mShaderProgram->opt_toon) {
+            for (int j = 0; j < 3; j++) {
+                mDrawUniforms.toonLightDir[j] = mToonLightDir[j];
+                mDrawUniforms.toonLightColor[j] = mToonLightColor[j];
+                mDrawUniforms.toonAmbient[j] = mToonAmbient[j];
+            }
+            mDrawUniforms.toonRampCenter = mToonRampCenter;
+            mDrawUniforms.toonRampSoftness = mToonRampSoftness;
+            mDrawUniforms.toonHighlightIntensity = mToonHighlightIntensity;
+            mDrawUniforms.toonShadowIntensity = mToonShadowIntensity;
+            mDrawUniforms.toonDebug = mToonDebug;
         }
-        mDrawUniforms.toonRampCenter = mToonRampCenter;
-        mDrawUniforms.toonRampSoftness = mToonRampSoftness;
-        mDrawUniforms.toonHighlightIntensity = mToonHighlightIntensity;
-        mDrawUniforms.toonShadowIntensity = mToonShadowIntensity;
-        mDrawUniforms.toonDebug = mToonDebug;
-    }
 
         current_framebuffer.mCommandEncoder->setFragmentBytes(&mDrawUniforms, sizeof(DrawUniforms), 1);
         mPrimDepthDirty = false;

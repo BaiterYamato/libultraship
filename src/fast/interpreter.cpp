@@ -515,8 +515,8 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         // With more cache entries than slots, an unbound victim always exists.
         static_assert(TEXTURE_CACHE_MAX_SIZE > SHADER_MAX_TEXTURES);
         auto lru_it = mTextureCache.lru.begin();
-        while (std::find(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures),
-                         &*lru_it->it) != std::end(mRenderingState.mTextures)) {
+        while (std::find(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), &*lru_it->it) !=
+               std::end(mRenderingState.mTextures)) {
             ++lru_it;
         }
         it = lru_it->it;
@@ -3147,8 +3147,9 @@ void Interpreter::FlushToonShadow() {
             const uint64_t* r1 = raster[(gz * 2) + 1];
             for (int gx = 0; gx < kShadowGridSize; gx++) {
                 const int sx = gx * 2;
-                const int cov = (int)((r0[sx >> 6] >> (sx & 63)) & 1ull) + (int)((r0[(sx + 1) >> 6] >> ((sx + 1) & 63)) & 1ull) +
-                                (int)((r1[sx >> 6] >> (sx & 63)) & 1ull) + (int)((r1[(sx + 1) >> 6] >> ((sx + 1) & 63)) & 1ull);
+                const int cov =
+                    (int)((r0[sx >> 6] >> (sx & 63)) & 1ull) + (int)((r0[(sx + 1) >> 6] >> ((sx + 1) & 63)) & 1ull) +
+                    (int)((r1[sx >> 6] >> (sx & 63)) & 1ull) + (int)((r1[(sx + 1) >> 6] >> ((sx + 1) & 63)) & 1ull);
                 if (cov == 0) {
                     continue;
                 }
@@ -3409,8 +3410,7 @@ void Interpreter::RenderShadowVolumes() {
         }
         // Band alpha: full-opacity core, one step lighter per ring.
         const int step = std::min(band, bandsTotal - 1);
-        const uint8_t bandA =
-            (uint8_t)(coreAlpha * ((float)(bandsTotal - step) / (float)bandsTotal) * 255.0f);
+        const uint8_t bandA = (uint8_t)(coreAlpha * ((float)(bandsTotal - step) / (float)bandsTotal) * 255.0f);
         if (bandA == 0) {
             continue;
         }
@@ -4003,8 +4003,7 @@ F3DVtx* Interpreter::SegAddrVtx(uintptr_t w1) {
         uint32_t offset = w1 & 0x00FFFFFE;
 
         if (mSegmentPointers[segNum] != 0) {
-            return (F3DVtx*)(mSegmentPointers[segNum] +
-                             (size_t)(offset / OTR_EXPORTED_VTX_SIZE) * sizeof(F3DVtx));
+            return (F3DVtx*)(mSegmentPointers[segNum] + (size_t)(offset / OTR_EXPORTED_VTX_SIZE) * sizeof(F3DVtx));
         }
     }
     return (F3DVtx*)w1;
@@ -5630,10 +5629,9 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_FOGF, { "G_FOGF", gfx_fog_factor_float_handler_custom } },              // G_FOGF (0x41)
     { OTR_G_SETTOON, { "G_SETTOON", gfx_set_toon_handler_custom } },
     { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },
-    { OTR_G_SETTOONSHADOW,
-      { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } },
+    { OTR_G_SETTOONSHADOW, { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } },
     { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } },
-    { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
+    { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } }, // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
     { RDP_G_LOADBLOCK_WIDE, { "G_LOADBLOCK_WIDE", gfx_load_block_wide_handler_rdp } }, // RDP_G_LOADBLOCK_WIDE (-15)

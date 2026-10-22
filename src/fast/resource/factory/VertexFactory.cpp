@@ -39,9 +39,8 @@ std::shared_ptr<Vertex> ReadVertexResource(Ship::BinaryReader& reader, std::shar
     return vertex;
 }
 
-static std::shared_ptr<Ship::IResource> ReadVertexFile(std::shared_ptr<Ship::File> file,
-                                                       std::shared_ptr<Ship::ResourceInitData> initData,
-                                                       bool s32Positions) {
+static std::shared_ptr<Ship::IResource>
+ReadVertexFile(std::shared_ptr<Ship::File> file, std::shared_ptr<Ship::ResourceInitData> initData, bool s32Positions) {
     auto reader = std::get<std::shared_ptr<Ship::BinaryReader>>(file->Reader);
     uint32_t count = reader->ReadUInt32();
     return ReadVertexResource(*reader, initData, count, s32Positions);
