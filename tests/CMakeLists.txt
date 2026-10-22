@@ -19,6 +19,8 @@ add_executable(lus_tests
     sound_matrix_decoder_tests.cpp
     path_file_helper_tests.cpp
     archive_resource_tests.cpp
+    archive_manager_lifetime_tests.cpp
+    archive_manager_zip_metadata_tests.cpp
     glob_tests.cpp
     splittext_tests.cpp
     path_diskfile_tests.cpp
@@ -39,12 +41,21 @@ endif()
 
 set_property(TARGET lus_tests PROPERTY CXX_STANDARD 20)
 
+# Synthetic ZIP fixtures use libzip directly; its include dependency is private to LUS.
+find_package(libzip REQUIRED)
+
 target_link_libraries(lus_tests PRIVATE
     libultraship
     gtest_main
+    libzip::zip
 )
 
 target_compile_definitions(lus_tests PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_OFF)
 
 include(GoogleTest)
-gtest_discover_tests(lus_tests)
+# Keep existing tests unchanged; bound only the lifecycle/reentry suite.
+gtest_discover_tests(lus_tests TEST_FILTER "-ArchiveManagerLifetime.*")
+gtest_discover_tests(lus_tests
+    TEST_FILTER "ArchiveManagerLifetime.*"
+    PROPERTIES TIMEOUT 20
+)
