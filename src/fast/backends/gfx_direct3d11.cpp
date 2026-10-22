@@ -267,7 +267,8 @@ void GfxRenderingAPIDX11::Init() {
 
     vertex_buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
     // Matches the CPU mBufVbo allocation in interpreter.cpp (VBO_MAX_FLOATS_PER_VERTEX floats/vertex).
-    vertex_buffer_desc.ByteWidth = 256 * VBO_MAX_FLOATS_PER_VERTEX * 3 * sizeof(float); // Same as buf_vbo size in gfx_pc
+    vertex_buffer_desc.ByteWidth =
+        256 * VBO_MAX_FLOATS_PER_VERTEX * 3 * sizeof(float); // Same as buf_vbo size in gfx_pc
     vertex_buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     vertex_buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     vertex_buffer_desc.MiscFlags = 0;
@@ -687,8 +688,9 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
 
-    // SOH [Enhancement] World light casting: also rebuild when the stencil mode changes. Link-Span: a decal-only change must NOT rebuild the state, as upstream: the image without mods has to
-    // stay identical (fixing that stale compare function is a separate renderer decision, not transport).
+    // SOH [Enhancement] World light casting: also rebuild when the stencil mode changes. Link-Span: a decal-only change
+    // must NOT rebuild the state, as upstream: the image without mods has to stay identical (fixing that stale compare
+    // function is a separate renderer decision, not transport).
     if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask ||
         mLastStencilMode != mStencilMode) {
         mLastDepthTest = mCurrentDepthTest;
@@ -1048,8 +1050,7 @@ void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
         // SOH [Enhancement] Stencil volumes: also clear the stencil plane (the combined D24S8 format always
         // has one). The z-fail masks assume stencil starts at 0 each frame, and the composite only
         // self-zeroes pixels it draws.
-        mContext->ClearDepthStencilView(fb.depth_stencil_view.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
-                                        1.0f, 0);
+        mContext->ClearDepthStencilView(fb.depth_stencil_view.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     }
 }
 

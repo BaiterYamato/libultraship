@@ -616,10 +616,10 @@ class Interpreter {
     std::vector<LoadedVertex> mShadowXform;
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
-    float mShadowSlabDepth = 40.0f;    // stencil-volume: how far below the feet the slab reaches (ground band)
-    float mShadowSlabRise = 10.0f;     // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
-    int mShadowEdgeSoftness = 1;       // penumbra rings around the silhouette (0 = hard edge, max 2)
-    bool mShadowShowVolume = false;    // debug: draw the translucent shadow volume (black caps, blue walls)
+    float mShadowSlabDepth = 40.0f;       // stencil-volume: how far below the feet the slab reaches (ground band)
+    float mShadowSlabRise = 10.0f;        // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
+    int mShadowEdgeSoftness = 1;          // penumbra rings around the silhouette (0 = hard edge, max 2)
+    bool mShadowShowVolume = false;       // debug: draw the translucent shadow volume (black caps, blue walls)
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
     std::shared_ptr<GfxDebugger> mGfxDebugger;
