@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include "ship/utils/binarytools/BinaryReader.h"
 
 namespace tinyxml2 {
@@ -203,7 +204,7 @@ class Archive : public std::enable_shared_from_this<Archive> {
     bool mIsChecksumValid;
     bool mHasGameVersion;
     uint32_t mGameVersion;
-    int32_t mPriority = -1;
+    std::atomic<int32_t> mPriority{ -1 };
     ArchiveManifest mManifest;
     std::string mPath;
     std::shared_ptr<std::unordered_map<uint64_t, std::string>> mHashes;

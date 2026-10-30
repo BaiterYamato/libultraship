@@ -168,11 +168,11 @@ void Archive::SetLoaded(bool isLoaded) {
 }
 
 int32_t Archive::GetPriority() {
-    return mPriority;
+    return mPriority.load(std::memory_order_relaxed);
 }
 
 void Archive::SetPriority(int32_t priority) {
-    mPriority = priority;
+    mPriority.store(priority, std::memory_order_relaxed);
 }
 
 void Archive::SetGameVersion(uint32_t gameVersion) {

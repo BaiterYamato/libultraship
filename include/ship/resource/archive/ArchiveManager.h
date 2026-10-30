@@ -42,6 +42,11 @@ using UntrustedArchiveHandler = std::function<bool(Archive& archive, KeystoreEnt
 class ArchiveManager {
   public:
     ArchiveManager();
+    struct ArchiveSnapshot {
+        std::vector<std::shared_ptr<Archive>> archives;
+        uint64_t revision;
+    };
+    ArchiveSnapshot GetArchiveSnapshot();
 
     /**
      * @brief Discovers and mounts all archives found under the given paths.
@@ -98,6 +103,12 @@ class ArchiveManager {
      * @return Number of archives removed (0 or 1).
      */
     size_t RemoveArchive(std::shared_ptr<Archive> archive);
+
+    // Troca integral, por revisão, identidade e ordem, de um snapshot esperado. Os candidatos devem estar
+    // abertos e seus índices permanecer imutáveis. false preserva o VFS; exceções também.
+    // published deve estar vazio; recebe ownership gerenciado, na ordem de desired.
+    bool ReplaceArchiveBatch(const ArchiveSnapshot& expected, const std::vector<std::shared_ptr<Archive>>& desired,
+                             std::vector<std::shared_ptr<Archive>>& published);
 
     /**
      * @brief Removes the archive at the given filesystem path.
@@ -259,6 +270,7 @@ class ArchiveManager {
                                                   const std::shared_ptr<ManagedArchive>& candidate);
     void RebuildVirtualFileSystemLocked();
     mutable std::mutex mMutex;
+    uint64_t mRevision = 0;
     std::unordered_map<Archive*, std::shared_ptr<ManagedArchiveState>> mManagedArchives;
     // Returned string pointers stay valid until this manager is destroyed.
     mutable std::unordered_set<std::string> mPathStrings;

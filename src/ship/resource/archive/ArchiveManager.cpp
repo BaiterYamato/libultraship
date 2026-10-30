@@ -75,6 +75,7 @@ std::shared_ptr<Archive> ArchiveManager::ManagedArchiveLocked(const std::shared_
 }
 
 void ArchiveManager::RebuildVirtualFileSystemLocked() {
+    ++mRevision;
     mGameVersions.clear();
     mHashes.clear();
     mFileToArchive.clear();
@@ -290,6 +291,7 @@ bool ArchiveManager::WriteFile(std::shared_ptr<Archive> archive, const std::stri
             const auto hash = CRC64(filePath.c_str());
             mHashes[hash] = filePath;
             mFileToArchive[hash] = retained;
+            ++mRevision;
         }
     }
     return true;
@@ -312,7 +314,100 @@ size_t ArchiveManager::RemoveArchive(const std::string& path) {
 }
 
 size_t ArchiveManager::RemoveArchive(std::shared_ptr<Archive> archive) {
-    return RemoveArchive(archive->GetPath());
+    if (!archive)
+        return 0;
+    std::shared_ptr<Archive> removed;
+    {
+        const std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = std::find(mArchives.begin(), mArchives.end(), archive);
+        if (found == mArchives.end())
+            return 0;
+        removed = *found;
+        mArchives.erase(found);
+        RebuildVirtualFileSystemLocked();
+    }
+    return 1;
+}
+
+ArchiveManager::ArchiveSnapshot ArchiveManager::GetArchiveSnapshot() {
+    const std::lock_guard<std::mutex> lock(mMutex);
+    return { mArchives, mRevision };
+}
+
+bool ArchiveManager::ReplaceArchiveBatch(const ArchiveSnapshot& expected,
+                                         const std::vector<std::shared_ptr<Archive>>& desired,
+                                         std::vector<std::shared_ptr<Archive>>& published) {
+    if (!published.empty())
+        return false;
+    std::vector<std::shared_ptr<ManagedArchive>> candidates;
+    std::vector<std::shared_ptr<Archive>> prepared, next, result;
+    candidates.reserve(desired.size());
+    prepared.reserve(desired.size());
+    next.reserve(desired.size());
+    for (const auto& archive : desired) {
+        if (!archive)
+            return false;
+        candidates.push_back(std::make_shared<ManagedArchive>(archive));
+        prepared.push_back(PrepareArchiveSnapshot(candidates.back()));
+    }
+    // Índices temporários e referências antigas são destruídos depois do lock, inclusive em exceção.
+    decltype(mHashes) hashes;
+    decltype(mFileToArchive) files;
+    decltype(mDirectories) directories;
+    decltype(mGameVersions) versions;
+    decltype(mManagedArchives) states;
+    {
+        const std::lock_guard<std::mutex> lock(mMutex);
+        if (mRevision != expected.revision || mArchives != expected.archives)
+            return false;
+        states = mManagedArchives;
+        for (size_t i = 0; i < desired.size(); ++i) {
+            const auto& archive = desired[i];
+            if (!archive->IsLoaded() ||
+                (!mValidGameVersions.empty() && !mValidGameVersions.contains(archive->GetGameVersion())))
+                return false;
+            // Um objeto só pode aparecer uma vez, mesmo que tenha o mesmo caminho de outro.
+            if (std::find(next.begin(), next.end(), archive) != next.end())
+                return false;
+            const auto mounted = std::find(mArchives.begin(), mArchives.end(), archive);
+            if (mounted != mArchives.end()) {
+                next.push_back(*mounted);
+            } else {
+                const auto found = states.find(archive.get());
+                if (found != states.end() &&
+                    !(found->second->unloaded.load(std::memory_order_acquire) && found->second->snapshot.expired()))
+                    return false; // Nunca ressuscitar snapshot aposentado ou em Close.
+                states[archive.get()] = candidates[i]->state;
+                next.push_back(prepared[i]);
+            }
+            if (archive->HasGameVersion())
+                versions.push_back(archive->GetGameVersion());
+            for (const auto& [hash, name] : *archive->ListFiles()) {
+                hashes[hash] = name;
+                files[hash] = next.back(); // A prioridade genérica continua sendo: último archive ganha.
+                const auto slash = name.find_last_of('/');
+                if (slash != std::string::npos)
+                    directories.insert(name.substr(0, slash));
+            }
+        }
+        result = next;
+        // Daqui até o fim do commit só há stores e swaps sem alocação.
+        for (size_t i = 0; i < next.size(); ++i) {
+            if (std::find(expected.archives.begin(), expected.archives.end(), desired[i]) == expected.archives.end())
+                candidates[i]->managed = true;
+            if (next[i]->GetPriority() != static_cast<int32_t>(i))
+                next[i]->SetPriority(static_cast<int32_t>(i));
+        }
+        mArchives.swap(next);
+        mHashes.swap(hashes);
+        mFileToArchive.swap(files);
+        mDirectories.swap(directories);
+        mGameVersions.swap(versions);
+        mManagedArchives.swap(states);
+        published.swap(result);
+        ++mRevision;
+    }
+    return true;
 }
 
 void ArchiveManager::SetArchives(std::shared_ptr<std::vector<std::shared_ptr<Archive>>> archives) {
