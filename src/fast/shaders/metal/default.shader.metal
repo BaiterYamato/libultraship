@@ -10,10 +10,22 @@ struct FrameUniforms {
 };
 
 struct DrawUniforms {
+    // SOH [Enhancement] Sized to 6 to match the C++ DrawUniforms (textureFiltering[SHADER_MAX_TEXTURES]),
+    // so the toon fields below land at the same byte offset in both structs.
     int textureFiltering[6];
     @if(o_prim_depth)
     float prim_depth;
     @end
+    // SOH [Enhancement] Toon lighting (unconditional so the CB layout matches the C++ struct for
+    // every shader variant). packed_float3 is 12 bytes / 4-aligned, matching simd::float1[3].
+    packed_float3 toonLightDir;
+    packed_float3 toonLightColor;
+    packed_float3 toonAmbient;
+    float toonRampCenter;
+    float toonRampSoftness;
+    float toonHighlightIntensity;
+    float toonShadowIntensity;
+    float toonDebug;
 };
 
 struct FragOut {
@@ -50,6 +62,10 @@ struct Vertex {
         float4 grayscale [[attribute(@{get_vertex_index()})]];
         @{update_floats(4)}
     @end
+    @if(o_toon)
+        float3 normal [[attribute(@{get_vertex_index()})]];
+        @{update_floats(3)}
+    @end
     @for(i in 0..o_inputs)
         @if(o_alpha)
             float4 input@{i + 1} [[attribute(@{get_vertex_index()})]];
@@ -82,6 +98,9 @@ struct ProjectedVertex {
     @if(o_grayscale)
         float4 grayscale;
     @end
+    @if(o_toon)
+        float3 normal;
+    @end
     @for(i in 0..o_inputs)
         @if(o_alpha)
             float4 input@{i + 1};
@@ -113,6 +132,9 @@ vertex ProjectedVertex vertexShader(Vertex in [[stage_in]]) {
     @end
     @if(o_grayscale)
         out.grayscale = in.grayscale;
+    @end
+    @if(o_toon)
+        out.normal = in.normal;
     @end
     @for(i in 0..o_inputs)
          out.input@{i + 1} = in.input@{i + 1};
@@ -266,6 +288,26 @@ fragment FragOut fragmentShader(
     texel = WRAP(texel, -0.51, 1.51);
     texel = clamp(texel, 0.0, 1.0);
     // TODO discard if alpha is 0?
+
+    // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single dominant
+    // light through a soft half-Lambert ramp.
+    @if(o_toon)
+        float3 toonN = normalize(in.normal);
+        float3 toonL = normalize(float3(drawUniforms.toonLightDir));
+        float toonNL = dot(toonN, toonL) * 0.5 + 0.5;
+        float toonRamp = smoothstep(drawUniforms.toonRampCenter - drawUniforms.toonRampSoftness,
+                                    drawUniforms.toonRampCenter + drawUniforms.toonRampSoftness, toonNL);
+        float3 toonLit = float3(drawUniforms.toonAmbient) +
+                         float3(drawUniforms.toonLightColor) * drawUniforms.toonHighlightIntensity;
+        float3 toonShadow = mix(toonLit, float3(drawUniforms.toonAmbient), drawUniforms.toonShadowIntensity);
+        if (drawUniforms.toonDebug > 0.5) {
+            // Diagnostic view: flat white on the lit side of the ramp, flat black in shadow, albedo
+            // discarded — makes it obvious which draws are receiving toon lighting.
+            texel.xyz = float3(toonRamp);
+        } else {
+            texel.xyz = clamp(texel.xyz * mix(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+        }
+    @end
 
     @if(o_fog)
         @if(o_alpha)

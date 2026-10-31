@@ -7,7 +7,11 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
+#include <algorithm>
 #include <any>
 #include <map>
 #include <set>
@@ -16,6 +20,7 @@
 #include <list>
 #include <stack>
 #include "fast/resource/type/Light.h"
+#include "fast/resource/type/Vertex.h"
 
 #ifndef _LANGUAGE_C
 #define _LANGUAGE_C
@@ -66,7 +71,7 @@ std::stack<std::string> currentDir;
 #define RATIO_Y(activeFb, dims) \
     ((mFbActive ? activeFb->second.applied_height : dims.height) / (2.0f * HALF_SCREEN_HEIGHT(activeFb)))
 
-#define TEXTURE_CACHE_MAX_SIZE 1024
+#define TEXTURE_CACHE_MAX_SIZE 8192 // SOH [Unbound] was 1024
 
 namespace Fast {
 
@@ -113,7 +118,8 @@ constexpr size_t MAX_TRI_BUFFER = 256;
 Interpreter::Interpreter() {
     mRsp = new RSP();
     mRdp = new RDP();
-    mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
+    // SOH [Enhancement] Sized by VBO_MAX_FLOATS_PER_VERTEX so there is room for the toon normal attribute.
+    mBufVbo = new float[MAX_TRI_BUFFER * (VBO_MAX_FLOATS_PER_VERTEX * 3)];
 }
 
 Interpreter::~Interpreter() {
@@ -134,6 +140,9 @@ static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+        // Push the dominant toon light for this batch. The backend only consumes it
+        // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
+        mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
@@ -441,12 +450,43 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
     return &mPrevCombiner->second;
 }
 
+void Interpreter::SetResolvedResourceCacheEnabled(bool enabled) {
+    mResolvedResourceCacheEnabled = enabled;
+    if (!enabled) {
+        mResolvedResourceCache.clear();
+    }
+}
+
+// Texture binds resolve the same paths every frame; skip the resource
+// manager's string/hash/mutex work by memoizing on the pointer.
+std::shared_ptr<Ship::IResource> Interpreter::ResolveResourceCached(const char* path) {
+    if (path == nullptr) {
+        return nullptr;
+    }
+    if (!mResolvedResourceCacheEnabled) {
+        return Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(path);
+    }
+    auto it = mResolvedResourceCache.find(path);
+    if (it != mResolvedResourceCache.end()) {
+        return it->second;
+    }
+    auto res = Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(path);
+    // Only memoize a hit. The resource manager caches its own misses, so re-asking
+    // for one is cheap, and CacheExternalResource can turn a path that missed into a
+    // valid resource at runtime. A memoized null would outlive the resource itself.
+    if (res != nullptr) {
+        mResolvedResourceCache[path] = res;
+    }
+    return res;
+}
+
 void Interpreter::TextureCacheClear() {
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
     }
     mTextureCache.map.clear();
     mTextureCache.lru.clear();
+    mResolvedResourceCache.clear();
     // Pre-allocate buckets so the map never rehashes during normal operation.
     // Rehashing invalidates all iterators, including those stored in LRU entries.
     mTextureCache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
@@ -471,15 +511,18 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     }
 
     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
-        // Remove the texture that was least recently used
-        it = mTextureCache.lru.front().it;
-        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
-        for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
-            if (mRenderingState.mTextures[j] == &*it)
-                mRenderingState.mTextures[j] = nullptr;
+        // A bound texture must keep its ID/content until its slot is replaced.
+        // With more cache entries than slots, an unbound victim always exists.
+        static_assert(TEXTURE_CACHE_MAX_SIZE > SHADER_MAX_TEXTURES);
+        auto lru_it = mTextureCache.lru.begin();
+        while (std::find(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), &*lru_it->it) !=
+               std::end(mRenderingState.mTextures)) {
+            ++lru_it;
         }
+        it = lru_it->it;
+        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+        mTextureCache.lru.erase(lru_it);
         mTextureCache.map.erase(it);
-        mTextureCache.lru.pop_front();
     }
 
     uint32_t texture_id;
@@ -545,6 +588,25 @@ static uint32_t GetEffectiveLineSize(uint32_t lineSizeBytes, uint32_t fullImageL
     return tileLineSizeBytes;
 }
 
+static uint32_t GetTileSizeFromCoordinates(float low, float high) {
+    // An unset tile (high <= low) defines no region; return 0 so callers skip the tile-region clamp
+    // instead of collapsing the texture to the phantom 1-texel size the +4 formula would yield.
+    if (high <= low) {
+        return 0;
+    }
+    return static_cast<uint32_t>(lroundf((high - low + 4.0f) / 4.0f));
+}
+
+// Loaded size is HD-scaled but the tile region is raw N64 texels; normalize before comparing.
+static bool IsPyramidLike(uint32_t width, uint32_t height, uint32_t tileW, uint32_t tileH, float hByteScale,
+                          float vPixelScale) {
+    const float hs = hByteScale > 0.0f ? hByteScale : 1.0f;
+    const float vs = vPixelScale > 0.0f ? vPixelScale : 1.0f;
+    const uint32_t loadedPixels = static_cast<uint32_t>(width / hs) * static_cast<uint32_t>(height / vs);
+    const uint32_t renderedPixels = tileW * tileH;
+    return renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13; // < 1.625x
+}
+
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
@@ -570,20 +632,25 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
-    uint32_t loadedPixels = width * height;
-    uint32_t renderedPixels = tile_w * tile_h;
-    bool pyramidLike =
-        renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13; // < 1.625x
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
+    bool pyramidLike = IsPyramidLike(width, height, tile_w, tile_h, metadata->h_byte_scale, metadata->v_pixel_scale);
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
-    // HD replacement textures must still clamp to the rendered tile region
-    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
+    if ((pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -640,19 +707,25 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
-    uint32_t loadedPixels = width * height;
-    uint32_t renderedPixels = tile_w * tile_h;
-    bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
+    bool pyramidLike = IsPyramidLike(width, height, tile_w, tile_h, metadata->h_byte_scale, metadata->v_pixel_scale);
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
-    // HD replacement textures must still clamp to the rendered tile region
-    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
+    if ((pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -946,19 +1019,25 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
-    uint32_t loadedPixels = width * height;
-    uint32_t renderedPixels = tile_w * tile_h;
-    bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
+    bool pyramidLike = IsPyramidLike(width, height, tile_w, tile_h, metadata->h_byte_scale, metadata->v_pixel_scale);
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
-    // HD replacement textures must still clamp to the rendered tile region
-    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
+    if ((pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -1040,19 +1119,25 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
-    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
-    uint32_t loadedPixels = width * height;
-    uint32_t renderedPixels = tile_w * tile_h;
-    bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+    uint32_t tile_w = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+    uint32_t tile_h = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
+    bool pyramidLike = IsPyramidLike(width, height, tile_w, tile_h, metadata->h_byte_scale, metadata->v_pixel_scale);
     bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
     bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
-    // HD replacement textures must still clamp to the rendered tile region
-    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    // A masked axis wraps every 2^mask texels, so trim an over-loaded texture back to that.
+    // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
+    uint32_t maskW = mRdp->texture_tile[tile].masks;
+    uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
+        width = 1u << maskW;
+    }
+    if (maskH != 0 && (1u << maskH) >= tile_h && (1u << maskH) < height) {
+        height = 1u << maskH;
+    }
+    if ((pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -1156,6 +1241,18 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     // Describe the buffer by what was actually packed (the loaded HD stride)
     uint32_t uploadWidth = safeLineSizeBytes / 4;
     uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;
+    const bool singleLineLoad = uploadHeight <= 1 && resultNewLineSize != 0 && resultNewLineSize < safeLineSizeBytes;
+    if (uploadWidth > (uint32_t)mRapi->GetMaxTextureSize() || singleLineLoad) {
+        if (safeLoadedBytes == (uint64_t)width * height * 4) {
+            // buffer holds the full image, use its real dimensions
+            uploadWidth = width;
+            uploadHeight = height;
+        } else {
+            // partial load, fall back to the tile-derived dimensions
+            uploadWidth = resultNewLineSize / 4;
+            uploadHeight = resultNewHeight;
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
 }
 
@@ -1394,10 +1491,82 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
     Interpreter::NormalizeVector(coeffs);
 }
 
+// SOH [Enhancement] Resolve the single effective light for the current object's toon shading:
+// ambient from the binding's ambient light, and the key direction/colour from the application-supplied
+// gSPToonKey (defaulting to a straight-on white key if none was provided this batch). The application
+// chooses and eases the key; the renderer just consumes it.
+void Interpreter::SelectToonLight() {
+    int amb_idx = mRsp->current_num_lights - 1;
+    if (amb_idx < 0) {
+        amb_idx = 0;
+    }
+    mRsp->toon_ambient[0] = mRsp->current_lights[amb_idx].l.col[0] / 255.0f;
+    mRsp->toon_ambient[1] = mRsp->current_lights[amb_idx].l.col[1] / 255.0f;
+    mRsp->toon_ambient[2] = mRsp->current_lights[amb_idx].l.col[2] / 255.0f;
+
+    // SOH [Enhancement] The game supplies one world-space key light per object via gSPToonKey. The
+    // forwarded normals are world-space too (see GfxSpVertex), so the key is used as-is — no
+    // object-space transform (which would only be correct for one limb of a batched skeletal actor,
+    // but they share a single light uniform). The game drives a single Wind Waker-style key (sun by
+    // day, animating to torches at night).
+    if (!mRsp->toon_key_valid) {
+        // A toon batch reached here with no key supplied. Not expected in normal use — the game emits
+        // gSPToonKey before every object's geometry — so default to a straight-on white key that at
+        // least lights the object evenly rather than leaving the shade undefined.
+        mRsp->toon_light_dir[0] = 0.0f;
+        mRsp->toon_light_dir[1] = 0.0f;
+        mRsp->toon_light_dir[2] = 1.0f;
+        mRsp->toon_light_color[0] = 1.0f;
+        mRsp->toon_light_color[1] = 1.0f;
+        mRsp->toon_light_color[2] = 1.0f;
+        return;
+    }
+
+    mRsp->toon_light_dir[0] = mRsp->toon_key_dir[0];
+    mRsp->toon_light_dir[1] = mRsp->toon_key_dir[1];
+    mRsp->toon_light_dir[2] = mRsp->toon_key_dir[2];
+    // Guard a zero-length key (s8 quantization can collapse a small direction) so NormalizeVector
+    // doesn't divide by zero and produce NaNs — fall back to straight-on.
+    float key_len2 = mRsp->toon_light_dir[0] * mRsp->toon_light_dir[0] +
+                     mRsp->toon_light_dir[1] * mRsp->toon_light_dir[1] +
+                     mRsp->toon_light_dir[2] * mRsp->toon_light_dir[2];
+    if (key_len2 < 1e-8f) {
+        mRsp->toon_light_dir[0] = 0.0f;
+        mRsp->toon_light_dir[1] = 0.0f;
+        mRsp->toon_light_dir[2] = 1.0f;
+    } else {
+        NormalizeVector(mRsp->toon_light_dir);
+    }
+    mRsp->toon_light_color[0] = mRsp->toon_key_color[0];
+    mRsp->toon_light_color[1] = mRsp->toon_key_color[1];
+    mRsp->toon_light_color[2] = mRsp->toon_key_color[2];
+}
+
+// SOH [Link-Span] OOT-VANILLA-001: o host liga quando o jogo roda sem mods; a matriz de interpolação passa então pela
+// mesma quantização s16.16 do GBI original.
+static bool sQuantizeFloatMtx = false;
+extern "C" void Fast_SetQuantizeFloatMtx(bool on) {
+    sQuantizeFloatMtx = on;
+}
+
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
     if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
+#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
+        // Float matrices: no fixed-point quantisation (the int cast below overflows past +/-32767).
+        if (sQuantizeFloatMtx) {
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                    float v = it->second.mf[i][j];
+                    int as_int = (int)(v * 65536.0f);
+                    matrix[i][j] = as_int * (1.0f / 65536.0f);
+                }
+            }
+        } else {
+            memcpy(matrix, it->second.mf, sizeof(matrix));
+        }
+#else
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 float v = it->second.mf[i][j];
@@ -1405,8 +1574,12 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
                 matrix[i][j] = as_int * (1.0f / 65536.0f);
             }
         }
+#endif
     } else {
-#ifndef GBI_FLOATS
+#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
+        // For a modified GBI where fixed point values are replaced with floats
+        memcpy(matrix, addr, sizeof(matrix));
+#else
         // Original GBI where fixed point matrices are used
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j += 2) {
@@ -1416,9 +1589,6 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
                 matrix[i][j + 1] = (int32_t)((int_part << 16) | (frac_part & 0xffff)) / 65536.0f;
             }
         }
-#else
-        // For a modified GBI where fixed point values are replaced with floats
-        memcpy(matrix, addr, sizeof(matrix));
 #endif
     }
 
@@ -1530,6 +1700,9 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
                 CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
                 CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+                if (mRdp->toon) { // SOH [Enhancement] toon lighting: cache the dominant light
+                    SelectToonLight();
+                }
                 mRsp->lights_changed = false;
             }
 
@@ -1592,6 +1765,38 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->color.r = r > 255 ? 255 : r;
             d->color.g = g > 255 ? 255 : g;
             d->color.b = b > 255 ? 255 : b;
+
+            // SOH [Enhancement] Toon lighting: forward the WORLD-space normal to the fragment shader
+            // and neutralize the vertex shade so the combiner emits pure albedo. The fragment shader
+            // then re-lights it with the single dominant light (also world-space, see SelectToonLight)
+            // through the toon ramp.
+            //
+            // The normal must be transformed object->world here, NOT left in object space: a skeletal
+            // actor (Link, NPCs) draws every limb under its own modelview matrix but batches them into
+            // a single draw call, while the light direction is one per-batch uniform. Object-space
+            // normals would each be in a different limb's space yet share that one uniform, so only one
+            // limb could ever be lit correctly. Transforming into world space puts every limb's normal
+            // in the same frame as the world-space key, so the single uniform is correct for all limbs.
+            // (object->world uses the same row-vector convention as the position transform above; the
+            // shader renormalizes, so uniform limb scale is harmless.)
+            if (mRdp->toon || mRdp->toon_shadow) {
+                float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+                // SOH [Enhancement] Actor shadow: world-space position (same object->world transform as the
+                // normal). The shadow pass flattens these onto the ground plane; the camera lives in the
+                // projection matrix, so world pos x P_matrix later yields clip space. Computed whenever the
+                // shadow is armed, so shadows work even when the cel relight (mRdp->toon) is off.
+                d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
+                d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
+                d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
+                if (mRdp->toon) {
+                    d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
+                    d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
+                    d->nz = vn->n[0] * mv[0][2] + vn->n[1] * mv[1][2] + vn->n[2] * mv[2][2];
+                    d->color.r = 255;
+                    d->color.g = 255;
+                    d->color.b = 255;
+                }
+            }
 
             if (mRsp->geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
@@ -1694,6 +1899,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
 
+    // SOH [Enhancement] Actor shadow: while the shadow pass is armed for this object, record its world-space
+    // triangles here (before any culling, so the whole silhouette is captured). FlushToonShadow drains them
+    // at the object boundary. is_rect screen-space quads (UI) have no world position, so skip them. The
+    // replayed shadow geometry itself runs with toon_shadow cleared, so it is never re-captured. NOTE: this
+    // is gated on toon_shadow only (NOT mRdp->toon), so shadows work even when the cel relight is disabled.
+    if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
+        for (int si = 0; si < 3; si++) {
+            mShadowVerts.push_back(v_arr[si]->wx);
+            mShadowVerts.push_back(v_arr[si]->wy);
+            mShadowVerts.push_back(v_arr[si]->wz);
+        }
+    }
+
     // if (rand()%2) return;
 
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
@@ -1791,6 +2009,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
     bool use_grayscale = mRdp->grayscale;
     bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
+    // Toon lighting only applies to lit geometry (where vertex normals exist).
+    bool use_toon = mRdp->toon && (mRsp->geometry_mode & G_LIGHTING);
 
     if (texture_edge) {
         if (use_alpha) {
@@ -1833,7 +2053,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     } else {
         cc_options |= -1 << SHADER_ID_SHIFT;
     }
-
+    if (use_toon) {
+        cc_options |= SHADER_OPT(TOON);
+    }
     if (mRdp->loaded_texture[0].masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
@@ -1920,21 +2142,28 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
             tex_width[i] = line_size;
 
-            tex_width2[i] = (uint32_t)(int32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
-            tex_height2[i] = (uint32_t)(int32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+            tex_width2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
+            tex_height2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
 
             // Same pyramid-like ratio gate as ImportTexture: only clamp when loaded pixels
             // are close to rendered pixels (mipmap), not when much bigger (window scroll).
-            uint32_t loadedPx = tex_width[i] * tex_height[i];
-            uint32_t renderedPx = tex_width2[i] * tex_height2[i];
-            bool pyrLike = renderedPx > 0 && loadedPx > renderedPx && loadedPx * 8 < renderedPx * 13;
-            // HD replacements must clamp to the tile region
-            bool isHd = mRdp->loaded_texture[i].raw_tex_metadata.h_byte_scale != 1 ||
-                        mRdp->loaded_texture[i].raw_tex_metadata.v_pixel_scale != 1;
-            if ((isHd || pyrLike || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
+            const RawTexMetadata& triMeta = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
+            bool pyrLike = IsPyramidLike(tex_width[i], tex_height[i], tex_width2[i], tex_height2[i],
+                                         triMeta.h_byte_scale, triMeta.v_pixel_scale);
+            // Same wrap-period trim as the import paths. The >= tex_width2 guard skips a stale
+            // mask left by an FB blit (the pause background), which would otherwise tile the FB.
+            uint32_t maskW = mRdp->texture_tile[tile].masks;
+            uint32_t maskH = mRdp->texture_tile[tile].maskt;
+            if (maskW != 0 && (1u << maskW) >= tex_width2[i] && (1u << maskW) < tex_width[i]) {
+                tex_width[i] = 1u << maskW;
+            }
+            if (maskH != 0 && (1u << maskH) >= tex_height2[i] && (1u << maskH) < tex_height[i]) {
+                tex_height[i] = 1u << maskH;
+            }
+            if ((pyrLike || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
                 tex_width[i] = tex_width2[i];
             }
-            if ((isHd || pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
+            if ((pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
                 tex_height[i] = tex_height2[i];
             }
 
@@ -2077,6 +2306,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mBufVbo[mBufVboLen++] = mRdp->grayscale_color.g / 255.0f;
             mBufVbo[mBufVboLen++] = mRdp->grayscale_color.b / 255.0f;
             mBufVbo[mBufVboLen++] = mRdp->grayscale_color.a / 255.0f; // lerp interpolation factor (not alpha)
+        }
+
+        // SOH [Enhancement] Toon lighting: world-space normal (aNormal). The dominant light/ambient
+        // are sent as uniforms (per draw), not per-vertex, to stay within the vertex-attribute limit.
+        if (use_toon) {
+            mBufVbo[mBufVboLen++] = v_arr[i]->nx;
+            mBufVbo[mBufVboLen++] = v_arr[i]->ny;
+            mBufVbo[mBufVboLen++] = v_arr[i]->nz;
         }
 
         for (int j = 0; j < numInputs; j++) {
@@ -2387,6 +2624,8 @@ void Interpreter::GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_
     mRdp->texture_tile[tile].siz = siz;
     mRdp->texture_tile[tile].cms = cms;
     mRdp->texture_tile[tile].cmt = cmt;
+    mRdp->texture_tile[tile].masks = masks;
+    mRdp->texture_tile[tile].maskt = maskt;
     mRdp->texture_tile[tile].shifts = shifts;
     mRdp->texture_tile[tile].shiftt = shiftt;
     mRdp->texture_tile[tile].line_size_bytes = line * 8;
@@ -2665,6 +2904,625 @@ static inline int16_t sign_extend_9(uint32_t v) {
     return (int16_t)((v & 0x100) ? (int32_t)(v | 0xFFFFFE00u) : (int32_t)v);
 }
 
+// SOH [Enhancement] Actor shadow: footprint-grid tuning (see FlushToonShadow). Boxes are emitted on a
+// kShadowGridSize² grid (128 cells resolve a Link-sized footprint to ~0.5 world units); occupancy is
+// rasterized at 2× that (kShadowRasterSize), so each output cell carries a 0–4 sub-cell coverage count that
+// drives the anti-aliased edge bands. Rows are bitmasks of kShadow*Words uint64_t words.
+static constexpr int kShadowGridSize = 128;
+static constexpr int kShadowGridWords = kShadowGridSize / 64;
+static constexpr int kShadowRasterSize = kShadowGridSize * 2;
+static constexpr int kShadowRasterWords = kShadowRasterSize / 64;
+static_assert(kShadowGridSize % 64 == 0 && kShadowRasterSize % 64 == 0, "rows are whole uint64_t words");
+// Per-frame volume accumulator budget. Once a frame's volumes exceed it, later objects skip their shadow
+// (drop the newest, keep what's built) rather than growing unbounded.
+static constexpr size_t kShadowAccumBudgetFloats = 8u * 1024u * 1024u;
+
+// SOH [Enhancement] Actor shadow: BUILD this object's shadow volume and accumulate it for the frame. It is
+// NOT drawn here — all the frame's volumes are rendered together by RenderShadowVolumes() at the pre-actor
+// hook, so the shadow lands only on the environment (the room is in the depth buffer but actors are not yet),
+// exactly like the Wind Waker light pools. That means no self-shadow and no shadowing of other actors, at the
+// cost of one frame of lag in the shadow's position (imperceptible for a ground shadow).
+//
+// The volume is a thin SLAB at the feet: the captured silhouette projected along the cel key-light direction
+// onto the feet level, then extruded from slabTop (above the feet, catches uphill ground) to slabBottom
+// (below the feet, catches downhill ground / cliffs). The stencil z-fail pass conforms it to the real ground.
+//
+// The slab is built from the FOOTPRINT, not from the triangles: the projected triangles are rasterized into
+// an occupancy grid over the footprint bounds, and the volume is one box per run of occupied cells. This
+// keeps the stencil counts small by construction. The obvious alternative — one closed prism per projected
+// triangle — breaks on anything denser than a vanilla N64 mesh: every prism overlapping a ground pixel
+// z-fail-increments the same 8-bit stencil (and at low camera pitch the view ray's underground segment
+// crosses hundreds more prism walls), so past 255 the increment clamps, the decrement pass walks it to 0, and
+// the shadow shows angle-dependent holes. A ~2k-triangle replacement model is already far past that limit;
+// the grid never gets near it — box walls are only emitted along each band region's OUTLINE (interior walls
+// between abutting boxes are skipped), so pass-1 increments scale with the silhouette's boundary crossings,
+// a handful even on a grazing ray.
+//
+// The raster runs at twice the output resolution, so every output cell gets a 0–4 coverage count from its
+// 2×2 sub-cells. EdgeSoftness turns that into anti-aliased opacity bands: fully-covered cells form the core
+// and partially-covered edge cells render at lighter steps (see pass 3), which smooths the staircase the
+// grid would otherwise show along the silhouette.
+void Interpreter::FlushToonShadow() {
+    const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
+    if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    // Eased size scale (0..1) the game pushes per object, so the shadow grows in / shrinks out instead of
+    // popping. At ~0 there's nothing to draw.
+    const float sizeScale = std::clamp(mRsp->toon_shadow_size, 0.0f, 1.0f);
+    if (sizeScale <= 0.01f) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    // Frame budget: once the accumulated volumes exceed it, drop THIS object's shadow (the newest) and keep
+    // everything already built — one missing shadow, not a whole-frame blink of all of them.
+    size_t accumTotal = 0;
+    for (int b = 0; b < kShadowBands; b++) {
+        accumTotal += mShadowVolumeAccum[b].size();
+    }
+    if (accumTotal > kShadowAccumBudgetFloats) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    const size_t floatCount = mShadowVerts.size();
+
+    // Feet level = the lowest captured vertex (the real rendered feet, not the unreliable collision floor); the
+    // XZ centroid is the point the footprint shrinks toward when sizeScale < 1.
+    float minY = 1e30f, sumX = 0.0f, sumZ = 0.0f;
+    size_t vertN = 0;
+    for (size_t i = 0; i + 3 <= floatCount; i += 3) {
+        sumX += mShadowVerts[i], minY = std::min(minY, mShadowVerts[i + 1]), sumZ += mShadowVerts[i + 2];
+        vertN++;
+    }
+    const float cenX = sumX / (float)vertN, cenZ = sumZ / (float)vertN;
+    // Feet level, optionally raised UP to the floor Y the game passed: a model whose geometry dips far below
+    // the floor (a signpost's buried post) would otherwise build the whole slab below ground and cast nothing.
+    // Clamp only ever LIFTS the feet (max), so an actor standing on/above the floor is unaffected.
+    float feetY = minY;
+    if (mRsp->toon_shadow_clamp_feet) {
+        feetY = std::max(minY, mRsp->toon_shadow_feet_clamp_y);
+    }
+    const float slabTop = feetY + mShadowSlabRise;                     // above the feet (uphill ground)
+    const float slabBottom = feetY - std::max(5.0f, mShadowSlabDepth); // below the feet (downhill / cliffs)
+
+    // Cast direction from the cel key light (toward-light dir snapshotted at arm time), elevation-remapped
+    // against world up so a low light still casts a short shadow (Length slider drives minElev).
+    float lx = mRsp->toon_shadow_dir[0], ly = mRsp->toon_shadow_dir[1], lz = mRsp->toon_shadow_dir[2];
+    const float llen = sqrtf((lx * lx) + (ly * ly) + (lz * lz));
+    float dirX, dirY, dirZ;
+    const float minElev = std::clamp(mToonShadowMinElevation, 0.05f, 0.99f);
+    if (llen < 0.001f) {
+        dirX = 0.0f, dirY = -1.0f, dirZ = 0.0f;
+    } else {
+        lx /= llen, ly /= llen, lz /= llen;
+        const float lUp = ly < 0.0f ? 0.0f : ly;
+        const float elev = minElev + ((1.0f - minElev) * lUp);
+        const float hLen = sqrtf((lx * lx) + (lz * lz));
+        if (hLen < 0.001f) {
+            dirX = 0.0f, dirY = -1.0f, dirZ = 0.0f;
+        } else {
+            const float hScale = sqrtf(std::max(0.0f, 1.0f - (elev * elev))) / hLen;
+            dirX = -hScale * lx, dirY = -elev, dirZ = -hScale * lz;
+        }
+    }
+    const float descend = -dirY;
+
+    auto projectXZ = [&](float vx, float vy, float vz, float& ox, float& oz) {
+        float t = (descend > 0.001f) ? ((vy - slabTop) / descend) : 0.0f;
+        if (t < 0.0f) {
+            t = 0.0f;
+        }
+        ox = vx + (dirX * t);
+        oz = vz + (dirZ * t);
+    };
+
+    // Append one outward-wound world-space triangle to a band's frame accumulator, tagged cap(0) / wall(1).
+    auto pushTri = [&](int band, const float* p0, const float* p1, const float* p2, float ccx, float ccy, float ccz,
+                       uint8_t kind) {
+        const float ux = p1[0] - p0[0], uy = p1[1] - p0[1], uz = p1[2] - p0[2];
+        const float vx = p2[0] - p0[0], vy = p2[1] - p0[1], vz = p2[2] - p0[2];
+        const float nX = (uy * vz) - (uz * vy), nY = (uz * vx) - (ux * vz), nZ = (ux * vy) - (uy * vx);
+        const float fx = ((p0[0] + p1[0] + p2[0]) / 3.0f) - ccx;
+        const float fy = ((p0[1] + p1[1] + p2[1]) / 3.0f) - ccy;
+        const float fz = ((p0[2] + p1[2] + p2[2]) / 3.0f) - ccz;
+        const bool outward = ((nX * fx) + (nY * fy) + (nZ * fz)) >= 0.0f;
+        const float* q1 = outward ? p1 : p2;
+        const float* q2 = outward ? p2 : p1;
+        std::vector<float>& acc = mShadowVolumeAccum[band];
+        acc.push_back(p0[0]), acc.push_back(p0[1]), acc.push_back(p0[2]);
+        acc.push_back(q1[0]), acc.push_back(q1[1]), acc.push_back(q1[2]);
+        acc.push_back(q2[0]), acc.push_back(q2[1]), acc.push_back(q2[2]);
+        if (mShadowShowVolume) { // cap/wall tag is only read by the debug overlay
+            mShadowVolumeKind[band].push_back(kind);
+        }
+    };
+
+    // Rasterize the projected triangles into an occupancy grid over the footprint bounds, then rebuild the
+    // volume as one box per horizontal run of occupied cells. Boxes never overlap and abutting boxes share
+    // exactly-coincident, oppositely-wound walls (identical float coordinates → identical rasterization), so
+    // their z-fail counts cancel and the union reads as one seamless footprint with stencil overlap 1.
+    auto shrink = [&](float& x, float& z) {
+        if (sizeScale < 1.0f) {
+            x = cenX + (x - cenX) * sizeScale;
+            z = cenZ + (z - cenZ) * sizeScale;
+        }
+    };
+    // Pass 1: bounds of the projected (shrunk) footprint.
+    float minX = 1e30f, maxX = -1e30f, minZ = 1e30f, maxZ = -1e30f;
+    for (size_t i = 0; i + 3 <= floatCount; i += 3) {
+        float px, pz;
+        projectXZ(mShadowVerts[i], mShadowVerts[i + 1], mShadowVerts[i + 2], px, pz);
+        shrink(px, pz);
+        minX = std::min(minX, px), maxX = std::max(maxX, px);
+        minZ = std::min(minZ, pz), maxZ = std::max(maxZ, pz);
+    }
+    const float cellW = (maxX - minX) / kShadowGridSize;
+    const float cellH = (maxZ - minZ) / kShadowGridSize;
+    if (cellW < 1e-4f || cellH < 1e-4f) { // footprint degenerate (a line/point) — nothing worth casting
+        mShadowVerts.clear();
+        return;
+    }
+    // Pass 2: rasterize, conservatively. Mark each triangle's three vertex cells (so sub-cell triangles
+    // still register) plus every cell in its bounding box whose CENTRE lies within half a cell-diagonal
+    // of the triangle (signed edge distance ≥ −margin). The margin matters: a centre exactly on the
+    // crack between two adjacent triangles can be float-marginally outside BOTH, and an exact
+    // centre-in-triangle test then leaves a pinhole. The margin closes cracks by construction, at the
+    // cost of dilating the footprint by up to half a cell.
+    //
+    // Resolution: the 2× raster only exists to give each output cell a 0–4 sub-cell coverage count for
+    // the soft-edge bands. EdgeSoftness 0 (hard edge) needs no counts — any hit is core — so it
+    // rasterizes at the output resolution directly, a quarter of the cell tests.
+    const int softness = std::clamp(mShadowEdgeSoftness, 0, kShadowBands - 1);
+    const int rScale = (softness == 0) ? 1 : 2;
+    const int rSize = kShadowGridSize * rScale;
+    const float rCellW = cellW / (float)rScale, rCellH = cellH / (float)rScale;
+    const float margin = 0.5f * sqrtf((rCellW * rCellW) + (rCellH * rCellH));
+    auto rCellX = [&](float x) { return std::clamp((int)((x - minX) / rCellW), 0, rSize - 1); };
+    auto rCellZ = [&](float z) { return std::clamp((int)((z - minZ) / rCellH), 0, rSize - 1); };
+    uint64_t raster[kShadowRasterSize][kShadowRasterWords] = {}; // sized for 2×; hard edge uses a quarter
+    auto rasterSet = [&](int gz, int gx) { raster[gz][gx >> 6] |= 1ull << (gx & 63); };
+    for (size_t base = 0; base + 9 <= floatCount; base += 9) {
+        float ax, az, bx, bz, cx, cz;
+        projectXZ(mShadowVerts[base + 0], mShadowVerts[base + 1], mShadowVerts[base + 2], ax, az);
+        projectXZ(mShadowVerts[base + 3], mShadowVerts[base + 4], mShadowVerts[base + 5], bx, bz);
+        projectXZ(mShadowVerts[base + 6], mShadowVerts[base + 7], mShadowVerts[base + 8], cx, cz);
+        shrink(ax, az), shrink(bx, bz), shrink(cx, cz);
+        const int axi = rCellX(ax), azi = rCellZ(az);
+        const int bxi = rCellX(bx), bzi = rCellZ(bz);
+        const int cxi = rCellX(cx), czi = rCellZ(cz);
+        rasterSet(azi, axi);
+        rasterSet(bzi, bxi);
+        rasterSet(czi, cxi);
+        const float area2 = ((bx - ax) * (cz - az)) - ((cx - ax) * (bz - az));
+        if (fabsf(area2) < 1e-6f) {
+            continue; // sliver — the vertex sub-cells above are all it gets
+        }
+        // Signed edge distances need a consistent orientation and per-edge length scaling (the raw edge
+        // function is distance × edge length).
+        const float sgn = (area2 >= 0.0f) ? 1.0f : -1.0f;
+        const float len0 = sqrtf(((bx - ax) * (bx - ax)) + ((bz - az) * (bz - az)));
+        const float len1 = sqrtf(((cx - bx) * (cx - bx)) + ((cz - bz) * (cz - bz)));
+        const float len2 = sqrtf(((ax - cx) * (ax - cx)) + ((az - cz) * (az - cz)));
+        const float m0 = -margin * len0, m1 = -margin * len1, m2 = -margin * len2;
+        const int x0 = std::min({ axi, bxi, cxi }), x1 = std::max({ axi, bxi, cxi });
+        const int z0 = std::min({ azi, bzi, czi }), z1 = std::max({ azi, bzi, czi });
+        for (int gz = z0; gz <= z1; gz++) {
+            const float pz = minZ + ((gz + 0.5f) * rCellH);
+            for (int gx = x0; gx <= x1; gx++) {
+                const float px = minX + ((gx + 0.5f) * rCellW);
+                const float e0 = sgn * (((bx - ax) * (pz - az)) - ((bz - az) * (px - ax)));
+                const float e1 = sgn * (((cx - bx) * (pz - bz)) - ((cz - bz) * (px - bx)));
+                const float e2 = sgn * (((ax - cx) * (pz - cz)) - ((az - cz) * (px - cx)));
+                if (e0 >= m0 && e1 >= m1 && e2 >= m2) {
+                    rasterSet(gz, gx);
+                }
+            }
+        }
+    }
+
+    // Pass 3: downsample each output cell's 2×2 sub-cells to a coverage count (0–4) and assign disjoint
+    // opacity bands (band alphas step down in RenderShadowVolumes; nothing double-darkens):
+    //   EdgeSoftness 0: any coverage → full opacity (hard edge) — raster is already at output
+    //                   resolution, so its rows ARE the core band, no downsample.
+    //   EdgeSoftness 1: full coverage → core; partial coverage → half opacity. The partially-covered cells
+    //                   are exactly the silhouette's staircase, so this reads as an anti-aliased edge.
+    //   EdgeSoftness 2: full → core; 2–3 sub-cells → 2/3; 1 sub-cell → 1/3, plus a one-cell halo outside
+    //                   the footprint at 1/3 — a finer ramp and a slightly wider fringe.
+    uint64_t bandRows[kShadowBands][kShadowGridSize][kShadowGridWords] = {};
+    uint64_t occupied[kShadowGridSize][kShadowGridWords] = {};
+    if (rScale == 1) {
+        for (int gz = 0; gz < kShadowGridSize; gz++) {
+            for (int i = 0; i < kShadowGridWords; i++) {
+                occupied[gz][i] = raster[gz][i];
+                bandRows[0][gz][i] = raster[gz][i];
+            }
+        }
+    } else {
+        for (int gz = 0; gz < kShadowGridSize; gz++) {
+            const uint64_t* r0 = raster[gz * 2];
+            const uint64_t* r1 = raster[(gz * 2) + 1];
+            for (int gx = 0; gx < kShadowGridSize; gx++) {
+                const int sx = gx * 2;
+                const int cov =
+                    (int)((r0[sx >> 6] >> (sx & 63)) & 1ull) + (int)((r0[(sx + 1) >> 6] >> ((sx + 1) & 63)) & 1ull) +
+                    (int)((r1[sx >> 6] >> (sx & 63)) & 1ull) + (int)((r1[(sx + 1) >> 6] >> ((sx + 1) & 63)) & 1ull);
+                if (cov == 0) {
+                    continue;
+                }
+                occupied[gz][gx >> 6] |= 1ull << (gx & 63);
+                int band = 0;
+                if (softness == 1) {
+                    band = (cov == 4) ? 0 : 1;
+                } else if (softness >= 2) {
+                    band = (cov == 4) ? 0 : ((cov >= 2) ? 1 : 2);
+                }
+                bandRows[band][gz][gx >> 6] |= 1ull << (gx & 63);
+            }
+        }
+    }
+    if (softness >= 2) {
+        // Halo: one output cell outside the occupied footprint, at the lightest band.
+        static constexpr uint64_t kZeroRow[kShadowGridWords] = {};
+        for (int gz = 0; gz < kShadowGridSize; gz++) {
+            const uint64_t* cur = occupied[gz];
+            const uint64_t* up = (gz > 0) ? occupied[gz - 1] : kZeroRow;
+            const uint64_t* down = (gz + 1 < kShadowGridSize) ? occupied[gz + 1] : kZeroRow;
+            for (int i = 0; i < kShadowGridWords; i++) {
+                const uint64_t left = (cur[i] << 1) | ((i > 0) ? (cur[i - 1] >> 63) : 0);
+                const uint64_t right = (cur[i] >> 1) | ((i + 1 < kShadowGridWords) ? (cur[i + 1] << 63) : 0);
+                bandRows[2][gz][i] |= (cur[i] | left | right | up[i] | down[i]) & ~cur[i];
+            }
+        }
+    }
+
+    // Pass 4: one box (2 caps + 4 wall quads) per maximal RECTANGLE of occupied cells, per band. A
+    // rectangle is a maximal horizontal run repeated IDENTICALLY across consecutive rows. Identical-run
+    // merging preserves the invariant the x walls rely on (nothing in any merged row abuts the run's
+    // ends — an abutting cell would have made that row's maximal run differ, stopping the merge) while
+    // cutting the emitted triangles several-fold on typical blob footprints: a silhouette's edge slope
+    // is below one cell per row for most rows, so those rows carry identical runs and merge.
+    auto bandTest = [&](int band, int gz, int gx) -> bool {
+        return ((bandRows[band][gz][gx >> 6] >> (gx & 63)) & 1ull) != 0;
+    };
+    // Consumption tracker: a rectangle removes each claimed run WHOLE, so `rem` always holds a subset
+    // of the original maximal runs, intact — which is what makes the exact-run test below sound. The
+    // z-wall neighbour tests keep consulting bandRows (the full occupancy), not rem.
+    uint64_t rem[kShadowGridSize][kShadowGridWords];
+    for (int band = 0; band < kShadowBands; band++) {
+        memcpy(rem, bandRows[band], sizeof(rem));
+        auto remTest = [&](int gz, int gx) -> bool { return ((rem[gz][gx >> 6] >> (gx & 63)) & 1ull) != 0; };
+        auto remClearRun = [&](int gz, int x0, int x1) {
+            for (int gx = x0; gx < x1; gx++) {
+                rem[gz][gx >> 6] &= ~(1ull << (gx & 63));
+            }
+        };
+        // Does row gz still contain EXACTLY the maximal run [x0,x1)?
+        auto rowRunMatches = [&](int gz, int x0, int x1) -> bool {
+            if ((x0 > 0 && remTest(gz, x0 - 1)) || (x1 < kShadowGridSize && remTest(gz, x1))) {
+                return false; // longer run here — not identical
+            }
+            for (int gx = x0; gx < x1; gx++) {
+                if (!remTest(gz, gx)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (int gz = 0; gz < kShadowGridSize; gz++) {
+            int gx = 0;
+            while (gx < kShadowGridSize) {
+                if (!remTest(gz, gx)) {
+                    gx++;
+                    continue;
+                }
+                const int runStart = gx;
+                while (gx < kShadowGridSize && remTest(gz, gx)) {
+                    gx++;
+                }
+                remClearRun(gz, runStart, gx);
+                // Grow the rectangle downward while the run repeats exactly, consuming as it goes.
+                int zEnd = gz + 1;
+                while (zEnd < kShadowGridSize && rowRunMatches(zEnd, runStart, gx)) {
+                    remClearRun(zEnd, runStart, gx);
+                    zEnd++;
+                }
+                const float x0 = minX + (runStart * cellW), x1 = minX + (gx * cellW);
+                const float z0 = minZ + (gz * cellH), z1 = minZ + (zEnd * cellH);
+                const float ccx = (x0 + x1) * 0.5f, ccy = (slabTop + slabBottom) * 0.5f, ccz = (z0 + z1) * 0.5f;
+                auto quad = [&](const float* a, const float* b, const float* c, const float* d, uint8_t kind) {
+                    pushTri(band, a, b, c, ccx, ccy, ccz, kind), pushTri(band, a, c, d, ccx, ccy, ccz, kind);
+                };
+                const float t00[3] = { x0, slabTop, z0 }, t10[3] = { x1, slabTop, z0 };
+                const float t11[3] = { x1, slabTop, z1 }, t01[3] = { x0, slabTop, z1 };
+                const float b00[3] = { x0, slabBottom, z0 }, b10[3] = { x1, slabBottom, z0 };
+                const float b11[3] = { x1, slabBottom, z1 }, b01[3] = { x0, slabBottom, z1 };
+                quad(t00, t10, t11, t01, 0); // top cap
+                quad(b00, b10, b11, b01, 0); // bottom cap
+                quad(t01, t00, b00, b01, 1); // wall x0 (nothing abuts the run ends in any merged row)
+                quad(t10, t11, b11, b10, 1); // wall x1
+                // z walls at the rectangle's first/last row only: the segments where the neighbouring
+                // row's cell (in the SAME band) is unoccupied. Abutting geometry's coincident opposite
+                // walls would cancel in the final stencil count anyway, but they still pile up in the
+                // increment pass before the decrements land — emitting only outline segments keeps
+                // pass-1 peaks proportional to the region's OUTLINE crossings.
+                auto zWallSegments = [&](int neighborGz, float zw) {
+                    const bool haveNeighbor = (neighborGz >= 0) && (neighborGz < kShadowGridSize);
+                    int sx = runStart;
+                    while (sx < gx) {
+                        if (haveNeighbor && bandTest(band, neighborGz, sx)) {
+                            sx++;
+                            continue;
+                        }
+                        const int s0 = sx;
+                        while (sx < gx && !(haveNeighbor && bandTest(band, neighborGz, sx))) {
+                            sx++;
+                        }
+                        const float wx0 = minX + (s0 * cellW), wx1 = minX + (sx * cellW);
+                        const float ta[3] = { wx0, slabTop, zw }, tb[3] = { wx1, slabTop, zw };
+                        const float ba[3] = { wx0, slabBottom, zw }, bb[3] = { wx1, slabBottom, zw };
+                        quad(ta, tb, bb, ba, 1);
+                    }
+                };
+                zWallSegments(gz - 1, z0);
+                zWallSegments(zEnd, z1);
+            }
+        }
+    }
+    mShadowVerts.clear();
+}
+
+// SOH [Enhancement] Actor shadow: render every shadow volume accumulated since the last call, then clear the
+// accumulators. Each opacity band (the core, then the penumbra rings — disjoint footprint regions built in
+// FlushToonShadow) gets its own batched z-fail stencil pass pair + one self-clearing composite at the band's
+// stepped-down alpha; the steps read as a small soft edge. Called once per frame at the pre-actor hook
+// (after the room is drawn) so the shadows fall only on the environment.
+void Interpreter::RenderShadowVolumes() {
+    const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
+    auto clearAccums = [this] {
+        for (int b = 0; b < kShadowBands; b++) {
+            mShadowVolumeAccum[b].clear();
+            mShadowVolumeKind[b].clear();
+        }
+    };
+    size_t accumTotal = 0;
+    for (int b = 0; b < kShadowBands; b++) {
+        accumTotal += mShadowVolumeAccum[b].size();
+    }
+    if (accumTotal < 9 || coreAlpha <= 0.0f) {
+        clearAccums();
+        return;
+    }
+
+    const uint64_t savedCombine = mRdp->combine_mode;
+    const uint32_t savedOtherL = mRdp->other_mode_l;
+    const uint32_t savedOtherH = mRdp->other_mode_h;
+    const uint32_t savedGeo = mRsp->geometry_mode;
+    const bool savedToon = mRdp->toon;
+    const bool savedToonShadow = mRdp->toon_shadow;
+    const bool savedGray = mRdp->grayscale;
+    const struct RGBA savedPrim = mRdp->prim_color;
+
+    mRdp->toon = false;
+    mRdp->toon_shadow = false; // the volume geometry must not be re-captured
+    mRdp->grayscale = false;
+    mRdp->other_mode_h = (savedOtherH & ~(3U << G_MDSFT_CYCLETYPE)) | G_CYC_1CYCLE;
+    GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_PRIMITIVE), alpha_comb(0, 0, 0, G_ACMUX_PRIMITIVE), 0, 0);
+
+    const uint32_t cullFront = get_attr(CULL_FRONT);
+    const uint32_t cullBack = get_attr(CULL_BACK);
+    const uint32_t cullBoth = get_attr(CULL_BOTH);
+    const GfxClipParameters clip = mRapi->GetClipParameters();
+    // How many opacity steps the soft edge uses (EdgeSoftness rings + the core). Leftover ring geometry from
+    // a mid-frame softness change draws at the lightest step rather than being dropped.
+    const int bandsTotal = std::clamp(mShadowEdgeSoftness, 0, kShadowBands - 1) + 1;
+
+    // Copy triangle t's three cached verts into the scratch slots GfxSpTri1 reads.
+    auto loadTri = [&](size_t t) {
+        mRsp->loaded_vertices[MAX_VERTICES + 0] = mShadowXform[t * 3 + 0];
+        mRsp->loaded_vertices[MAX_VERTICES + 1] = mShadowXform[t * 3 + 1];
+        mRsp->loaded_vertices[MAX_VERTICES + 2] = mShadowXform[t * 3 + 2];
+    };
+    size_t triTotal = 0; // triangles of the band currently staged in mShadowXform
+
+    // SOH [Enhancement] Actor shadow: batched volume submission. The volume is thousands of identical-state
+    // triangles; routing each through GfxSpTri1 repays the full combiner/shader/mode resolution per triangle —
+    // the measured CPU bottleneck. Instead, resolve+load all render state ONCE per band (draw a single triangle
+    // through the normal path with culling off, then discard it — nothing is submitted because its state-change
+    // Flushes fire on an empty buffer and we zero the buffer afterward), learn the exact per-vertex VBO layout
+    // from what it wrote, and fill the vertex buffer directly for the rest. The z-fail pass is two-sided
+    // (no culling — the GPU's facing picks increment vs decrement per triangle), so the software cull
+    // below only fires for geometry modes that carry cull bits. The capture must rerun each band
+    // because the band's composite re-resolves the pipeline with its own state. mBufVbo is backend-agnostic,
+    // so this single interpreter-side change is correct on all three backends.
+    size_t shadowStride = 0;                           // floats per vertex (0 = layout unexpected -> fallback)
+    float shadowColorBlock[VBO_MAX_FLOATS_PER_VERTEX]; // constant non-position vertex data (the flat prim color)
+
+    auto appendShadowVert = [&](const LoadedVertex& v) {
+        float z = v.z;
+        if (clip.z_is_from_0_to_1) {
+            z = (z + v.w) / 2.0f;
+        }
+        mBufVbo[mBufVboLen++] = v.x;
+        mBufVbo[mBufVboLen++] = clip.invertY ? -v.y : v.y;
+        mBufVbo[mBufVboLen++] = z;
+        mBufVbo[mBufVboLen++] = v.w;
+        for (size_t f = 4; f < shadowStride; f++) {
+            mBufVbo[mBufVboLen++] = shadowColorBlock[f];
+        }
+    };
+    // Software backface cull, identical to GfxSpTri1's, so each pass keeps the same faces it did per-triangle.
+    auto faceCulled = [&](const LoadedVertex& v1, const LoadedVertex& v2, const LoadedVertex& v3) -> bool {
+        const uint32_t cullType = mRsp->geometry_mode & cullBoth;
+        if (cullType == 0) {
+            return false;
+        }
+        const float dx1 = (v1.x / v1.w) - (v2.x / v2.w), dy1 = (v1.y / v1.w) - (v2.y / v2.w);
+        const float dx2 = (v3.x / v3.w) - (v2.x / v2.w), dy2 = (v3.y / v3.w) - (v2.y / v2.w);
+        float cross = (dx1 * dy2) - (dy1 * dx2);
+        if ((v1.w < 0) ^ (v2.w < 0) ^ (v3.w < 0)) {
+            cross = -cross;
+        }
+        if (ucode_handler_index == UcodeHandlers::ucode_f3dex2 &&
+            (mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) == 1) {
+            cross = -cross;
+        }
+        if (cullType == cullFront) {
+            return cross <= 0;
+        }
+        if (cullType == cullBack) {
+            return cross >= 0;
+        }
+        return true; // cull_both
+    };
+    // Fill + submit the whole volume for the current pass: fast direct-write path, or the per-triangle GfxSpTri1
+    // fallback if the captured layout was unexpected (shadowStride == 0).
+    auto drawVolume = [&]() {
+        if (shadowStride == 0) {
+            for (size_t t = 0; t < triTotal; t++) {
+                loadTri(t);
+                GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+            }
+        } else {
+            for (size_t t = 0; t < triTotal; t++) {
+                const LoadedVertex& a = mShadowXform[t * 3 + 0];
+                const LoadedVertex& b = mShadowXform[t * 3 + 1];
+                const LoadedVertex& c = mShadowXform[t * 3 + 2];
+                if (faceCulled(a, b, c)) {
+                    continue;
+                }
+                appendShadowVert(a), appendShadowVert(b), appendShadowVert(c);
+                if (++mBufVboNumTris == MAX_TRI_BUFFER) {
+                    Flush();
+                }
+            }
+        }
+        Flush();
+    };
+
+    for (int band = 0; band < kShadowBands; band++) {
+        const std::vector<float>& vol = mShadowVolumeAccum[band];
+        if (vol.size() < 9) {
+            continue;
+        }
+        // Band alpha: full-opacity core, one step lighter per ring.
+        const int step = std::min(band, bandsTotal - 1);
+        const uint8_t bandA = (uint8_t)(coreAlpha * ((float)(bandsTotal - step) / (float)bandsTotal) * 255.0f);
+        if (bandA == 0) {
+            continue;
+        }
+
+        // Transform the band to clip space ONCE; the two stencil passes and the debug overlay reuse it
+        // instead of re-projecting every vertex per pass. Vertex color is left undefined: the combine outputs
+        // PRIMITIVE (set per pass via prim_color), so the per-vertex shade color is never used.
+        const size_t vertCount = vol.size() / 3;
+        mShadowXform.resize(vertCount);
+        for (size_t vi = 0; vi < vertCount; vi++) {
+            const float wx = vol[vi * 3 + 0], wy = vol[vi * 3 + 1], wz = vol[vi * 3 + 2];
+            LoadedVertex& d = mShadowXform[vi];
+            d.x = AdjXForAspectRatio((wx * mRsp->P_matrix[0][0]) + (wy * mRsp->P_matrix[1][0]) +
+                                     (wz * mRsp->P_matrix[2][0]) + mRsp->P_matrix[3][0]);
+            d.y = (wx * mRsp->P_matrix[0][1]) + (wy * mRsp->P_matrix[1][1]) + (wz * mRsp->P_matrix[2][1]) +
+                  mRsp->P_matrix[3][1];
+            d.z = (wx * mRsp->P_matrix[0][2]) + (wy * mRsp->P_matrix[1][2]) + (wz * mRsp->P_matrix[2][2]) +
+                  mRsp->P_matrix[3][2];
+            d.w = (wx * mRsp->P_matrix[0][3]) + (wy * mRsp->P_matrix[1][3]) + (wz * mRsp->P_matrix[2][3]) +
+                  mRsp->P_matrix[3][3];
+            d.u = d.v = 0;
+            d.clip_rej = 0;
+        }
+        triTotal = vertCount / 3;
+
+        // Shared mask render state (both z-fail passes): flat transparent black, depth-tested XLU. Then
+        // resolve it into the pipeline and learn the VBO layout via the discarded setup triangle (see the
+        // batched-submission note above) — required per band, since the previous band's composite re-resolved
+        // the pipeline with its own state.
+        mRdp->prim_color = { 0, 0, 0, 0 };
+        mRdp->other_mode_l = G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2;
+        shadowStride = 0;
+        {
+            const uint32_t geoSaved = mRsp->geometry_mode;
+            mRsp->geometry_mode = G_ZBUFFER; // no cull -> GfxSpTri1 runs its full setup for this triangle
+            Flush();
+            loadTri(0);
+            GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+            mRsp->geometry_mode = geoSaved;
+            const size_t stride = (mBufVboNumTris > 0) ? (mBufVboLen / 3) : 0;
+            if (stride > 4 && stride <= VBO_MAX_FLOATS_PER_VERTEX) {
+                for (size_t f = 4; f < stride; f++) {
+                    shadowColorBlock[f] = mBufVbo[f]; // vertex 0's data past the 4 position floats (x,y,z,w)
+                }
+                shadowStride = stride;
+            }
+            mBufVboLen = 0, mBufVboNumTris = 0; // discard the setup triangle (re-drawn, culled, in the passes)
+        }
+
+        // z-fail mask, ONE two-sided pass: the GPU's facing picks the op per triangle (wrap-increment
+        // one facing, wrap-decrement the other), so the volume is submitted once with culling off
+        // instead of as a cull-front/cull-back pass pair — half the iteration, VBO fill and draw
+        // calls. Wrap ops + the composite's nonzero test make primitive order and facing polarity
+        // irrelevant; only "opposite ops per facing" matters (see StencilMode::VolumeIncrDecr).
+        mRsp->geometry_mode = G_ZBUFFER;
+        Flush();
+        mRapi->SetStencilMode((int)StencilMode::VolumeIncrDecr);
+        drawVolume();
+
+        // composite (self-clearing); full-screen clip-space quad, no depth test.
+        mRdp->prim_color = { 0, 0, 0, bandA };
+        mRdp->other_mode_l = G_RM_AA_XLU_SURF | G_RM_AA_XLU_SURF2;
+        mRsp->geometry_mode = 0;
+        mRapi->SetStencilMode((int)StencilMode::Composite);
+        {
+            const float qx[4] = { -1.0f, 1.0f, 1.0f, -1.0f }, qy[4] = { -1.0f, -1.0f, 1.0f, 1.0f };
+            for (int k = 0; k < 4; k++) {
+                LoadedVertex* d = &mRsp->loaded_vertices[MAX_VERTICES + k];
+                d->x = qx[k], d->y = qy[k], d->z = 0.0f, d->w = 1.0f;
+                d->u = d->v = 0;
+                d->color = mRdp->prim_color;
+                d->clip_rej = 0;
+            }
+            GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+            GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 2, MAX_VERTICES + 3, false);
+        }
+        Flush();
+
+        // debug overlay: draw this band's volumes translucently (black caps, blue walls), no stencil/depth.
+        if (mShadowShowVolume) {
+            mRapi->SetStencilMode((int)StencilMode::Off);
+            mRsp->geometry_mode = cullBack;
+            mRdp->other_mode_l = G_RM_AA_XLU_SURF | G_RM_AA_XLU_SURF2;
+            const std::vector<uint8_t>& kinds = mShadowVolumeKind[band];
+            for (int batch = 0; batch < 2; batch++) {
+                mRdp->prim_color = (batch == 0) ? RGBA{ 0, 0, 0, 128 } : RGBA{ 40, 90, 255, 128 };
+                for (size_t t = 0; (t * 3) + 3 <= vertCount; t++) {
+                    const bool isCap = t < kinds.size() && kinds[t] == 0;
+                    if (isCap != (batch == 0)) {
+                        continue;
+                    }
+                    loadTri(t);
+                    GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+                }
+                Flush();
+            }
+        }
+    }
+
+    mRapi->SetStencilMode((int)StencilMode::Off);
+    mRdp->prim_color = savedPrim;
+    mRdp->combine_mode = savedCombine;
+    mRdp->other_mode_l = savedOtherL;
+    mRdp->other_mode_h = savedOtherH;
+    mRsp->geometry_mode = savedGeo;
+    mRdp->toon = savedToon;
+    mRdp->toon_shadow = savedToonShadow;
+    mRdp->grayscale = savedGray;
+
+    clearAccums();
+}
+
 void Interpreter::GfxDpSetGrayscaleColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mRdp->grayscale_color.r = r;
     mRdp->grayscale_color.g = g;
@@ -2924,6 +3782,9 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         float y = expanded_lry / 4.0f;
         float w = (expanded_lrx - ulx) / 4.0f;
         float h = (expanded_lry - uly) / 4.0f;
+        float halfNativeWidth = (float)HALF_SCREEN_WIDTH(mActiveFrameBuffer);
+        x = halfNativeWidth + AdjXForAspectRatio(x - halfNativeWidth);
+        w = AdjXForAspectRatio(w);
 
         struct XYWidthHeight area;
         area.x = (int16_t)x;
@@ -3126,6 +3987,26 @@ void* Interpreter::SegAddr(uintptr_t w1) {
     } else {
         return (void*)w1;
     }
+}
+
+// Vertices reached through a segment (a runtime vertex buffer, e.g. the Skin system's segment 8) are addressed
+// by a BYTE offset that was encoded when a vertex was 16 bytes. sizeof(F3DVtx) is larger under GBI_S32_VTX,
+// so the offset must be converted to an element index and re-scaled, or every vertex past the first is
+// misaligned. Identical to SegAddr when the two sizes agree.
+// Only correct for offsets authored in 16-byte units, i.e. every ROM-exported display list. A runtime-built
+// segmented address computed with sizeof(Vtx) (e.g. the unused z_fbdemo.c TransitionTile) would be rescaled
+// wrongly; such code must reference its vertices by raw pointer instead.
+F3DVtx* Interpreter::SegAddrVtx(uintptr_t w1) {
+    if (w1 & 1) {
+        uint32_t segNum = (uint32_t)(w1 >> 24);
+
+        uint32_t offset = w1 & 0x00FFFFFE;
+
+        if (mSegmentPointers[segNum] != 0) {
+            return (F3DVtx*)(mSegmentPointers[segNum] + (size_t)(offset / OTR_EXPORTED_VTX_SIZE) * sizeof(F3DVtx));
+        }
+    }
+    return (F3DVtx*)w1;
 }
 
 #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
@@ -3497,7 +4378,7 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), gfx->SegAddrVtx(cmd->words.w1));
 
     return false;
 }
@@ -3505,7 +4386,7 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), gfx->SegAddrVtx(cmd->words.w1));
 
     return false;
 }
@@ -3514,7 +4395,8 @@ bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    // The packed length is a byte count over the archive's vertex size, not the runtime struct's.
+    gfx->GfxSpVertex((C0(0, 16)) / OTR_EXPORTED_VTX_SIZE, C0(16, 4), gfx->SegAddrVtx(cmd->words.w1));
 
     return false;
 }
@@ -3536,10 +4418,20 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
         gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (F3DVtx*)offset);
         (*cmd0)++;
     } else {
-        F3DVtx* vtx = (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        // The exported offset is a BYTE offset into the vertex resource. Its unit is that resource's own
+        // on-disk record size (16 for vanilla v0, 22 for the s32 v1 form) - never sizeof(F3DVtx), which is
+        // the padded runtime struct. Ask the resource rather than assuming.
+        auto resourceMgr = Ship::Context::GetRawInstance()->GetResourceManager();
+        auto res = resourceMgr->LoadResource(hash);
+        F3DVtx* vtx = (F3DVtx*)resourceMgr->GetResourceRawPointer(res);
 
         if (vtx != NULL) {
-            vtx = (F3DVtx*)((char*)vtx + offset);
+            // dynamic_cast, not static: a hash that resolved to some other resource type would otherwise be
+            // undefined behaviour. Falls back to the vanilla record size, which is what this assumed before.
+            auto vertexRes = std::dynamic_pointer_cast<Fast::Vertex>(res);
+            const uint32_t recordSize =
+                (vertexRes != nullptr && vertexRes->RecordSize != 0) ? vertexRes->RecordSize : OTR_EXPORTED_VTX_SIZE;
+            vtx += offset / recordSize;
 
             (*cmd0)--;
             F3DGfx* cmd = *cmd0;
@@ -3860,6 +4752,27 @@ bool gfx_othermode_h_handler_f3d(F3DGfx** cmd0) {
     return false;
 }
 
+// A resolved address still in the N64 segmented range (<= 0x0FFFFFFF) usually means SegAddr
+// failed to resolve it (segment not set up). Keep it only if it belongs to a loaded module,
+// where it's a real low pointer (e.g. a static TLUT) rather than an unresolved segment addr.
+static bool IsValidResolvedAddress(uintptr_t addr) {
+    if (addr > 0x0FFFFFFF) {
+        return true;
+    }
+
+    // Still in the N64 segmented range, but might be a false positive (a real low pointer).
+#ifdef _WIN32
+    // For Windows, check whether the address belongs to a dll.
+    HMODULE module = nullptr;
+    return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCSTR>(addr), &module) != 0;
+#else
+    // For non-Windows platforms, check whether the address belongs to a loaded object.
+    Dl_info info;
+    return dladdr(reinterpret_cast<void*>(addr), &info) != 0;
+#endif
+}
+
 bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -3875,8 +4788,8 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
-            std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-                Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(imgData));
+            std::shared_ptr<Fast::Texture> tex =
+                std::static_pointer_cast<Fast::Texture>(gfx->ResolveResourceCached(imgData));
 
             if (tex == nullptr) {
                 (*cmd0)++;
@@ -3894,23 +4807,9 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
         }
     }
 
-    // If the resolved address is still in the N64 segmented range, SegAddr
-    // failed to resolve it (segment not set up). Skip to avoid dereferencing
-    // invalid memory.
-    // For Windows, also check if the address is not from a dll because this validation returns a false positive caused
-    // by how the virtual memory is allocated.
-#ifdef _WIN32
-    HMODULE module = nullptr;
-    if (i <= 0x0FFFFFFF &&
-        !(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                             reinterpret_cast<LPCSTR>(i), &module))) {
+    if (!IsValidResolvedAddress(i)) {
         return false;
     }
-#else
-    if (i <= 0x0FFFFFFF) {
-        return false;
-    }
-#endif
 
     gfx->GfxDpSetTextureImage(C0(21, 3), C0(19, 2), C0(0, 12) + 1, imgData, texFlags, rawTexMetdata, (void*)i);
 
@@ -4136,6 +5035,107 @@ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// SOH [Enhancement] Toon lighting per-draw marker (mirrors grayscale).
+bool gfx_set_toon_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    // SOH [Enhancement] Actor shadow: draw the last object's drop shadow before the bracket toggles, then
+    // disarm the shadow pass (each object re-arms via gSPToonShadow). Run on both edges so a stale enable
+    // can never leak across the actor-loop boundary.
+    gfx->FlushToonShadow();
+    gfx->mRdp->toon_shadow = false;
+
+    gfx->mRdp->toon = cmd->words.w1;
+    // A fresh key must be supplied (per object) after each toon-on; clear any stale one.
+    gfx->mRsp->toon_key_valid = false;
+    return false;
+}
+
+// SOH [Enhancement] Per-object toon key light: world-space direction (3x s8 / 127) + color (3x u8 / 255).
+bool gfx_set_toon_key_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    // SOH [Enhancement] The toon key light is pushed to the GPU once per batch (see Flush) as a single
+    // world-space direction + color. Several objects that share texture/state are otherwise batched into
+    // one draw, so they would all be lit by whichever object's key was set last — each object picks its
+    // own key (the nearest light, or the sun), so a shared batch would mislight all but the last. Flush
+    // the pending geometry now, with the PREVIOUS object's key still in effect, so every toon object
+    // becomes its own correctly-lit batch.
+    gfx->Flush();
+
+    int8_t dx = (cmd->words.w0 >> 16) & 0xFF;
+    int8_t dy = (cmd->words.w0 >> 8) & 0xFF;
+    int8_t dz = (cmd->words.w0 >> 0) & 0xFF;
+    gfx->mRsp->toon_key_dir[0] = dx / 127.0f;
+    gfx->mRsp->toon_key_dir[1] = dy / 127.0f;
+    gfx->mRsp->toon_key_dir[2] = dz / 127.0f;
+    gfx->mRsp->toon_key_color[0] = ((cmd->words.w1 >> 16) & 0xFF) / 255.0f;
+    gfx->mRsp->toon_key_color[1] = ((cmd->words.w1 >> 8) & 0xFF) / 255.0f;
+    gfx->mRsp->toon_key_color[2] = ((cmd->words.w1 >> 0) & 0xFF) / 255.0f;
+    gfx->mRsp->toon_key_valid = true;
+    // The key changes the effective light, so force a recompute on the next vertex.
+    gfx->mRsp->lights_changed = true;
+    return false;
+}
+
+// SOH [Enhancement] Per-object actor shadow marker. The normal bytes are only an arm flag (nonzero = this
+// object casts a shadow, zero = it doesn't) — the renderer builds the volume from the captured feet and the
+// per-object toon key direction, not from a floor plane. w1 carries the eased 0..1 shadow size. Emitting this
+// per object also bounds each object's captured geometry: the previous object's volume is built here before
+// the next one arms.
+bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    // Arm flag: any nonzero normal byte arms the shadow for this object; all-zero disarms it. nx:ny carry an
+    // s16 "feet-clamp" world Y (or TOON_SHADOW_NO_CLAMP); nz is the arm marker that keeps the shadow armed even
+    // when the clamp bytes happen to be zero.
+    uint8_t nx = (cmd->words.w0 >> 16) & 0xFF;
+    uint8_t ny = (cmd->words.w0 >> 8) & 0xFF;
+    uint8_t nz = (cmd->words.w0 >> 0) & 0xFF;
+
+    float sizeOrSentinel;
+    uint32_t w1Bits = (uint32_t)cmd->words.w1;
+    memcpy(&sizeOrSentinel, &w1Bits, sizeof(sizeOrSentinel));
+
+    // Sentinel (gSPToonShadowFlush): a zero normal with this magic w1 means "render the frame's accumulated
+    // shadow volumes now" (emitted at the pre-actor hook so shadows land only on the environment).
+    if ((nx | ny | nz) == 0 && sizeOrSentinel <= -1.0e29f) {
+        gfx->RenderShadowVolumes();
+        return false;
+    }
+
+    gfx->FlushToonShadow(); // build + accumulate the previous object's volume
+
+    gfx->mRsp->toon_shadow_size = sizeOrSentinel;
+    gfx->mRdp->toon_shadow = (nx | ny | nz) != 0;
+    // Decode the s16 feet clamp packed in nx:ny (TOON_SHADOW_NO_CLAMP = leave the feet at the captured
+    // geometry). Set alongside toon_shadow_size so the deferred FlushToonShadow reads this object's value.
+    int16_t feetClamp = (int16_t)(((uint16_t)nx << 8) | (uint16_t)ny);
+    gfx->mRsp->toon_shadow_clamp_feet = (feetClamp != -32768);
+    gfx->mRsp->toon_shadow_feet_clamp_y = (float)feetClamp;
+    // Snapshot THIS object's key direction (set by the gSPToonKey just before this command) so its
+    // deferred shadow flush uses it, not whatever later object last touched toon_key_dir.
+    gfx->mRsp->toon_shadow_dir[0] = gfx->mRsp->toon_key_dir[0];
+    gfx->mRsp->toon_shadow_dir[1] = gfx->mRsp->toon_key_dir[1];
+    gfx->mRsp->toon_shadow_dir[2] = gfx->mRsp->toon_key_dir[2];
+    return false;
+}
+
+// SOH [Enhancement] World light casting: set the stencil mode for the stencil light-volume technique.
+// Mirrors the toon-key handler's flush-then-set: the mode change must not retroactively apply to already
+// batched geometry, so flush the pending tris (under the previous mode) before switching.
+bool gfx_set_stencil_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    gfx->Flush();
+    gfx->mRapi->SetStencilMode((int)cmd->words.w1);
+    return false;
+}
+
 bool gfx_load_block_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4204,6 +5204,29 @@ bool gfx_set_tile_size_interp_handler_rdp(F3DGfx** cmd0) {
         ++(*cmd0);
         ++(*cmd0);
     }
+
+    return false;
+}
+
+bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
+    F3DGfx* cmd = *cmd0;
+    Interpreter* gfx = mInstance.lock().get();
+
+    int tile = C1(24, 3);
+    float coords[8];
+    for (int i = 0; i < 8; i += 2) {
+        ++(*cmd0);
+        memcpy(&coords[i], &(*cmd0)->words.w0, sizeof(float));
+        memcpy(&coords[i + 1], &(*cmd0)->words.w1, sizeof(float));
+    }
+
+    float t = gfx->mInterpolationT;
+    gfx->mRdp->texture_tile[tile].uls = coords[0] + t * (coords[4] - coords[0]);
+    gfx->mRdp->texture_tile[tile].ult = coords[1] + t * (coords[5] - coords[1]);
+    gfx->mRdp->texture_tile[tile].lrs = coords[2] + t * (coords[6] - coords[2]);
+    gfx->mRdp->texture_tile[tile].lrt = coords[3] + t * (coords[7] - coords[3]);
+    gfx->mRdp->textures_changed[0] = true;
+    gfx->mRdp->textures_changed[1] = true;
 
     return false;
 }
@@ -4489,6 +5512,20 @@ bool gfx_extra_geometry_mode_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// SOH [Unbound] OTR_G_FOGF: fog factor as two floats (w1 points at { mul, offset }). Same math as G_MW_FOG
+// (fog = ndcZ * mul + offset, 0..255) without the s16 packing, which capped where fog could start.
+bool gfx_fog_factor_float_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *(cmd0);
+    const float* f = (const float*)gfx->SegAddr(cmd->words.w1);
+
+    if (f != nullptr) {
+        gfx->mRsp->fog_mul = f[0];
+        gfx->mRsp->fog_offset = f[1];
+    }
+    return false;
+}
+
 bool gfx_stubbed_command_handler(F3DGfx** cmd0) {
     return false;
 }
@@ -4525,34 +5562,35 @@ static constexpr UcodeHandler rdpHandlers = {
     { RDP_G_SETTARGETINTERPINDEX,
       { "G_SETTARGETINTERPINDEX", gfx_set_interpolation_index_target } }, // G_SETTARGETINTERPINDEX
     { RDP_G_SETTILESIZE_INTERP,
-      { "G_SETTILESIZE_INTERP", gfx_set_tile_size_interp_handler_rdp } },            // G_SETTILESIZE_INTERP
-    { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },           // G_TEXRECT (-28)
-    { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },   // G_TEXRECTFLIP (-27)
-    { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },          // mRdpLOADSYNC (-26)
-    { RDP_G_RDPPIPESYNC, { "mRdpPIPESYNC", gfx_stubbed_command_handler } },          // mRdpPIPESYNC (-25)
-    { RDP_G_RDPTILESYNC, { "mRdpTILESYNC", gfx_stubbed_command_handler } },          // mRdpPIPESYNC (-24)
-    { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },          // mRdpFULLSYNC (-23)
-    { RDP_G_SETKEYGB, { "G_SETKEYGB", gfx_set_key_gb_handler_rdp } },                // G_SETKEYGB (-22)
-    { RDP_G_SETKEYR, { "G_SETKEYR", gfx_set_key_r_handler_rdp } },                   // G_SETKEYR (-21)
-    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_set_convert_handler_rdp } },           // G_SETCONVERT (-20)
-    { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },            // G_SETSCISSOR (-19)
-    { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },    // G_SETPRIMDEPTH (-18)
-    { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },   // mRdpSETOTHERMODE (-17)
-    { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                 // G_LOADTLUT (-16)
-    { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },       // G_SETTILESIZE (-14)
-    { RDP_G_LOADBLOCK, { "G_LOADBLOCK", gfx_load_block_handler_rdp } },              // G_LOADBLOCK (-13)
-    { RDP_G_LOADTILE, { "G_LOADTILE", gfx_load_tile_handler_rdp } },                 // G_LOADTILE (-12)
-    { RDP_G_SETTILE, { "G_SETTILE", gfx_set_tile_handler_rdp } },                    // G_SETTILE (-11)
-    { RDP_G_FILLRECT, { "G_FILLRECT", gfx_fill_rect_handler_rdp } },                 // G_FILLRECT (-10)
-    { RDP_G_SETFILLCOLOR, { "G_SETFILLCOLOR", gfx_set_fill_color_handler_rdp } },    // G_SETFILLCOLOR (-9)
-    { RDP_G_SETFOGCOLOR, { "G_SETFOGCOLOR", gfx_set_fog_color_handler_rdp } },       // G_SETFOGCOLOR (-8)
-    { RDP_G_SETBLENDCOLOR, { "G_SETBLENDCOLOR", gfx_set_blend_color_handler_rdp } }, // G_SETBLENDCOLOR (-7)
-    { RDP_G_SETPRIMCOLOR, { "G_SETPRIMCOLOR", gfx_set_prim_color_handler_rdp } },    // G_SETPRIMCOLOR (-6)
-    { RDP_G_SETENVCOLOR, { "G_SETENVCOLOR", gfx_set_env_color_handler_rdp } },       // G_SETENVCOLOR (-5)
-    { RDP_G_SETCOMBINE, { "G_SETCOMBINE", gfx_set_combine_handler_rdp } },           // G_SETCOMBINE (-4)
-    { RDP_G_SETTIMG, { "G_SETTIMG", gfx_set_timg_handler_rdp } },                    // G_SETTIMG (-3)
-    { RDP_G_SETZIMG, { "G_SETZIMG", gfx_set_z_img_handler_rdp } },                   // G_SETZIMG (-2)
-    { RDP_G_SETCIMG, { "G_SETCIMG", gfx_set_c_img_handler_rdp } },                   // G_SETCIMG (-1)
+      { "G_SETTILESIZE_INTERP", gfx_set_tile_size_interp_handler_rdp } },                     // G_SETTILESIZE_INTERP
+    { RDP_G_SETTILESIZE_LERP, { "G_SETTILESIZE_LERP", gfx_set_tile_size_lerp_handler_rdp } }, // G_SETTILESIZE_LERP
+    { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },                    // G_TEXRECT (-28)
+    { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },            // G_TEXRECTFLIP (-27)
+    { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },                   // mRdpLOADSYNC (-26)
+    { RDP_G_RDPPIPESYNC, { "mRdpPIPESYNC", gfx_stubbed_command_handler } },                   // mRdpPIPESYNC (-25)
+    { RDP_G_RDPTILESYNC, { "mRdpTILESYNC", gfx_stubbed_command_handler } },                   // mRdpPIPESYNC (-24)
+    { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },                   // mRdpFULLSYNC (-23)
+    { RDP_G_SETKEYGB, { "G_SETKEYGB", gfx_set_key_gb_handler_rdp } },                         // G_SETKEYGB (-22)
+    { RDP_G_SETKEYR, { "G_SETKEYR", gfx_set_key_r_handler_rdp } },                            // G_SETKEYR (-21)
+    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_set_convert_handler_rdp } },                    // G_SETCONVERT (-20)
+    { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },                     // G_SETSCISSOR (-19)
+    { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },             // G_SETPRIMDEPTH (-18)
+    { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },            // mRdpSETOTHERMODE (-17)
+    { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                          // G_LOADTLUT (-16)
+    { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },                // G_SETTILESIZE (-14)
+    { RDP_G_LOADBLOCK, { "G_LOADBLOCK", gfx_load_block_handler_rdp } },                       // G_LOADBLOCK (-13)
+    { RDP_G_LOADTILE, { "G_LOADTILE", gfx_load_tile_handler_rdp } },                          // G_LOADTILE (-12)
+    { RDP_G_SETTILE, { "G_SETTILE", gfx_set_tile_handler_rdp } },                             // G_SETTILE (-11)
+    { RDP_G_FILLRECT, { "G_FILLRECT", gfx_fill_rect_handler_rdp } },                          // G_FILLRECT (-10)
+    { RDP_G_SETFILLCOLOR, { "G_SETFILLCOLOR", gfx_set_fill_color_handler_rdp } },             // G_SETFILLCOLOR (-9)
+    { RDP_G_SETFOGCOLOR, { "G_SETFOGCOLOR", gfx_set_fog_color_handler_rdp } },                // G_SETFOGCOLOR (-8)
+    { RDP_G_SETBLENDCOLOR, { "G_SETBLENDCOLOR", gfx_set_blend_color_handler_rdp } },          // G_SETBLENDCOLOR (-7)
+    { RDP_G_SETPRIMCOLOR, { "G_SETPRIMCOLOR", gfx_set_prim_color_handler_rdp } },             // G_SETPRIMCOLOR (-6)
+    { RDP_G_SETENVCOLOR, { "G_SETENVCOLOR", gfx_set_env_color_handler_rdp } },                // G_SETENVCOLOR (-5)
+    { RDP_G_SETCOMBINE, { "G_SETCOMBINE", gfx_set_combine_handler_rdp } },                    // G_SETCOMBINE (-4)
+    { RDP_G_SETTIMG, { "G_SETTIMG", gfx_set_timg_handler_rdp } },                             // G_SETTIMG (-3)
+    { RDP_G_SETZIMG, { "G_SETZIMG", gfx_set_z_img_handler_rdp } },                            // G_SETZIMG (-2)
+    { RDP_G_SETCIMG, { "G_SETCIMG", gfx_set_c_img_handler_rdp } },                            // G_SETCIMG (-1)
 };
 
 static constexpr UcodeHandler otrHandlers = {
@@ -4588,7 +5626,12 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_REGBLENDEDTEX,
       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
-    { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
+    { OTR_G_FOGF, { "G_FOGF", gfx_fog_factor_float_handler_custom } },              // G_FOGF (0x41)
+    { OTR_G_SETTOON, { "G_SETTOON", gfx_set_toon_handler_custom } },
+    { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },
+    { OTR_G_SETTOONSHADOW, { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } },
+    { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } },
+    { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } }, // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
     { RDP_G_LOADBLOCK_WIDE, { "G_LOADBLOCK_WIDE", gfx_load_block_wide_handler_rdp } }, // RDP_G_LOADBLOCK_WIDE (-15)
@@ -5279,6 +6322,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
     cc_features->opt_invisible = (shader_id1 & SHADER_OPT(INVISIBLE)) != 0;
     cc_features->opt_grayscale = (shader_id1 & SHADER_OPT(GRAYSCALE)) != 0;
     cc_features->opt_prim_depth = (shader_id1 & SHADER_OPT(PRIM_DEPTH)) != 0;
+    cc_features->opt_toon = (shader_id1 & SHADER_OPT(TOON)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);

@@ -106,6 +106,12 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
         return LoadResourceProcess({ newFilePath, identifier.Owner, identifier.Parent }, false, initData);
     }
 
+    uint64_t epoch;
+    {
+        const std::lock_guard<std::mutex> lock(mMutex);
+        epoch = mCacheEpoch;
+    }
+
     // Cache the starts_with check to avoid repeated string comparisons
     const bool isAltPath = identifier.Path.starts_with(IResource::gAltAssetPrefix);
     const bool shouldCheckAlt = !loadExact && mAltAssetsEnabled && !isAltPath;
@@ -149,35 +155,54 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
         }
     }
 
-    // Get the file from the OTR
+    // Get the file from the OTR. It may be null when the resource exists only as a `.meta`
+    // alias (no real file at this path); fall through so the loader can resolve the alias,
+    // but only when a `.meta` for this path actually exists.
     auto file = LoadFileProcess(identifier.Path);
-    if (file == nullptr) {
+    if (file == nullptr && !mArchiveManager->HasFile(identifier.Path + ".meta")) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
-        mResourceCache[identifier] = ResourceLoadError::NotFound;
+        decltype(mResourceCache)::node_type retired;
+        {
+            const std::lock_guard<std::mutex> lock(mMutex);
+            if (epoch == mCacheEpoch) {
+                auto found = mResourceCache.find(identifier);
+                const auto* cached =
+                    found == mResourceCache.end() ? nullptr : std::get_if<std::shared_ptr<IResource>>(&found->second);
+                // Preserva um recurso limpo publicado durante a leitura que falhou.
+                if (!cached || !*cached || (*cached)->IsDirty()) {
+                    if (found != mResourceCache.end())
+                        retired = mResourceCache.extract(found);
+                    mResourceCache.emplace(identifier, ResourceLoadError::NotFound);
+                }
+            }
+        } // O nó substituído (recurso e parent) só é destruído fora do mutex.
         return nullptr;
     }
 
     // Transform the raw data into a resource
     auto resource = GetResourceLoader()->LoadResource(identifier.Path, file, initData);
 
-    // Another thread could have loaded the resource while we were processing, so we want to check before setting to
-    // the cache.
-    cachedResource = GetCachedResource(identifier, true);
-
+    std::shared_ptr<IResource> retained;
     {
         const std::lock_guard<std::mutex> lock(mMutex);
-
-        if (cachedResource != nullptr) {
-            // If another thread has already loaded this resource, discard the work we already did and return from
-            // cache.
-            resource = cachedResource;
-        }
-
-        // Set the cache to the loaded resource
-        if (resource != nullptr) {
-            mResourceCache[identifier] = resource;
-        } else {
-            mResourceCache[identifier] = ResourceLoadError::NotFound;
+        // Uma fábrica antiga pode terminar, mas não repovoa cache de outra geração.
+        if (epoch == mCacheEpoch) {
+            auto found = mResourceCache.find(identifier);
+            if (found != mResourceCache.end() && std::holds_alternative<std::shared_ptr<IResource>>(found->second))
+                cachedResource = std::get<std::shared_ptr<IResource>>(found->second);
+            if (cachedResource && !cachedResource->IsDirty()) {
+                retained = std::move(resource); // Destruição de recursos fora do mutex.
+                resource = cachedResource;
+            }
+            if (found != mResourceCache.end() && std::holds_alternative<std::shared_ptr<IResource>>(found->second)) {
+                auto previous = std::get<std::shared_ptr<IResource>>(found->second);
+                if (!retained)
+                    retained = std::move(previous);
+            }
+            if (resource)
+                mResourceCache[identifier] = resource;
+            else
+                mResourceCache[identifier] = ResourceLoadError::NotFound;
         }
     }
 
@@ -391,6 +416,12 @@ void ResourceManager::UnloadResourcesProcess(const ResourceFilter& filter) {
 
     for (const auto& key : *list.get()) {
         UnloadResource({ key, mDefaultCacheOwner, mDefaultCacheArchive });
+
+        // A `.meta` alias resource is cached under its base path, which is not itself a listed
+        // file. Evict it too so it can't survive stale after its target/dependencies are unloaded.
+        if (key.ends_with(".meta")) {
+            UnloadResource({ key.substr(0, key.size() - 5), mDefaultCacheOwner, mDefaultCacheArchive });
+        }
     }
 }
 
@@ -402,19 +433,53 @@ std::shared_ptr<ResourceLoader> ResourceManager::GetResourceLoader() {
     return mResourceLoader;
 }
 
-size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
-    // Store a shared pointer here so that erase doesn't destruct the resource.
-    // The resource will attempt to load other resources on the destructor, and this will fail because we already hold
-    // the mutex.
-    std::variant<ResourceLoadError, std::shared_ptr<IResource>> value = nullptr;
-    size_t ret = 0;
-    // We can only erase the resource if we have any resources for that owner.
-    if (mResourceCache.contains(identifier)) {
-        const std::lock_guard<std::mutex> lock(mMutex);
-        mResourceCache.erase(identifier);
+bool ResourceManager::PublishArchiveBatch(const ArchiveManager::ArchiveSnapshot& expected,
+                                          const std::vector<std::shared_ptr<Archive>>& desired,
+                                          const std::unordered_set<std::string>& affected,
+                                          std::vector<std::shared_ptr<Archive>>& published) {
+    // Preparar todos os nomes antes do commit, inclusive resolução alternativa e sidecars.
+    auto names = affected;
+    for (const auto& path : affected) {
+        const auto base = path.ends_with(".meta") ? path.substr(0, path.size() - 5) : path;
+        names.insert(base);
+        names.insert(base + ".meta");
+        names.insert(IResource::gAltAssetPrefix + base);
+        names.insert(IResource::gAltAssetPrefix + base + ".meta");
+        if (base.starts_with(IResource::gAltAssetPrefix)) {
+            const auto regular = base.substr(IResource::gAltAssetPrefix.size());
+            names.insert(regular);
+            names.insert(regular + ".meta");
+        }
     }
+    // Extrair nós evita destruir recursos (ou o parent gerenciado) dentro dos locks.
+    std::vector<decltype(mResourceCache)::node_type> retired;
+    {
+        const std::lock_guard<std::mutex> lock(mMutex);
+        retired.reserve(mResourceCache.size());
+        if (!mArchiveManager->ReplaceArchiveBatch(expected, desired, published))
+            return false;
+        for (auto it = mResourceCache.begin(); it != mResourceCache.end();) {
+            if (names.contains(it->first.Path)) {
+                auto current = it++;
+                retired.push_back(mResourceCache.extract(current));
+            } else {
+                ++it;
+            }
+        }
+        ++mCacheEpoch;
+    }
+    return true;
+}
 
-    return ret;
+size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
+    decltype(mResourceCache)::node_type retired;
+    {
+        const std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mResourceCache.find(identifier);
+        if (found != mResourceCache.end())
+            retired = mResourceCache.extract(found);
+    }
+    return retired.empty() ? 0 : 1;
 }
 
 size_t ResourceManager::UnloadResource(const std::string& filePath) {
@@ -422,8 +487,15 @@ size_t ResourceManager::UnloadResource(const std::string& filePath) {
 }
 
 void ResourceManager::CacheExternalResource(const std::string& filePath, std::shared_ptr<IResource> resource) {
-    const std::lock_guard<std::mutex> lock(mMutex);
-    mResourceCache[{ filePath, mDefaultCacheOwner, mDefaultCacheArchive }] = resource;
+    decltype(mResourceCache)::node_type retired;
+    {
+        const std::lock_guard<std::mutex> lock(mMutex);
+        ResourceIdentifier identifier{ filePath, mDefaultCacheOwner, mDefaultCacheArchive };
+        auto found = mResourceCache.find(identifier);
+        if (found != mResourceCache.end())
+            retired = mResourceCache.extract(found);
+        mResourceCache[identifier] = std::move(resource);
+    }
 }
 
 bool ResourceManager::WriteResource(const ResourceIdentifier& identifier, const std::vector<uint8_t>& data,

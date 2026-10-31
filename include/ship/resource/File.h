@@ -20,6 +20,8 @@ class Archive;
 #define RESOURCE_FORMAT_BINARY 0
 /** @brief Format tag indicating the resource data is stored as XML. */
 #define RESOURCE_FORMAT_XML 1
+// JSON: first byte '{'; type and version come from a top-level "$schema": "<type>/<version>"
+#define RESOURCE_FORMAT_JSON 2
 
 /**
  * @brief Metadata that describes how a resource was (or should be) loaded.

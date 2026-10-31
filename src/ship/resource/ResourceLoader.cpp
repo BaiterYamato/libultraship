@@ -1,4 +1,6 @@
 #include "ship/resource/ResourceLoader.h"
+#include <string_view>
+#include <cstdlib>
 #include "ship/resource/ResourceFactory.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/resource/Resource.h"
@@ -41,6 +43,10 @@ bool ResourceLoader::RegisterResourceFactory(std::shared_ptr<ResourceFactory> fa
 
     ResourceFactoryKey key{ .resourceFormat = format, .resourceType = type, .resourceVersion = version };
     if (mFactories.contains(key)) {
+        // Registering the same factory instance again under another type name only adds the name alias.
+        if (mFactories[key] == factory) {
+            return true;
+        }
         SPDLOG_ERROR("Failed to register resource factory: factory with key {}{}{} already exists", format, type,
                      version);
         return false;
@@ -84,7 +90,10 @@ std::shared_ptr<ResourceFactory> ResourceLoader::GetFactory(uint32_t format, std
 
 std::shared_ptr<ResourceInitData> ResourceLoader::ReadResourceInitDataLegacy(const std::string& filePath,
                                                                              std::shared_ptr<File> fileToLoad) {
-    // Determine if file is binary or XML...
+    // Determine if file is binary, XML or JSON...
+    if (fileToLoad->Buffer->at(0) == '{') {
+        return ReadResourceInitDataJson(filePath, fileToLoad);
+    }
     if (fileToLoad->Buffer->at(0) == '<') {
         // File is XML
         // Read the xml document
@@ -178,28 +187,72 @@ std::shared_ptr<ResourceInitData> ResourceLoader::ReadResourceInitData(const std
     initData->Type =
         Context::GetRawInstance()->GetResourceManager()->GetResourceLoader()->GetResourceType(parsed["type"]);
     initData->ResourceVersion = parsed["version"];
+    initData->IsCustom = parsed.value("isCustom", false);
 
     return initData;
 }
 
-std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, std::shared_ptr<File> fileToLoad,
-                                                        std::shared_ptr<ResourceInitData> initData) {
-    if (fileToLoad == nullptr) {
-        SPDLOG_ERROR("Failed to load resource: File not loaded");
+// Position File::BufferOffset at the resource body. A currently-headed binary resource keeps an OTR
+// header ahead of its body; when init data was supplied externally (a caller or a `.meta`) rather
+// than parsed from that header, skip past it. Headerless buffers (a shader, or any asset once
+// Kenix3/libultraship#1160 removes the header) have no valid byte order / matching type and are left
+// at offset 0. Remove this and its call sites along with the header under #1160.
+static void SetBufferOffset(const std::shared_ptr<File>& file, const std::shared_ptr<ResourceInitData>& initData) {
+    if (file == nullptr || initData->Format != RESOURCE_FORMAT_BINARY || file->Buffer->size() < OTR_HEADER_SIZE) {
+        return;
+    }
+    auto reader = std::make_shared<BinaryReader>(std::make_shared<MemoryStream>(file->Buffer));
+    auto byteOrder = (Endianness)reader->ReadInt8();
+    if (byteOrder != Endianness::Little && byteOrder != Endianness::Big) {
+        return;
+    }
+    reader->SetEndianness(byteOrder);
+    reader->ReadInt8(); // isCustom
+    reader->ReadInt8(); // reserved
+    reader->ReadInt8(); // reserved
+    if (reader->ReadUInt32() == initData->Type) {
+        file->BufferOffset = OTR_HEADER_SIZE;
+    }
+}
+
+std::shared_ptr<ResourceInitData> ResourceLoader::ResolveMetaAlias(const std::string& filePath,
+                                                                   std::shared_ptr<File>& fileToLoad) {
+    auto resourceManager = Context::GetRawInstance()->GetResourceManager();
+    auto metaFileToLoad = resourceManager->LoadFileProcess(filePath + ".meta");
+    if (metaFileToLoad == nullptr) {
         return nullptr;
     }
 
-    if (initData == nullptr) {
-        auto metaFilePath = filePath + ".meta";
-        auto metaFileToLoad = Context::GetRawInstance()->GetResourceManager()->LoadFileProcess(metaFilePath);
+    auto metaInitData = ReadResourceInitData(filePath, metaFileToLoad);
+    auto aliasedFileToLoad = resourceManager->LoadFileProcess(metaInitData->Path);
+    if (aliasedFileToLoad == nullptr) {
+        return nullptr;
+    }
 
-        if (metaFileToLoad != nullptr) {
-            auto initDataFromMetaFile = ReadResourceInitData(filePath, metaFileToLoad);
-            fileToLoad = Context::GetRawInstance()->GetResourceManager()->LoadFileProcess(initDataFromMetaFile->Path);
-            initData = initDataFromMetaFile;
-        } else {
-            initData = ReadResourceInitDataLegacy(filePath, fileToLoad);
-        }
+    // The alias wins only if its target lives in an equal-or-higher priority archive than the
+    // real asset at filePath (ties go to the alias; a missing real asset reports priority -1).
+    auto archiveManager = resourceManager->GetArchiveManager();
+    int32_t realPriority = archiveManager->GetFilePriority(filePath);
+    int32_t aliasPriority = archiveManager->GetFilePriority(metaInitData->Path);
+    if (aliasPriority < realPriority) {
+        return nullptr;
+    }
+
+    fileToLoad = aliasedFileToLoad;
+    return metaInitData;
+}
+
+std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, std::shared_ptr<File> fileToLoad,
+                                                        std::shared_ptr<ResourceInitData> initData) {
+    // fileToLoad is the highest-priority real asset at filePath, or null when the resource
+    // exists only as a `.meta` alias. Prefer a winning alias, else read the real asset's header.
+    bool legacyInitData = false;
+    if (initData == nullptr) {
+        initData = ResolveMetaAlias(filePath, fileToLoad);
+    }
+    if (initData == nullptr && fileToLoad != nullptr) {
+        initData = ReadResourceInitDataLegacy(filePath, fileToLoad);
+        legacyInitData = true;
     }
 
     if (fileToLoad == nullptr) {
@@ -209,11 +262,16 @@ std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, st
 
     switch (initData->Format) {
         case RESOURCE_FORMAT_BINARY:
+            if (!legacyInitData) {
+                SetBufferOffset(fileToLoad, initData);
+            }
             fileToLoad->Reader = CreateBinaryReader(fileToLoad, initData);
             break;
         case RESOURCE_FORMAT_XML:
             fileToLoad->Reader = CreateXMLReader(fileToLoad, initData);
             break;
+        case RESOURCE_FORMAT_JSON:
+            break; // JSON factories parse the buffer (and any lower archive layers) themselves
     }
 
     // initData->Parent = shared_from_this();
@@ -268,6 +326,45 @@ ResourceLoader::ReadResourceInitDataBinary(const std::string& filePath, std::sha
     // OTR HEADER END
 
     headerReader->Seek(0, SeekOffsetType::Start);
+    return resourceInitData;
+}
+
+/**
+ * JSON resources declare their type as a top-level "$schema": "<type name>/<version>", e.g. "unbound/scene/1".
+ * A patch layer may omit it, so every mounted layer is searched, topmost first. Only that one key is read here;
+ * the factory parses the document.
+ */
+static std::string FindJsonSchema(const std::vector<std::shared_ptr<File>>& layers) {
+    for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+        auto doc = nlohmann::json::parse((*it)->Buffer->begin(), (*it)->Buffer->end(), nullptr, false, true);
+        if (doc.is_object() && doc.contains("$schema") && doc["$schema"].is_string()) {
+            return doc["$schema"].get<std::string>();
+        }
+    }
+    return "";
+}
+
+std::shared_ptr<ResourceInitData> ResourceLoader::ReadResourceInitDataJson(const std::string& filePath,
+                                                                           std::shared_ptr<File> fileToLoad) {
+    auto resourceInitData = CreateDefaultResourceInitData();
+    resourceInitData->Path = filePath;
+    resourceInitData->Format = RESOURCE_FORMAT_JSON;
+
+    std::string schema = FindJsonSchema({ fileToLoad });
+    if (schema.empty()) {
+        auto archives = Context::GetRawInstance()->GetResourceManager()->GetArchiveManager();
+        schema = FindJsonSchema(archives->LoadFileFromAllLayers(filePath));
+    }
+    if (schema.empty()) {
+        SPDLOG_ERROR("JSON resource {} has no \"$schema\" string in any layer", filePath);
+        return resourceInitData;
+    }
+    auto slash = schema.find_last_of('/');
+    std::string typeName = slash == std::string::npos ? schema : schema.substr(0, slash);
+    int32_t version = slash == std::string::npos ? 0 : std::atoi(schema.c_str() + slash + 1);
+
+    resourceInitData->Type = GetResourceType(typeName);
+    resourceInitData->ResourceVersion = version;
     return resourceInitData;
 }
 

@@ -39,6 +39,16 @@ struct ShaderProgram {
     GLint texture_width_location;
     GLint texture_height_location;
     GLint texture_filtering_location;
+    // SOH [Enhancement] Toon lighting
+    bool opt_toon;
+    GLint toon_light_dir_location;
+    GLint toon_light_color_location;
+    GLint toon_ambient_location;
+    GLint toon_ramp_center_location;
+    GLint toon_ramp_softness_location;
+    GLint toon_highlight_intensity_location;
+    GLint toon_shadow_intensity_location;
+    GLint toon_debug_location;
 };
 
 struct FramebufferOGL {
@@ -117,6 +127,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     int8_t mLastActiveTexture = -1;
     int8_t mLastBlendEnabled = -1;
     int8_t mLastScissorEnabled = -1;
+    // SOH [Enhancement] world light casting / actor shadows: change tracker for mStencilMode (reset
+    // each frame — ImGui's GL backend touches stencil state between our frames).
+    int mLastStencilMode = -1;
 
     std::map<std::pair<uint64_t, uint32_t>, ShaderProgram> mShaderProgramPool;
     ShaderProgram* mCurrentShaderProgram;

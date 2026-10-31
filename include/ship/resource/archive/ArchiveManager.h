@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <stdint.h>
 #include <functional>
+#include <mutex>
 #include "ship/resource/File.h"
 #ifdef ENABLE_SCRIPTING
 #include "ship/security/Keystore.h"
@@ -41,6 +42,11 @@ using UntrustedArchiveHandler = std::function<bool(Archive& archive, KeystoreEnt
 class ArchiveManager {
   public:
     ArchiveManager();
+    struct ArchiveSnapshot {
+        std::vector<std::shared_ptr<Archive>> archives;
+        uint64_t revision;
+    };
+    ArchiveSnapshot GetArchiveSnapshot();
 
     /**
      * @brief Discovers and mounts all archives found under the given paths.
@@ -58,6 +64,8 @@ class ArchiveManager {
 
     /**
      * @brief Opens and adds an archive by filesystem path.
+     *
+     * Loads the archive before publishing it, outside the VFS mutex.
      * @param archivePath Absolute or relative path to the archive file or directory.
      * @return Shared pointer to the newly added Archive, or nullptr on failure.
      */
@@ -65,17 +73,27 @@ class ArchiveManager {
 
     /**
      * @brief Adds a pre-constructed Archive object to the managed collection.
-     * @param archive Already-constructed (but not yet loaded) Archive.
-     * @return Shared pointer to the added Archive.
+     * @param archive Already-constructed and loaded Archive.
+     * @return Shared pointer to the added Archive, or nullptr if unloaded, rejected by
+     *         game-version validation, or still finishing a previous retirement.
      */
     std::shared_ptr<Archive> AddArchive(std::shared_ptr<Archive> archive);
 
-    /** @brief Returns all currently mounted archives in priority order (last = highest priority). */
+    /**
+     * @brief Returns a snapshot of mounted archives in priority order (last = highest priority).
+     *
+     * The returned pointers retain archive lifetime across removal. Editing the returned
+     * vector does not modify the manager.
+     */
     std::shared_ptr<std::vector<std::shared_ptr<Archive>>> GetArchives();
 
     /**
-     * @brief Replaces the entire archive list with a new collection.
-     * @param archives New ordered list of archives.
+     * @brief Replaces the archive list with an ordered snapshot of already-loaded objects.
+     *
+     * Does not open or reload the objects. Null/unloaded entries, invalid game versions,
+     * and objects still finishing retirement are skipped. Existing objects are retained
+     * without closing/reopening them; nullptr clears the collection.
+     * @param archives New ordered list of loaded archives, or nullptr.
      */
     void SetArchives(std::shared_ptr<std::vector<std::shared_ptr<Archive>>> archives);
 
@@ -85,6 +103,12 @@ class ArchiveManager {
      * @return Number of archives removed (0 or 1).
      */
     size_t RemoveArchive(std::shared_ptr<Archive> archive);
+
+    // Troca integral, por revisão, identidade e ordem, de um snapshot esperado. Os candidatos devem estar
+    // abertos e seus índices permanecer imutáveis. false preserva o VFS; exceções também.
+    // published deve estar vazio; recebe ownership gerenciado, na ordem de desired.
+    bool ReplaceArchiveBatch(const ArchiveSnapshot& expected, const std::vector<std::shared_ptr<Archive>>& desired,
+                             std::vector<std::shared_ptr<Archive>>& published);
 
     /**
      * @brief Removes the archive at the given filesystem path.
@@ -104,6 +128,13 @@ class ArchiveManager {
      * @return Loaded File, or nullptr if no mounted archive contains the file.
      */
     std::shared_ptr<File> LoadFile(const std::string& filePath);
+
+    /**
+     * @brief Loads every mounted copy of a virtual path.
+     * @param filePath Virtual path of the file.
+     * @return Loaded files from lowest to highest archive priority.
+     */
+    std::vector<std::shared_ptr<File>> LoadFileFromAllLayers(const std::string& filePath);
 
     /**
      * @brief Loads raw file bytes by 64-bit hash from the highest-priority matching archive.
@@ -144,6 +175,14 @@ class ArchiveManager {
     GetArchiveFromFile(const std::string& filePath); // Retrieves a ptr to the archive that the asset is inside of
 
     /**
+     * @brief Load-order priority of the archive that owns the given file (higher = higher
+     * priority; the last-loaded archive wins). Used to rank a real asset against an alias target.
+     * @param filePath Virtual path of the file.
+     * @return Priority index, or -1 if no loaded archive has the file.
+     */
+    int32_t GetFilePriority(const std::string& filePath);
+
+    /**
      * @brief Lists virtual paths of all files matching the given search mask across all archives.
      * @param searchMask Glob pattern (empty = list everything).
      * @return Sorted, deduplicated list of matching paths.
@@ -176,6 +215,9 @@ class ArchiveManager {
      * @brief Looks up the virtual path string for a given 64-bit hash.
      * @param hash Hash to resolve.
      * @return Pointer to the path string, or nullptr if the hash is not indexed.
+     * @note A returned pointer remains valid until manager destruction, including after
+     *       unmount. A new lookup of a removed hash still returns nullptr. Distinct names
+     *       already returned are retained for the manager lifetime.
      */
     const std::string* HashToString(uint64_t hash) const;
 
@@ -183,6 +225,7 @@ class ArchiveManager {
      * @brief Looks up the virtual path C-string for a given 64-bit hash.
      * @param hash Hash to resolve.
      * @return C-string pointer, or nullptr if not found.
+     * @note The same pointer lifetime and name-retention rules as HashToString apply.
      */
     const char* HashToCString(uint64_t hash) const;
 
@@ -220,6 +263,17 @@ class ArchiveManager {
     void ResetVirtualFileSystem();
 
   private:
+    struct ManagedArchiveState;
+    struct ManagedArchive;
+    static std::shared_ptr<Archive> PrepareArchiveSnapshot(const std::shared_ptr<ManagedArchive>& candidate);
+    std::shared_ptr<Archive> ManagedArchiveLocked(const std::shared_ptr<Archive>& prepared,
+                                                  const std::shared_ptr<ManagedArchive>& candidate);
+    void RebuildVirtualFileSystemLocked();
+    mutable std::mutex mMutex;
+    uint64_t mRevision = 0;
+    std::unordered_map<Archive*, std::shared_ptr<ManagedArchiveState>> mManagedArchives;
+    // Returned string pointers stay valid until this manager is destroyed.
+    mutable std::unordered_set<std::string> mPathStrings;
     std::vector<std::shared_ptr<Archive>> mArchives;
     std::vector<uint32_t> mGameVersions;
     std::unordered_set<uint32_t> mValidGameVersions;

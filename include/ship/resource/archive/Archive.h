@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include "ship/utils/binarytools/BinaryReader.h"
 
 namespace tinyxml2 {
@@ -156,6 +157,15 @@ class Archive : public std::enable_shared_from_this<Archive> {
     bool IsLoaded();
 
     /**
+     * @brief Load-order priority assigned by the ArchiveManager when the archive is mounted
+     * (higher = higher priority; the last-loaded archive wins conflicts). -1 if unset.
+     */
+    int32_t GetPriority();
+
+    /** @brief Sets the load-order priority. Called by the ArchiveManager. */
+    void SetPriority(int32_t priority);
+
+    /**
      * @brief Opens the underlying archive file or directory for reading.
      * @return true on success.
      */
@@ -194,6 +204,7 @@ class Archive : public std::enable_shared_from_this<Archive> {
     bool mIsChecksumValid;
     bool mHasGameVersion;
     uint32_t mGameVersion;
+    std::atomic<int32_t> mPriority{ -1 };
     ArchiveManifest mManifest;
     std::string mPath;
     std::shared_ptr<std::unordered_map<uint64_t, std::string>> mHashes;

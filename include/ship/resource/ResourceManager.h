@@ -113,6 +113,13 @@ class ResourceManager {
 
     /** @brief Returns the ArchiveManager that manages the mounted archives. */
     std::shared_ptr<ArchiveManager> GetArchiveManager();
+
+    // Ordem fixa: mutex do cache, depois mutex do VFS. Chamador retém expected/desired
+    // durante toda a operação; fábricas e I/O nunca executam sob esses locks.
+    bool PublishArchiveBatch(const ArchiveManager::ArchiveSnapshot& expected,
+                             const std::vector<std::shared_ptr<Archive>>& desired,
+                             const std::unordered_set<std::string>& affected,
+                             std::vector<std::shared_ptr<Archive>>& published);
     /** @brief Returns the ResourceLoader responsible for deserializing file data. */
     std::shared_ptr<ResourceLoader> GetResourceLoader();
 
@@ -425,6 +432,7 @@ class ResourceManager {
     std::shared_ptr<ArchiveManager> mArchiveManager;
     std::shared_ptr<BS::thread_pool> mThreadPool;
     std::mutex mMutex;
+    uint64_t mCacheEpoch = 0;
     bool mAltAssetsEnabled = false;
     // Private information for which owner and archive are default.
     uintptr_t mDefaultCacheOwner = 0;
