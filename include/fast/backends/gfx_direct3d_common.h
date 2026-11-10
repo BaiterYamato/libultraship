@@ -41,7 +41,7 @@ struct PerDrawCB {
         uint32_t width;
         uint32_t height;
         uint32_t linear_filtering;
-        uint32_t padding;
+        uint32_t mipmaps; // R018: per-draw eligibility, same 16-byte layout
     } mTextures[SHADER_MAX_TEXTURES];
 };
 
@@ -58,9 +58,13 @@ struct TextureData {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> resource_view;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_state;
-    uint32_t width;
-    uint32_t height;
-    bool linear_filtering;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> point_sampler_state;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mip_levels = 1;
+    uint32_t cms = 0, cmt = 0;
+    bool linear_filtering = false;
+    bool is_framebuffer = false;
 };
 
 struct FramebufferDX11 {
@@ -118,6 +122,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void StartFrame() override;
     void EndFrame() override;
     void FinishRender() override;
+    bool PrepareWorldPresentation() override;
+    bool PresentWorld(int source, int destination, bool reconstruct) override;
+    void SetGpuFrameTiming(bool enabled, float measuredScale, uint64_t configuration = 0) override;
+    bool GetGpuFrameTime(double& milliseconds, float& measuredScale) override;
     int CreateFramebuffer() override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
@@ -131,8 +139,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
     void* GetFramebufferTextureId(int fbId) override;
-    bool SupportsFogVolume() const override { return true; }
-    bool SupportsFogFlow() const override { return true; }
+    bool SupportsFogVolume() const override {
+        return true;
+    }
+    bool SupportsFogFlow() const override {
+        return true;
+    }
     void DrawFogVolume(const FastFogVolume& volume, const FastFogFlow* flow) override;
     void SelectTextureFb(int fbId) override;
     void DeleteTexture(uint32_t texId) override;
@@ -148,6 +160,35 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     D3D_FEATURE_LEVEL mFeatureLevel;
 
   private:
+    struct FrameTiming {
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint, begin, end;
+        uint64_t frame = 0;
+        uint64_t epoch = 0;
+        float scale = 1.0f;
+        bool pending = false;
+    };
+    std::array<FrameTiming, 8> mFrameTiming{};
+    int mActiveFrameTiming = -1;
+    uint64_t mTimingFrame = 0;
+    uint64_t mTimingEpoch = 0, mTimingConfiguration = 0;
+    bool mFrameTimingEnabled = false, mFrameTimingFailed = false;
+    float mFrameTimingScale = 1.0f;
+    void BeginGpuFrameTiming();
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mSpatialVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mSpatialLinear, mSpatialReconstruct, mSpatialSharpen;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mSpatialCb;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mSpatialSampler;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mSpatialRaster;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mSpatialDepth;
+    struct SpatialTarget {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
+        UINT width = 0, height = 0;
+    };
+    SpatialTarget mSpatialResolved, mSpatialIntermediate;
+    bool EnsureSpatialTarget(SpatialTarget& target, UINT width, UINT height);
+    bool mSpatialFailed = false;
     bool CompileFogShader(const char* entry, const char* profile, ID3DBlob** blob, bool multisampled = false);
     bool InitFogVolume();
     void UpdateFogSupportRanges(const FastFogVolume& volume, const FastFogFlow& flow, UINT width, UINT height);
@@ -157,15 +198,15 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool InitFogLod(UINT width, UINT height, bool multisampled, bool useSun);
     bool InitFogMsaaCache(UINT width, UINT height);
     void DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
-                    const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction,
-                    bool useSun, ID3D11Query* lowEnd);
+                    const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction, bool useSun,
+                    ID3D11Query* lowEnd);
     bool InitFogFlow();
     bool InitFogVertical();
     bool InitFogParticles();
     bool InitFogFieldBlend();
     ID3D11ShaderResourceView* BlendFogField(ID3D11ShaderResourceView* current, UINT width, UINT height, float fraction);
-    ID3D11ShaderResourceView* UpdateFogFlow(const FastFogVolume& volume, const FastFogFlow& flow,
-                                          FogFlowAction& action, ID3D11Query* particleBegin, bool& particles);
+    ID3D11ShaderResourceView* UpdateFogFlow(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction& action,
+                                            ID3D11Query* particleBegin, bool& particles);
     void AuditFogFlow(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowCursor cursor,
                       ID3D11ShaderResourceView* source);
     void CollectFogTiming();
@@ -324,7 +365,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 #endif
 
     PerFrameCB mPerFrameCbData;
-    PerDrawCB mPerDrawCbData;
+    PerDrawCB mPerDrawCbData{};
     PerPrimDepthCB mPerPrimDepthCbData;
     PerToonCB mPerToonCbData; // Wind Waker Style toon lighting
 
@@ -343,6 +384,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     int32_t mRenderTargetHeight;
     int mCurrentFramebuffer;
     FilteringMode mCurrentFilterMode = FILTER_NONE;
+    // R018: cache shared sampler descriptors; HUD/world switches never allocate
+    // a new sampler after the corresponding descriptor has been seen once.
+    bool mTextureMipmaps = true;
+    uint32_t mTextureAnisotropy = 8;
+    std::map<uint32_t, Microsoft::WRL::ComPtr<ID3D11SamplerState>> mTextureSamplerCache;
+    void UpdateTextureSampler(TextureData& texture, bool mipmaps);
 
     // Previous states (to prevent setting states needlessly)
 

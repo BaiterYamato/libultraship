@@ -25,6 +25,7 @@
 
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_direct3d_common.h"
+#include "mip_gen.h"
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "fast/backends/gfx_dxgi.h"
@@ -44,6 +45,7 @@
 #include "fog_volume_shader.h"
 #include "fog_flow_shader.h"
 #include "fog_particle_shader.h"
+#include "spatial_upscale_shader.h"
 
 #include <prism/processor.h>
 #include "ship/config/ConsoleVariable.h"
@@ -59,6 +61,9 @@
 using namespace Microsoft::WRL; // For ComPtr
 
 namespace Fast {
+
+static_assert(sizeof(PerDrawCB::Texture) == 16, "R018 HLSL texture constants must occupy one register");
+static_assert(offsetof(PerDrawCB::Texture, mipmaps) == 12, "R018 mipmaps flag must replace the old padding");
 
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
 }
@@ -226,6 +231,8 @@ void GfxRenderingAPIDX11::Init() {
     // Create D3D11 mDevice
 
     mWindowBackend->CreateFactoryAndDevice(DEBUG_D3D, 11, this, CreateDeviceFunc);
+    mTextureSamplerCache.clear();
+    mPerDrawCbData = {};
 
     // Create the swap chain
     mWindowBackend->CreateSwapChain(mDevice.Get(), [this]() {
@@ -610,19 +617,32 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texture_desc.CPUAccessFlags = 0;
-    texture_desc.MiscFlags = 0; // D3D11_RESOURCE_MISC_GENERATE_MIPS ?
+    texture_desc.MiscFlags = 0;
     texture_desc.ArraySize = 1;
     texture_desc.MipLevels = 1;
     texture_desc.SampleDesc.Count = 1;
     texture_desc.SampleDesc.Quality = 0;
 
-    D3D11_SUBRESOURCE_DATA resource_data;
-    resource_data.pSysMem = rgba32_buf;
-    resource_data.SysMemPitch = width * 4;
-    resource_data.SysMemSlicePitch = resource_data.SysMemPitch * height;
+    // CPU mips are required: GenerateMips cannot preserve cutout coverage.
+    // Framebuffers/RTs are created elsewhere and stay single-level resources.
+    const bool generate_mips =
+        !texture_data->is_framebuffer &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gSettings.TextureMipmaps", 1) != 0;
+    std::vector<MipGen::Level> levels;
+    if (generate_mips) {
+        levels = MipGen::Generate(rgba32_buf, width, height);
+        texture_desc.MipLevels = static_cast<UINT>(levels.size());
+    }
+    std::vector<D3D11_SUBRESOURCE_DATA> resource_data(texture_desc.MipLevels);
+    for (UINT i = 0; i < texture_desc.MipLevels; ++i) {
+        resource_data[i].pSysMem = generate_mips ? levels[i].rgba.data() : rgba32_buf;
+        resource_data[i].SysMemPitch = (generate_mips ? levels[i].width : width) * 4;
+        resource_data[i].SysMemSlicePitch = 0; // unused for Texture2D
+    }
+    texture_data->mip_levels = texture_desc.MipLevels;
 
     ThrowIfFailed(
-        mDevice->CreateTexture2D(&texture_desc, &resource_data, texture_data->texture.ReleaseAndGetAddressOf()));
+        mDevice->CreateTexture2D(&texture_desc, resource_data.data(), texture_data->texture.ReleaseAndGetAddressOf()));
 
     // Create shader resource view from texture
 
@@ -631,27 +651,47 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
 }
 
 void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
-    D3D11_SAMPLER_DESC sampler_desc;
-    ZeroMemory(&sampler_desc, sizeof(D3D11_SAMPLER_DESC));
-
-    sampler_desc.Filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
-                                                                               : D3D11_FILTER_MIN_MAG_MIP_POINT;
-
-    sampler_desc.AddressU = gfx_cm_to_d3d11(cms);
-    sampler_desc.AddressV = gfx_cm_to_d3d11(cmt);
-    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
-    sampler_desc.MinLOD = 0;
-    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
-
     TextureData* texture_data = &mTextures[mCurrentTextureIds[tile]];
     texture_data->linear_filtering = linear_filter;
+    texture_data->cms = cms;
+    texture_data->cmt = cmt;
+    const bool mipmaps = mTextureMipmaps && mCurrentDepthTest && !texture_data->is_framebuffer &&
+                         texture_data->mip_levels > 1 && linear_filter && mCurrentFilterMode != FILTER_NONE;
+    UpdateTextureSampler(*texture_data, mipmaps);
+}
 
-    // This function is called twice per texture, the first one only to set default values.
-    // Maybe that could be skipped? Anyway, make sure to release the first default sampler
-    // state before setting the actual one.
-    texture_data->sampler_state.Reset();
-
-    ThrowIfFailed(mDevice->CreateSamplerState(&sampler_desc, texture_data->sampler_state.GetAddressOf()));
+void GfxRenderingAPIDX11::UpdateTextureSampler(TextureData& texture, bool mipmaps) {
+    // The extra point sampler preserves exact 3-point magnification even when
+    // the regular sampler uses anisotropy for minification. Slots s8..s13 do not
+    // overlap the existing Fast3D texture slots s0..s5.
+    auto get_sampler = [&](bool point) {
+        const bool linear = !point && texture.linear_filtering && (mCurrentFilterMode == FILTER_LINEAR || mipmaps);
+        const uint32_t anisotropy = linear && mipmaps ? mTextureAnisotropy : 1;
+        const bool use_mips = mipmaps && !point;
+        const auto u = gfx_cm_to_d3d11(texture.cms), v = gfx_cm_to_d3d11(texture.cmt);
+        const uint32_t key =
+            uint32_t(u) | (uint32_t(v) << 3) | (uint32_t(linear) << 6) | (uint32_t(use_mips) << 7) | (anisotropy << 8);
+        auto it = mTextureSamplerCache.find(key);
+        if (it == mTextureSamplerCache.end()) {
+            D3D11_SAMPLER_DESC desc = {};
+            desc.Filter = anisotropy > 1 ? D3D11_FILTER_ANISOTROPIC
+                          : linear       ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                                         : D3D11_FILTER_MIN_MAG_MIP_POINT;
+            desc.AddressU = u;
+            desc.AddressV = v;
+            desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+            desc.MaxAnisotropy = anisotropy;
+            desc.MinLOD = 0;
+            // HUD/no-depth, point draws and all framebuffer textures stay at L0.
+            desc.MaxLOD = use_mips ? D3D11_FLOAT32_MAX : 0;
+            ComPtr<ID3D11SamplerState> state;
+            ThrowIfFailed(mDevice->CreateSamplerState(&desc, state.GetAddressOf()));
+            it = mTextureSamplerCache.emplace(key, std::move(state)).first;
+        }
+        return it->second;
+    };
+    texture.sampler_state = get_sampler(false);
+    texture.point_sampler_state = get_sampler(true);
 }
 
 void GfxRenderingAPIDX11::SetDepthTestAndMask(bool depth_test, bool depth_mask) {
@@ -819,16 +859,28 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
             if (mCurrentTextureIds[i] >= mTextures.size()) {
                 continue;
             }
+            auto& texture = mTextures[mCurrentTextureIds[i]];
+            const bool mipmaps = mTextureMipmaps && mCurrentDepthTest && !texture.is_framebuffer &&
+                                 texture.mip_levels > 1 && texture.linear_filtering &&
+                                 mCurrentFilterMode != FILTER_NONE;
+            UpdateTextureSampler(texture, mipmaps);
+            // Eligibility can change on a HUD/world transition without a new
+            // SRV or SetSamplerParameters call; never gate this on SRV changes.
+            if (mCurrentFilterMode == FILTER_THREE_POINT) {
+                auto& cb = mPerDrawCbData.mTextures[i];
+                if (cb.width != texture.width || cb.height != texture.height ||
+                    cb.linear_filtering != uint32_t(texture.linear_filtering) || cb.mipmaps != uint32_t(mipmaps)) {
+                    cb.width = texture.width;
+                    cb.height = texture.height;
+                    cb.linear_filtering = texture.linear_filtering;
+                    cb.mipmaps = mipmaps;
+                    textures_changed = true;
+                }
+                mContext->PSSetSamplers(8 + i, 1, texture.point_sampler_state.GetAddressOf());
+            }
             if (mLastResourceViews[i].Get() != mTextures[mCurrentTextureIds[i]].resource_view.Get()) {
                 mLastResourceViews[i] = mTextures[mCurrentTextureIds[i]].resource_view.Get();
                 mContext->PSSetShaderResources(i, 1, mTextures[mCurrentTextureIds[i]].resource_view.GetAddressOf());
-
-                if (mCurrentFilterMode == FILTER_THREE_POINT) {
-                    mPerDrawCbData.mTextures[i].width = mTextures[mCurrentTextureIds[i]].width;
-                    mPerDrawCbData.mTextures[i].height = mTextures[mCurrentTextureIds[i]].height;
-                    mPerDrawCbData.mTextures[i].linear_filtering = mTextures[mCurrentTextureIds[i]].linear_filtering;
-                    textures_changed = true;
-                }
 
                 if (mLastSamplerStates[i].Get() != mTextures[mCurrentTextureIds[i]].sampler_state.Get()) {
                     mLastSamplerStates[i] = mTextures[mCurrentTextureIds[i]].sampler_state.Get();
@@ -919,6 +971,22 @@ void GfxRenderingAPIDX11::OnResize() {
 }
 
 void GfxRenderingAPIDX11::StartFrame() {
+    BeginGpuFrameTiming();
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const bool mipmaps = cvars->GetInteger("gSettings.TextureMipmaps", 1) != 0;
+    const int requested = cvars->GetInteger("gSettings.TextureAnisotropy", 8);
+    // Accept 1/2/4/8/16; other values round down after clamping.
+    uint32_t anisotropy = 1;
+    while (anisotropy < 16 && int(anisotropy * 2) <= requested) {
+        anisotropy *= 2;
+    }
+    mTextureAnisotropy = anisotropy;
+    if (mipmaps != mTextureMipmaps) {
+        mTextureMipmaps = mipmaps;
+        // Re-upload cached immutable textures at the next use, including the
+        // transition from single-level legacy textures to complete mip chains.
+        gfx_texture_cache_clear();
+    }
     ++mFogFrame;
     // Set per-frame constant buffer
     // b2 remains reserved for Unbound primitive depth; b3 is the optional toon input.
@@ -933,15 +1001,284 @@ void GfxRenderingAPIDX11::StartFrame() {
 }
 
 void GfxRenderingAPIDX11::EndFrame() {
+    if (mActiveFrameTiming >= 0) {
+        auto& timing = mFrameTiming[mActiveFrameTiming];
+        mContext->End(timing.end.Get());
+        mContext->End(timing.disjoint.Get());
+        timing.pending = true;
+        mActiveFrameTiming = -1;
+    }
     mContext->Flush();
 }
 
 void GfxRenderingAPIDX11::FinishRender() {
 }
 
+void GfxRenderingAPIDX11::SetGpuFrameTiming(bool enabled, float measuredScale, uint64_t configuration) {
+    if (enabled != mFrameTimingEnabled || configuration != mTimingConfiguration)
+        ++mTimingEpoch;
+    mFrameTimingEnabled = enabled;
+    mTimingConfiguration = configuration;
+    mFrameTimingScale = measuredScale;
+}
+
+void GfxRenderingAPIDX11::BeginGpuFrameTiming() {
+    ++mTimingFrame;
+    if (!mFrameTimingEnabled || mFrameTimingFailed || mActiveFrameTiming >= 0)
+        return;
+    // Do not wait for, flush or overwrite an in-flight query when the GPU is behind.
+    for (size_t i = 0; i < mFrameTiming.size(); ++i) {
+        auto& timing = mFrameTiming[i];
+        if (timing.pending)
+            continue;
+        if (!timing.disjoint) {
+            D3D11_QUERY_DESC desc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+            HRESULT hr = mDevice->CreateQuery(&desc, timing.disjoint.ReleaseAndGetAddressOf());
+            desc.Query = D3D11_QUERY_TIMESTAMP;
+            if (SUCCEEDED(hr))
+                hr = mDevice->CreateQuery(&desc, timing.begin.ReleaseAndGetAddressOf());
+            if (SUCCEEDED(hr))
+                hr = mDevice->CreateQuery(&desc, timing.end.ReleaseAndGetAddressOf());
+            if (FAILED(hr)) {
+                mFrameTimingFailed = true;
+                SPDLOG_WARN("R069: GPU timestamp queries unavailable ({:x})", static_cast<unsigned>(hr));
+                return;
+            }
+        }
+        timing.frame = mTimingFrame;
+        timing.epoch = mTimingEpoch;
+        timing.scale = mFrameTimingScale;
+        mContext->Begin(timing.disjoint.Get());
+        mContext->End(timing.begin.Get());
+        mActiveFrameTiming = static_cast<int>(i);
+        return;
+    }
+}
+
+bool GfxRenderingAPIDX11::GetGpuFrameTime(double& milliseconds, float& measuredScale) {
+    // Consume in submission order. At most one sample per displayed frame.
+    FrameTiming* oldest = nullptr;
+    for (auto& timing : mFrameTiming) {
+        if (timing.pending && (!oldest || timing.frame < oldest->frame))
+            oldest = &timing;
+    }
+    if (!oldest || mTimingFrame < oldest->frame + 3)
+        return false;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT frequency{};
+    UINT64 begin = 0, end = 0;
+    const UINT flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
+    const HRESULT a = mContext->GetData(oldest->disjoint.Get(), &frequency, sizeof(frequency), flags);
+    const HRESULT b = mContext->GetData(oldest->begin.Get(), &begin, sizeof(begin), flags);
+    const HRESULT c = mContext->GetData(oldest->end.Get(), &end, sizeof(end), flags);
+    if (FAILED(a) || FAILED(b) || FAILED(c)) {
+        oldest->pending = false;
+        return false;
+    }
+    if (a != S_OK || b != S_OK || c != S_OK)
+        return false;
+    oldest->pending = false;
+    // Never reuse timing from a long GPU backlog or a disjoint clock interval.
+    if (oldest->epoch != mTimingEpoch || frequency.Disjoint || !frequency.Frequency || end < begin ||
+        mTimingFrame > oldest->frame + 30)
+        return false;
+    milliseconds = double(end - begin) * 1000.0 / double(frequency.Frequency);
+    measuredScale = oldest->scale;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::PrepareWorldPresentation() {
+    if (mSpatialFailed)
+        return false;
+    if (mSpatialVs)
+        return true;
+    auto compile = [&](const char* entry, const char* profile, ID3DBlob** result) {
+        ComPtr<ID3DBlob> errors;
+        const HRESULT hr =
+            mD3dCompile(SpatialUpscaleShader, std::strlen(SpatialUpscaleShader), "spatial_upscale_shader", nullptr,
+                        nullptr, entry, profile, D3DCOMPILE_ENABLE_STRICTNESS, 0, result, errors.GetAddressOf());
+        if (FAILED(hr))
+            SPDLOG_WARN("R070 {}: {}", entry,
+                        errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
+        return hr;
+    };
+    ComPtr<ID3DBlob> code;
+    HRESULT hr = compile("VSMain", "vs_4_0", code.GetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = mDevice->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                                         mSpatialVs.GetAddressOf());
+    const char* entries[] = { "PSLinear", "PSReconstruct", "PSSharpen" };
+    ComPtr<ID3D11PixelShader>* shaders[] = { &mSpatialLinear, &mSpatialReconstruct, &mSpatialSharpen };
+    for (unsigned i = 0; i < 3 && SUCCEEDED(hr); ++i) {
+        code.Reset();
+        hr = compile(entries[i], "ps_4_0", code.GetAddressOf());
+        if (SUCCEEDED(hr))
+            hr = mDevice->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                                            shaders[i]->GetAddressOf());
+    }
+    D3D11_BUFFER_DESC cb{};
+    cb.ByteWidth = 16;
+    cb.Usage = D3D11_USAGE_DEFAULT;
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (SUCCEEDED(hr))
+        hr = mDevice->CreateBuffer(&cb, nullptr, mSpatialCb.GetAddressOf());
+    D3D11_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.MaxLOD = D3D11_FLOAT32_MAX;
+    if (SUCCEEDED(hr))
+        hr = mDevice->CreateSamplerState(&sampler, mSpatialSampler.GetAddressOf());
+    D3D11_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D11_FILL_SOLID;
+    raster.CullMode = D3D11_CULL_NONE;
+    raster.DepthClipEnable = TRUE;
+    if (SUCCEEDED(hr))
+        hr = mDevice->CreateRasterizerState(&raster, mSpatialRaster.GetAddressOf());
+    D3D11_DEPTH_STENCIL_DESC depth{};
+    depth.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    if (SUCCEEDED(hr))
+        hr = mDevice->CreateDepthStencilState(&depth, mSpatialDepth.GetAddressOf());
+    mSpatialFailed = FAILED(hr);
+    if (mSpatialFailed)
+        SPDLOG_WARN("R070: presentation initialization failed ({:x})", static_cast<unsigned>(hr));
+    return !mSpatialFailed;
+}
+
+bool GfxRenderingAPIDX11::EnsureSpatialTarget(SpatialTarget& target, UINT width, UINT height) {
+    if (target.texture && target.width == width && target.height == height)
+        return true;
+    SpatialTarget next;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, next.texture.GetAddressOf())) ||
+        FAILED(mDevice->CreateShaderResourceView(next.texture.Get(), nullptr, next.view.GetAddressOf())) ||
+        FAILED(mDevice->CreateRenderTargetView(next.texture.Get(), nullptr, next.target.GetAddressOf())))
+        return false;
+    next.width = width;
+    next.height = height;
+    target = std::move(next);
+    return true;
+}
+
+bool GfxRenderingAPIDX11::PresentWorld(int source, int destination, bool reconstruct) {
+    if (source == destination || !PrepareWorldPresentation())
+        return false;
+    const auto& srcFb = mFrameBuffers.at(source);
+    const auto& dstFb = mFrameBuffers.at(destination);
+    const auto& src = mTextures.at(srcFb.texture_id);
+    const auto& dst = mTextures.at(dstFb.texture_id);
+    if (!src.texture || !dst.texture || (!src.resource_view && srcFb.msaa_level == 1) || !dstFb.render_target_view ||
+        dstFb.msaa_level != 1)
+        return false;
+    // Supersampling remains a downsample, not a directional enlargement.
+    reconstruct = reconstruct && src.width <= dst.width && src.height <= dst.height;
+    if (srcFb.msaa_level > 1 && !EnsureSpatialTarget(mSpatialResolved, src.width, src.height))
+        return false;
+    if (reconstruct && !EnsureSpatialTarget(mSpatialIntermediate, dst.width, dst.height))
+        return false;
+
+    // Restore every binding touched here; interpreter/backend state caches remain valid.
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11GeometryShader> gs;
+    ComPtr<ID3D11HullShader> hs;
+    ComPtr<ID3D11DomainShader> ds;
+    ComPtr<ID3D11InputLayout> layout;
+    ComPtr<ID3D11Buffer> cb;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11RasterizerState> raster;
+    ComPtr<ID3D11BlendState> blend;
+    ComPtr<ID3D11DepthStencilState> depth;
+    ComPtr<ID3D11DepthStencilView> dsv;
+    ComPtr<ID3D11RenderTargetView> targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11RenderTargetView* rawTargets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT viewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D11_PRIMITIVE_TOPOLOGY topology{};
+    UINT stencil = 0, mask = 0;
+    float factors[4]{};
+    mContext->VSGetShader(vs.GetAddressOf(), nullptr, nullptr);
+    mContext->PSGetShader(ps.GetAddressOf(), nullptr, nullptr);
+    mContext->GSGetShader(gs.GetAddressOf(), nullptr, nullptr);
+    mContext->HSGetShader(hs.GetAddressOf(), nullptr, nullptr);
+    mContext->DSGetShader(ds.GetAddressOf(), nullptr, nullptr);
+    mContext->IAGetInputLayout(layout.GetAddressOf());
+    mContext->IAGetPrimitiveTopology(&topology);
+    mContext->PSGetConstantBuffers(0, 1, cb.GetAddressOf());
+    mContext->PSGetShaderResources(0, 1, srv.GetAddressOf());
+    mContext->PSGetSamplers(0, 1, sampler.GetAddressOf());
+    mContext->RSGetState(raster.GetAddressOf());
+    mContext->RSGetViewports(&viewportCount, viewports);
+    mContext->OMGetBlendState(blend.GetAddressOf(), factors, &mask);
+    mContext->OMGetDepthStencilState(depth.GetAddressOf(), &stencil);
+    mContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rawTargets, dsv.GetAddressOf());
+    for (unsigned i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+        targets[i].Attach(rawTargets[i]);
+    mContext->OMSetRenderTargets(0, nullptr, nullptr);
+    ID3D11ShaderResourceView* nullView = nullptr;
+    mContext->PSSetShaderResources(0, 1, &nullView);
+    if (srcFb.msaa_level > 1)
+        mContext->ResolveSubresource(mSpatialResolved.texture.Get(), 0, src.texture.Get(), 0,
+                                     DXGI_FORMAT_R8G8B8A8_UNORM);
+    ID3D11ShaderResourceView* input = srcFb.msaa_level > 1 ? mSpatialResolved.view.Get() : src.resource_view.Get();
+    mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    mContext->OMSetDepthStencilState(mSpatialDepth.Get(), 0);
+    mContext->RSSetState(mSpatialRaster.Get());
+    const D3D11_VIEWPORT viewport{ 0, 0, float(dst.width), float(dst.height), 0, 1 };
+    mContext->RSSetViewports(1, &viewport);
+    mContext->IASetInputLayout(nullptr);
+    mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mContext->VSSetShader(mSpatialVs.Get(), nullptr, 0);
+    mContext->GSSetShader(nullptr, nullptr, 0);
+    mContext->HSSetShader(nullptr, nullptr, 0);
+    mContext->DSSetShader(nullptr, nullptr, 0);
+    mContext->PSSetSamplers(0, 1, mSpatialSampler.GetAddressOf());
+    mContext->PSSetConstantBuffers(0, 1, mSpatialCb.GetAddressOf());
+    float dimensions[4] = { float(src.width), float(src.height), float(dst.width), float(dst.height) };
+    mContext->UpdateSubresource(mSpatialCb.Get(), 0, nullptr, dimensions, 0, 0);
+    ID3D11RenderTargetView* output = reconstruct ? mSpatialIntermediate.target.Get() : dstFb.render_target_view.Get();
+    mContext->OMSetRenderTargets(1, &output, nullptr);
+    mContext->PSSetShaderResources(0, 1, &input);
+    mContext->PSSetShader(reconstruct ? mSpatialReconstruct.Get() : mSpatialLinear.Get(), nullptr, 0);
+    mContext->Draw(3, 0);
+    mContext->PSSetShaderResources(0, 1, &nullView);
+    if (reconstruct) {
+        mContext->OMSetRenderTargets(1, dstFb.render_target_view.GetAddressOf(), nullptr);
+        dimensions[0] = float(dst.width);
+        dimensions[1] = float(dst.height);
+        mContext->UpdateSubresource(mSpatialCb.Get(), 0, nullptr, dimensions, 0, 0);
+        mContext->PSSetShaderResources(0, 1, mSpatialIntermediate.view.GetAddressOf());
+        mContext->PSSetShader(mSpatialSharpen.Get(), nullptr, 0);
+        mContext->Draw(3, 0);
+        mContext->PSSetShaderResources(0, 1, &nullView);
+    }
+    mContext->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rawTargets, dsv.Get());
+    mContext->OMSetBlendState(blend.Get(), factors, mask);
+    mContext->OMSetDepthStencilState(depth.Get(), stencil);
+    mContext->RSSetState(raster.Get());
+    mContext->RSSetViewports(viewportCount, viewports);
+    mContext->IASetInputLayout(layout.Get());
+    mContext->IASetPrimitiveTopology(topology);
+    mContext->VSSetShader(vs.Get(), nullptr, 0);
+    mContext->PSSetShader(ps.Get(), nullptr, 0);
+    mContext->GSSetShader(gs.Get(), nullptr, 0);
+    mContext->HSSetShader(hs.Get(), nullptr, 0);
+    mContext->DSSetShader(ds.Get(), nullptr, 0);
+    mContext->PSSetConstantBuffers(0, 1, cb.GetAddressOf());
+    mContext->PSSetSamplers(0, 1, sampler.GetAddressOf());
+    mContext->PSSetShaderResources(0, 1, srv.GetAddressOf());
+    return true;
+}
+
 int GfxRenderingAPIDX11::CreateFramebuffer() {
     uint32_t texture_id = NewTexture();
     TextureData& t = mTextures[texture_id];
+    t.is_framebuffer = true;
 
     size_t index = mFrameBuffers.size();
     mFrameBuffers.resize(mFrameBuffers.size() + 1);
@@ -972,6 +1309,11 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
     }
 
     bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level;
+    if (mFrameTimingEnabled && diff && fb_id == mFogLastFramebuffer) {
+        // A resized world target must never reuse fog history from the old pixel grid.
+        mFogLastFrame = 0;
+        mFogHistoryFrames = 0;
+    }
 
     if (diff || (fb.render_target_view.Get() != nullptr) != render_target) {
         if (fb_id != 0) {
@@ -1082,10 +1424,10 @@ bool CreateFogStateTexture(ID3D11Device* device, ID3D11ShaderResourceView** view
 } // namespace
 
 bool GfxRenderingAPIDX11::CompileFogShader(const char* entry, const char* profile, ID3DBlob** blob, bool multisampled) {
-    const D3D_SHADER_MACRO macros[]{{"FOG_MSAA", multisampled ? "1" : "0"}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO macros[]{ { "FOG_MSAA", multisampled ? "1" : "0" }, { nullptr, nullptr } };
     ComPtr<ID3DBlob> errors;
-    const auto result = mD3dCompile(FogVolumeShader, sizeof(FogVolumeShader) - 1, "FogVolume", macros, nullptr,
-                                    entry, profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, errors.GetAddressOf());
+    const auto result = mD3dCompile(FogVolumeShader, sizeof(FogVolumeShader) - 1, "FogVolume", macros, nullptr, entry,
+                                    profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, errors.GetAddressOf());
     if (FAILED(result)) {
         SPDLOG_WARN("Fast3D fog shader {} (MSAA={}) failed: {}", entry, multisampled,
                     errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no diagnostics");
@@ -1094,8 +1436,10 @@ bool GfxRenderingAPIDX11::CompileFogShader(const char* entry, const char* profil
 }
 
 bool GfxRenderingAPIDX11::InitFogVolume() {
-    if (mFogInitFailed) return false;
-    if (mFogPs) return true;
+    if (mFogInitFailed)
+        return false;
+    if (mFogPs)
+        return true;
     ComPtr<ID3DBlob> vs, ps;
     D3D11_BUFFER_DESC cb{};
     cb.ByteWidth = sizeof(FogConstants);
@@ -1139,8 +1483,10 @@ bool GfxRenderingAPIDX11::InitFogVolume() {
 
     if (!CompileFogShader("VSMain", "vs_4_0", vs.GetAddressOf()) ||
         !CompileFogShader("PSMain", "ps_4_0", ps.GetAddressOf()) ||
-        FAILED(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, mFogVs.GetAddressOf())) ||
-        FAILED(mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, mFogPs.GetAddressOf())) ||
+        FAILED(
+            mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, mFogVs.GetAddressOf())) ||
+        FAILED(
+            mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, mFogPs.GetAddressOf())) ||
         FAILED(mDevice->CreateBuffer(&cb, nullptr, mFogCb.GetAddressOf())) ||
         FAILED(mDevice->CreateBlendState(&blend, mFogBlend.GetAddressOf())) ||
         FAILED(mDevice->CreateRasterizerState(&raster, mFogRaster.GetAddressOf())) ||
@@ -1168,7 +1514,7 @@ bool GfxRenderingAPIDX11::InitFogVolume() {
     noise.Width = noise.Height = Fast::FogNoiseSide;
     noise.Format = DXGI_FORMAT_R8_UNORM;
     noise.Usage = D3D11_USAGE_IMMUTABLE;
-    const D3D11_SUBRESOURCE_DATA noiseData{Fast::FogNoise.data(), Fast::FogNoiseSide, 0};
+    const D3D11_SUBRESOURCE_DATA noiseData{ Fast::FogNoise.data(), Fast::FogNoiseSide, 0 };
     ComPtr<ID3D11Texture2D> noiseTexture;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
     if (SUCCEEDED(mDevice->CreateTexture2D(&noise, &noiseData, noiseTexture.GetAddressOf())) &&
@@ -1193,18 +1539,19 @@ bool GfxRenderingAPIDX11::InitFogVolume() {
 }
 
 void GfxRenderingAPIDX11::UpdateFogSupportRanges(const FastFogVolume& volume, const FastFogFlow& flow, UINT width,
-                                                UINT height) {
+                                                 UINT height) {
     float ranges[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4];
     for (UINT z = 0; z < height; ++z) {
         for (UINT x = 0; x < width; ++x) {
             const UINT nextX = std::min(x + 1, width - 1), nextZ = std::min(z + 1, height - 1);
-            const UINT corners[]{z * width + x, z * width + nextX, nextZ * width + x, nextZ * width + nextX};
+            const UINT corners[]{ z * width + x, z * width + nextX, nextZ * width + x, nextZ * width + nextX };
             auto& range = ranges[z * width + x];
             range[0] = range[2] = 1000001.0f;
             range[1] = range[3] = -1000001.0f;
             for (const UINT index : corners) {
                 const auto& cell = flow.cells[index];
-                if (!(cell.open & 1u)) continue;
+                if (!(cell.open & 1u))
+                    continue;
                 range[0] = std::min(range[0], cell.initial[1]);
                 range[1] = std::max(range[1], cell.initial[1]);
                 if (volume.upperCount && volume.upperCells[index][0] > 0.0001f) {
@@ -1215,14 +1562,15 @@ void GfxRenderingAPIDX11::UpdateFogSupportRanges(const FastFogVolume& volume, co
             }
         }
     }
-    const D3D11_BOX rect{0, 0, 0, width, height, 1};
+    const D3D11_BOX rect{ 0, 0, 0, width, height, 1 };
     mContext->UpdateSubresource(mFogSupportTexture.Get(), 0, &rect, ranges, width * sizeof(ranges[0]), 0);
 }
 
 void GfxRenderingAPIDX11::UpdateFogUpper(const FastFogVolume& volume, FogFlowAction action, UINT width, UINT height) {
     const bool blend = action == FogFlowAction::Advance && mFogUpperHasHistory;
     mFogUpperHasHistory = volume.upperCount != 0;
-    if (!mFogUpperHasHistory) return;
+    if (!mFogUpperHasHistory)
+        return;
     float values[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4];
     for (UINT i = 0; i < width * height; ++i) {
         const auto& cell = volume.upperCells[i];
@@ -1231,9 +1579,9 @@ void GfxRenderingAPIDX11::UpdateFogUpper(const FastFogVolume& volume, FogFlowAct
         values[i][1] = blend ? previous[1] : cell[1];
         values[i][2] = cell[0];
         values[i][3] = cell[1];
-        previous = {cell[0], cell[1]};
+        previous = { cell[0], cell[1] };
     }
-    const D3D11_BOX rect{0, 0, 0, width, height, 1};
+    const D3D11_BOX rect{ 0, 0, 0, width, height, 1 };
     mContext->UpdateSubresource(mFogUpperTexture.Get(), 0, &rect, values, width * sizeof(values[0]), 0);
     if (!mFogUpperLogged) {
         mFogUpperLogged = true;
@@ -1244,7 +1592,8 @@ void GfxRenderingAPIDX11::UpdateFogUpper(const FastFogVolume& volume, FogFlowAct
 void GfxRenderingAPIDX11::UpdateFogLift(const FastFogFlow& flow, FogFlowAction action, UINT width, UINT height) {
     mFogLiftPrevious = action == FogFlowAction::Advance && mFogLiftCurrent;
     mFogLiftCurrent = (flow.flags & FAST_FOG_FLOW_LIFT) && flow.maxRaisedFraction > 0.002f;
-    if (!mFogLiftPrevious && !mFogLiftCurrent) return;
+    if (!mFogLiftPrevious && !mFogLiftCurrent)
+        return;
     float lift[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4];
     for (UINT i = 0; i < width * height; ++i) {
         const float base = mFogLiftCurrent ? flow.raisedFraction[i] : 0.0f;
@@ -1254,19 +1603,21 @@ void GfxRenderingAPIDX11::UpdateFogLift(const FastFogFlow& flow, FogFlowAction a
         lift[i][1] = base;
         lift[i][2] = mFogLiftPrevious ? previous[1] : 0.0f;
         lift[i][3] = upper;
-        previous = {base, upper};
+        previous = { base, upper };
     }
-    const D3D11_BOX rect{0, 0, 0, width, height, 1};
+    const D3D11_BOX rect{ 0, 0, 0, width, height, 1 };
     mContext->UpdateSubresource(mFogLiftTexture.Get(), 0, &rect, lift, width * sizeof(lift[0]), 0);
 }
 
 bool GfxRenderingAPIDX11::InitFogMsaa() {
-    if (mFogMsaaFailed) return false;
-    if (mFogMsaaPs) return true;
+    if (mFogMsaaFailed)
+        return false;
+    if (mFogMsaaPs)
+        return true;
     ComPtr<ID3DBlob> bytecode;
     if (!CompileFogShader("PSMain", "ps_4_1", bytecode.GetAddressOf(), true) ||
         FAILED(mDevice->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr,
-                                         mFogMsaaPs.GetAddressOf()))) {
+                                          mFogMsaaPs.GetAddressOf()))) {
         mFogMsaaFailed = true;
         SPDLOG_WARN("Fast3D fog could not initialize the multisampled pass");
         return false;
@@ -1291,13 +1642,14 @@ static bool CreateFogColorTarget(ID3D11Device* device, UINT width, UINT height, 
 
 bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled, bool useSun) {
     auto& shaders = mFogLodShaders[multisampled];
-    if (mFogLodFailed || shaders.failed) return false;
+    if (mFogLodFailed || shaders.failed)
+        return false;
     if (!shaders.upscale) {
         const auto compile = [&](const char* entry, const char* profile, ID3D11PixelShader** shader) {
             ComPtr<ID3DBlob> bytecode;
             return CompileFogShader(entry, profile, bytecode.GetAddressOf(), multisampled) &&
                    SUCCEEDED(mDevice->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
-                                                       nullptr, shader));
+                                                        nullptr, shader));
         };
         if (!compile("PSLow", multisampled ? "ps_4_1" : "ps_4_0", shaders.low.GetAddressOf()) ||
             !compile("PSUpscale", "ps_5_0", shaders.upscale.GetAddressOf())) {
@@ -1332,7 +1684,8 @@ bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled,
         mFogLastFrame = 0;
     }
     if (useSun && !mFogReducedSun.view) {
-        if (mFogReducedSunFailed) return false;
+        if (mFogReducedSunFailed)
+            return false;
         FogHistoryTarget solar;
         if (!CreateFogColorTarget(mDevice.Get(), width, height, DXGI_FORMAT_R16_FLOAT, solar.target.GetAddressOf(),
                                   solar.view.GetAddressOf())) {
@@ -1347,13 +1700,14 @@ bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled,
 }
 
 bool GfxRenderingAPIDX11::InitFogMsaaCache(UINT width, UINT height) {
-    if (mFogMsaaCacheFailed) return false;
+    if (mFogMsaaCacheFailed)
+        return false;
     if (!mFogUniformPs) {
         const auto compile = [&](const char* entry, ID3D11PixelShader** shader) {
             ComPtr<ID3DBlob> bytecode;
             return CompileFogShader(entry, "ps_5_0", bytecode.GetAddressOf(), true) &&
                    SUCCEEDED(mDevice->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
-                                                       nullptr, shader));
+                                                        nullptr, shader));
         };
         if (!compile("PSUniformFog", mFogUniformPs.GetAddressOf()) ||
             !compile("PSUpscaleCached", mFogCachedUpscalePs.GetAddressOf())) {
@@ -1361,7 +1715,8 @@ bool GfxRenderingAPIDX11::InitFogMsaaCache(UINT width, UINT height) {
             return false;
         }
     }
-    if (mFogCacheWidth == width && mFogCacheHeight == height) return true;
+    if (mFogCacheWidth == width && mFogCacheHeight == height)
+        return true;
     FogHistoryTarget target;
     if (!CreateFogColorTarget(mDevice.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT,
                               target.target.GetAddressOf(), target.view.GetAddressOf())) {
@@ -1376,8 +1731,8 @@ bool GfxRenderingAPIDX11::InitFogMsaaCache(UINT width, UINT height) {
 }
 
 void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
-                                    const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction,
-                                    bool useSun, ID3D11Query* lowEnd) {
+                                     const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction,
+                                     bool useSun, ID3D11Query* lowEnd) {
     const auto& fb = mFrameBuffers[mCurrentFramebuffer];
     const auto& shaders = mFogLodShaders[fb.msaa_level > 1];
     const auto sameViewport = viewport.TopLeftX == mFogLastViewport.TopLeftX &&
@@ -1390,19 +1745,25 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
                         square(volume.eye[2] - old.previousEye[2]);
     const float facing = volume.forward[0] * old.previousForward[0] + volume.forward[1] * old.previousForward[1] +
                          volume.forward[2] * old.previousForward[2];
-    const float upright = volume.up[0] * old.previousUp[0] + volume.up[1] * old.previousUp[1] +
-                          volume.up[2] * old.previousUp[2];
+    const float upright =
+        volume.up[0] * old.previousUp[0] + volume.up[1] * old.previousUp[1] + volume.up[2] * old.previousUp[2];
     const bool sameDepth = std::equal(volume.depth, volume.depth + 4, mFogLastDepth.begin());
     const bool cameraCut = !sameDepth || shift > square(125.0f) || facing < 0.94f || upright < 0.94f ||
                            std::abs(volume.right[3] - old.previousRight[3]) > 0.13f ||
                            std::abs(volume.up[3] - old.previousUp[3]) > 0.13f;
     const char* reset = nullptr;
-    if (!mFogLastFrame) reset = "initial";
-    else if (mFogLastStream != flow.stream) reset = "scene";
-    else if (!sameViewport) reset = "resize";
-    else if (mFogLastMsaa != fb.msaa_level) reset = "msaa";
-    else if (cameraCut) reset = "camera";
-    else if (action == FogFlowAction::Seed || mFogFrame - mFogLastFrame > 1) reset = "gap";
+    if (!mFogLastFrame)
+        reset = "initial";
+    else if (mFogLastStream != flow.stream)
+        reset = "scene";
+    else if (!sameViewport)
+        reset = "resize";
+    else if (mFogLastMsaa != fb.msaa_level)
+        reset = "msaa";
+    else if (cameraCut)
+        reset = "camera";
+    else if (action == FogFlowAction::Seed || mFogFrame - mFogLastFrame > 1)
+        reset = "gap";
 
     FogTemporalConstants constants = old;
     const bool sameCamera = std::equal(volume.eye, volume.eye + 3, old.previousEye) &&
@@ -1421,11 +1782,13 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     if (mode == 2) {
         if (reset) {
             ++mFogHistoryResets;
-            if (mFogHistoryResets <= 24) SPDLOG_INFO("Fast3D fog history reset reason={}", reset);
+            if (mFogHistoryResets <= 24)
+                SPDLOG_INFO("Fast3D fog history reset reason={}", reset);
         } else if (!reuseReduced) {
             constexpr float offsets[]{ 0.28f, 0.72f, 0.43f, 0.57f };
             constants.low[2] = sameField ? 0.78f : 0.38f;
-            if (!useSun) constants.low[3] = offsets[mFogFrame % std::size(offsets)];
+            if (!useSun)
+                constants.low[3] = offsets[mFogFrame % std::size(offsets)];
             ++mFogHistoryFrames;
         }
     }
@@ -1434,13 +1797,13 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     if (reuseReduced) {
         ++mFogReducedReuses;
     } else {
-        ID3D11ShaderResourceView* previous = constants.low[2] > 0.0f
-            ? mFogHistory[mFogHistoryIndex].view.Get() : nullptr;
+        ID3D11ShaderResourceView* previous =
+            constants.low[2] > 0.0f ? mFogHistory[mFogHistoryIndex].view.Get() : nullptr;
         mContext->PSSetShaderResources(2, 1, &previous);
         mFogHistoryIndex ^= 1u;
         const D3D11_VIEWPORT reduced{ 0.0f, 0.0f, constants.low[0], constants.low[1], 0.0f, 1.0f };
         mContext->RSSetViewports(1, &reduced);
-        ID3D11RenderTargetView* targets[]{mFogHistory[mFogHistoryIndex].target.Get(), mFogReducedSun.target.Get()};
+        ID3D11RenderTargetView* targets[]{ mFogHistory[mFogHistoryIndex].target.Get(), mFogReducedSun.target.Get() };
         mContext->OMSetRenderTargets(useSun ? 2 : 1, targets, nullptr);
         mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         mContext->PSSetShader(shaders.low.Get(), nullptr, 0);
@@ -1449,7 +1812,8 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         mContext->RSSetViewports(1, &viewport);
         mContext->OMSetBlendState(mFogBlend.Get(), nullptr, 0xffffffffu);
     }
-    if (lowEnd) mContext->End(lowEnd);
+    if (lowEnd)
+        mContext->End(lowEnd);
 
     mContext->PSSetShaderResources(2, 1, mFogHistory[mFogHistoryIndex].view.GetAddressOf());
     ComPtr<ID3D11ShaderResourceView> oldReducedSun;
@@ -1465,7 +1829,7 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     if (cache) {
         ComPtr<ID3D11ShaderResourceView> oldCache;
         mContext->PSGetShaderResources(5, 1, oldCache.GetAddressOf());
-        const D3D11_VIEWPORT single{0.0f, 0.0f, viewport.Width, viewport.Height, 0.0f, 1.0f};
+        const D3D11_VIEWPORT single{ 0.0f, 0.0f, viewport.Width, viewport.Height, 0.0f, 1.0f };
         mContext->RSSetViewports(1, &single);
         mContext->OMSetRenderTargets(1, mFogUniformCache.target.GetAddressOf(), nullptr);
         mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
@@ -1483,7 +1847,8 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         mContext->Draw(3, 0);
     }
 
-    if (useSun) mContext->PSSetShaderResources(10, 1, oldReducedSun.GetAddressOf());
+    if (useSun)
+        mContext->PSSetShaderResources(10, 1, oldReducedSun.GetAddressOf());
     mFogLastFrame = mode == 2 ? mFogFrame : 0;
     mFogLastStream = flow.stream;
     mFogLastViewport = viewport;
@@ -1499,13 +1864,15 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
 }
 
 bool GfxRenderingAPIDX11::InitFogFlow() {
-    if (mFogFlowFailed || mDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0) return false;
-    if (mFogFlowCS) return true;
+    if (mFogFlowFailed || mDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0)
+        return false;
+    if (mFogFlowCS)
+        return true;
 
     ComPtr<ID3DBlob> shader, errors;
-    const auto compiled = mD3dCompile(FogFlowShader, sizeof(FogFlowShader) - 1, "FogFlow", nullptr, nullptr, "CSMain",
-                                      "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.GetAddressOf(),
-                                      errors.GetAddressOf());
+    const auto compiled =
+        mD3dCompile(FogFlowShader, sizeof(FogFlowShader) - 1, "FogFlow", nullptr, nullptr, "CSMain", "cs_5_0",
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.GetAddressOf(), errors.GetAddressOf());
     D3D11_BUFFER_DESC cb{};
     cb.ByteWidth = sizeof(FogFlowConstants);
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -1523,7 +1890,7 @@ bool GfxRenderingAPIDX11::InitFogFlow() {
 
     if (FAILED(compiled) ||
         FAILED(mDevice->CreateComputeShader(shader->GetBufferPointer(), shader->GetBufferSize(), nullptr,
-                                           mFogFlowCS.GetAddressOf())) ||
+                                            mFogFlowCS.GetAddressOf())) ||
         FAILED(mDevice->CreateBuffer(&cb, nullptr, mFogFlowCb.GetAddressOf())) ||
         FAILED(mDevice->CreateBuffer(&input, nullptr, mFogFlowInput.GetAddressOf())) ||
         FAILED(mDevice->CreateShaderResourceView(mFogFlowInput.Get(), &inputView, mFogFlowInputView.GetAddressOf())) ||
@@ -1540,16 +1907,18 @@ bool GfxRenderingAPIDX11::InitFogFlow() {
 }
 
 bool GfxRenderingAPIDX11::InitFogVertical() {
-    if (mFogVerticalFailed) return false;
-    if (mFogVerticalCS) return true;
-    const D3D_SHADER_MACRO macros[]{{"FOG_VERTICAL", "1"}, {nullptr, nullptr}};
+    if (mFogVerticalFailed)
+        return false;
+    if (mFogVerticalCS)
+        return true;
+    const D3D_SHADER_MACRO macros[]{ { "FOG_VERTICAL", "1" }, { nullptr, nullptr } };
     ComPtr<ID3DBlob> shader, errors;
-    const auto compiled = mD3dCompile(FogFlowShader, sizeof(FogFlowShader) - 1, "FogVertical", macros, nullptr,
-                                      "CSMain", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                                      shader.GetAddressOf(), errors.GetAddressOf());
+    const auto compiled =
+        mD3dCompile(FogFlowShader, sizeof(FogFlowShader) - 1, "FogVertical", macros, nullptr, "CSMain", "cs_5_0",
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.GetAddressOf(), errors.GetAddressOf());
     if (FAILED(compiled) ||
         FAILED(mDevice->CreateComputeShader(shader->GetBufferPointer(), shader->GetBufferSize(), nullptr,
-                                           mFogVerticalCS.GetAddressOf())) ||
+                                            mFogVerticalCS.GetAddressOf())) ||
         !CreateFogStateTexture(mDevice.Get(), mFogVerticalTextures[0].view.GetAddressOf(),
                                mFogVerticalTextures[0].target.GetAddressOf()) ||
         !CreateFogStateTexture(mDevice.Get(), mFogVerticalTextures[1].view.GetAddressOf(),
@@ -1565,20 +1934,23 @@ bool GfxRenderingAPIDX11::InitFogVertical() {
 }
 
 bool GfxRenderingAPIDX11::InitFogParticles() {
-    if (mFogParticlesFailed) return false;
-    if (mFogParticleStepCS) return true;
+    if (mFogParticlesFailed)
+        return false;
+    if (mFogParticleStepCS)
+        return true;
     const auto compile = [&](const char* deposit, ID3D11ComputeShader** shader) {
-        const D3D_SHADER_MACRO macros[]{{"FOG_PARTICLE_DEPOSIT", deposit}, {nullptr, nullptr}};
+        const D3D_SHADER_MACRO macros[]{ { "FOG_PARTICLE_DEPOSIT", deposit }, { nullptr, nullptr } };
         ComPtr<ID3DBlob> blob, errors;
-        const auto result = mD3dCompile(FogParticleShader, sizeof(FogParticleShader) - 1, "FogParticles", macros,
-                                        nullptr, "CSMain", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                                        blob.GetAddressOf(), errors.GetAddressOf());
+        const auto result =
+            mD3dCompile(FogParticleShader, sizeof(FogParticleShader) - 1, "FogParticles", macros, nullptr, "CSMain",
+                        "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob.GetAddressOf(), errors.GetAddressOf());
         if (FAILED(result)) {
             SPDLOG_WARN("Fast3D fog particle shader: {}",
                         errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
             return false;
         }
-        return SUCCEEDED(mDevice->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, shader));
+        return SUCCEEDED(
+            mDevice->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, shader));
     };
     D3D11_BUFFER_DESC state{};
     state.StructureByteStride = 8 * sizeof(float);
@@ -1606,7 +1978,8 @@ bool GfxRenderingAPIDX11::InitFogParticles() {
         FAILED(mDevice->CreateUnorderedAccessView(buffer.Get(), &target, mFogParticleTarget.GetAddressOf())) ||
         FAILED(mDevice->CreateBuffer(&paths, nullptr, pathBuffer.GetAddressOf())) ||
         FAILED(mDevice->CreateShaderResourceView(pathBuffer.Get(), &pathView, mFogParticlePathsView.GetAddressOf())) ||
-        FAILED(mDevice->CreateUnorderedAccessView(pathBuffer.Get(), &pathTarget, mFogParticlePathsTarget.GetAddressOf())) ||
+        FAILED(mDevice->CreateUnorderedAccessView(pathBuffer.Get(), &pathTarget,
+                                                  mFogParticlePathsTarget.GetAddressOf())) ||
         !CreateFogStateTexture(mDevice.Get(), mFogParticleFields[0].view.GetAddressOf(),
                                mFogParticleFields[0].target.GetAddressOf()) ||
         !CreateFogStateTexture(mDevice.Get(), mFogParticleFields[1].view.GetAddressOf(),
@@ -1619,18 +1992,20 @@ bool GfxRenderingAPIDX11::InitFogParticles() {
 }
 
 bool GfxRenderingAPIDX11::InitFogFieldBlend() {
-    if (mFogFieldBlendFailed) return false;
-    if (mFogFieldBlendCS) return true;
+    if (mFogFieldBlendFailed)
+        return false;
+    if (mFogFieldBlendCS)
+        return true;
     ComPtr<ID3DBlob> shader, errors;
-    const auto result = mD3dCompile(FogFieldBlendShader, sizeof(FogFieldBlendShader) - 1, "FogFieldBlend", nullptr,
-                                    nullptr, "CSMain", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                                    shader.GetAddressOf(), errors.GetAddressOf());
+    const auto result =
+        mD3dCompile(FogFieldBlendShader, sizeof(FogFieldBlendShader) - 1, "FogFieldBlend", nullptr, nullptr, "CSMain",
+                    "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.GetAddressOf(), errors.GetAddressOf());
     D3D11_BUFFER_DESC constants{};
     constants.ByteWidth = sizeof(FogFieldBlendConstants);
     constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(result) ||
         FAILED(mDevice->CreateComputeShader(shader->GetBufferPointer(), shader->GetBufferSize(), nullptr,
-                                           mFogFieldBlendCS.GetAddressOf())) ||
+                                            mFogFieldBlendCS.GetAddressOf())) ||
         FAILED(mDevice->CreateBuffer(&constants, nullptr, mFogFieldBlendCb.GetAddressOf())) ||
         !CreateFogStateTexture(mDevice.Get(), mFogBlendedField.view.GetAddressOf(),
                                mFogBlendedField.target.GetAddressOf())) {
@@ -1643,9 +2018,9 @@ bool GfxRenderingAPIDX11::InitFogFieldBlend() {
 }
 
 ID3D11ShaderResourceView* GfxRenderingAPIDX11::BlendFogField(ID3D11ShaderResourceView* current, UINT width, UINT height,
-                                                            float fraction) {
+                                                             float fraction) {
     const auto& states = mFogParticlesActive ? mFogParticleFields : mFogFlowTextures;
-    const FogFieldBlendConstants constants{width, height, fraction, uint32_t(mFogVerticalActive)};
+    const FogFieldBlendConstants constants{ width, height, fraction, uint32_t(mFogVerticalActive) };
     mContext->UpdateSubresource(mFogFieldBlendCb.Get(), 0, nullptr, &constants, 0, 0);
 
     ComPtr<ID3D11ComputeShader> oldShader;
@@ -1663,14 +2038,14 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::BlendFogField(ID3D11ShaderResourc
         mContext->CSGetUnorderedAccessViews(1, 1, oldVerticalTarget.GetAddressOf());
     }
 
-    ID3D11ShaderResourceView* inputs[]{states[mFogFlowIndex ^ 1u].view.Get(), current};
+    ID3D11ShaderResourceView* inputs[]{ states[mFogFlowIndex ^ 1u].view.Get(), current };
     mContext->CSSetShader(mFogFieldBlendCS.Get(), nullptr, 0);
     mContext->CSSetConstantBuffers(0, 1, mFogFieldBlendCb.GetAddressOf());
     mContext->CSSetShaderResources(0, 2, inputs);
     mContext->CSSetUnorderedAccessViews(0, 1, mFogBlendedField.target.GetAddressOf(), nullptr);
     if (mFogVerticalActive) {
-        ID3D11ShaderResourceView* vertical[]{mFogVerticalTextures[mFogFlowIndex ^ 1u].view.Get(),
-                                            mFogVerticalTextures[mFogFlowIndex].view.Get()};
+        ID3D11ShaderResourceView* vertical[]{ mFogVerticalTextures[mFogFlowIndex ^ 1u].view.Get(),
+                                              mFogVerticalTextures[mFogFlowIndex].view.Get() };
         mContext->CSSetShaderResources(2, 2, vertical);
         mContext->CSSetUnorderedAccessViews(1, 1, mFogBlendedVertical.target.GetAddressOf(), nullptr);
     }
@@ -1678,11 +2053,11 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::BlendFogField(ID3D11ShaderResourc
 
     if (mFogVerticalActive) {
         mContext->CSSetUnorderedAccessViews(1, 1, oldVerticalTarget.GetAddressOf(), nullptr);
-        ID3D11ShaderResourceView* previous[]{oldVerticalPrevious.Get(), oldVerticalCurrent.Get()};
+        ID3D11ShaderResourceView* previous[]{ oldVerticalPrevious.Get(), oldVerticalCurrent.Get() };
         mContext->CSSetShaderResources(2, 2, previous);
     }
     mContext->CSSetUnorderedAccessViews(0, 1, oldTarget.GetAddressOf(), nullptr);
-    ID3D11ShaderResourceView* oldInputs[]{oldPrevious.Get(), oldCurrent.Get()};
+    ID3D11ShaderResourceView* oldInputs[]{ oldPrevious.Get(), oldCurrent.Get() };
     mContext->CSSetShaderResources(0, 2, oldInputs);
     mContext->CSSetConstantBuffers(0, 1, oldCb.GetAddressOf());
     mContext->CSSetShader(oldShader.Get(), nullptr, 0);
@@ -1694,39 +2069,51 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::BlendFogField(ID3D11ShaderResourc
 }
 
 void GfxRenderingAPIDX11::AuditFogFlow(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowCursor cursor,
-                                      ID3D11ShaderResourceView* source) {
-    if (mFogAuditFailed) return;
+                                       ID3D11ShaderResourceView* source) {
+    if (mFogAuditFailed)
+        return;
     if (mFogAuditPending) {
         const auto ready = mContext->GetData(mFogAuditReady.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
-        if (ready == S_FALSE) return;
+        if (ready == S_FALSE)
+            return;
         mFogAuditPending = false;
-        if (FAILED(ready)) return;
+        if (FAILED(ready))
+            return;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const auto result = mContext->Map(mFogAuditStaging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        const auto result =
+            mContext->Map(mFogAuditStaging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
         if (result == DXGI_ERROR_WAS_STILL_DRAWING) {
             mFogAuditPending = true;
             return;
         }
-        if (FAILED(result)) return;
+        if (FAILED(result))
+            return;
         const auto& stamp = mFogAuditCursor;
         const bool contiguous = mFogAuditPrevious.Next(stamp) == FogFlowAction::Advance;
         unsigned cleared = 0, forced = 0, spread = 0, newFlow = 0, rim = 0;
         float fastest = 0.0f, transported = 0.0f, peakDensity = 0.0f;
         for (uint32_t z = 0; z < stamp.depth; ++z) {
-            const auto* row = reinterpret_cast<const float*>(static_cast<const char*>(mapped.pData) + z * mapped.RowPitch);
+            const auto* row =
+                reinterpret_cast<const float*>(static_cast<const char*>(mapped.pData) + z * mapped.RowPitch);
             for (uint32_t x = 0; x < stamp.width; ++x) {
                 const size_t i = z * stamp.width + x;
                 const uint8_t mask = mFogAuditMask[i];
-                if (mask == 0) continue;
+                if (mask == 0)
+                    continue;
                 const float density = row[4 * x];
                 const float speed = std::hypot(row[4 * x + 2], row[4 * x + 3]);
-                if (density < 0.5f * mFogAuditRestDensity) ++cleared;
-                if (mask == 2) ++forced;
-                if (mask == 1 && density > 1.20f * mFogAuditRestDensity) ++rim;
+                if (density < 0.5f * mFogAuditRestDensity)
+                    ++cleared;
+                if (mask == 2)
+                    ++forced;
+                if (mask == 1 && density > 1.20f * mFogAuditRestDensity)
+                    ++rim;
                 if (contiguous && mask == 1) {
                     const float loss = mFogAuditDensity[i] - density;
-                    if (loss > 0.0005f) ++spread;
-                    if (mFogAuditSpeed[i] < 0.05f && speed > 0.1f) ++newFlow;
+                    if (loss > 0.0005f)
+                        ++spread;
+                    if (mFogAuditSpeed[i] < 0.05f && speed > 0.1f)
+                        ++newFlow;
                     transported = std::max(transported, loss);
                 }
                 fastest = std::max(fastest, speed);
@@ -1737,11 +2124,14 @@ void GfxRenderingAPIDX11::AuditFogFlow(const FastFogVolume& volume, const FastFo
         }
         mContext->Unmap(mFogAuditStaging.Get(), 0);
         mFogAuditPrevious = stamp;
-        SPDLOG_INFO("Fast3D fog audit stream={} tick={} clear={} forced={} spread={} new_flow={} peak={:.2f} loss={:.5f} "
-                    "rim={} peak_rel={:.3f}", stamp.stream, stamp.tick, cleared, forced, spread, newFlow, fastest,
-                    transported, rim, peakDensity / mFogAuditRestDensity);
+        SPDLOG_INFO(
+            "Fast3D fog audit stream={} tick={} clear={} forced={} spread={} new_flow={} peak={:.2f} loss={:.5f} "
+            "rim={} peak_rel={:.3f}",
+            stamp.stream, stamp.tick, cleared, forced, spread, newFlow, fastest, transported, rim,
+            peakDensity / mFogAuditRestDensity);
     }
-    if (!volume.audit) return;
+    if (!volume.audit)
+        return;
     if (!mFogAuditStaging) {
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = desc.Height = FAST_FOG_GRID_SIDE;
@@ -1775,15 +2165,17 @@ void GfxRenderingAPIDX11::AuditFogFlow(const FastFogVolume& volume, const FastFo
 }
 
 ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume& volume, const FastFogFlow& flow,
-                                                           FogFlowAction& action, ID3D11Query* particleBegin,
-                                                           bool& particles) {
-    if (!InitFogFlow()) return nullptr;
+                                                             FogFlowAction& action, ID3D11Query* particleBegin,
+                                                             bool& particles) {
+    if (!InitFogFlow())
+        return nullptr;
     const auto width = static_cast<UINT>(volume.grid[0]);
     const auto depth = static_cast<UINT>(volume.grid[1]);
     const FogFlowCursor incoming{ flow.stream, flow.tick, width, depth };
     const auto tickAction = mFogFlowCursor.Next(incoming);
     action = tickAction;
-    if (tickAction == FogFlowAction::Stale) return nullptr;
+    if (tickAction == FogFlowAction::Stale)
+        return nullptr;
     const float originX = volume.minimum[0], originZ = volume.minimum[2];
     const float stepX = (volume.maximum[0] - originX) / (width - 1);
     const float stepZ = (volume.maximum[2] - originZ) / (depth - 1);
@@ -1793,8 +2185,10 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume
     const bool vortices = (flow.flags & FAST_FOG_FLOW_VORTICES) != 0;
     const bool cpuField = (flow.flags & FAST_FOG_FLOW_CPU_FIELD) != 0;
     const bool modeChanged = cpuField != mFogCpuField;
-    const bool useVertical = !cpuField && vortices && (flow.flags & FAST_FOG_FLOW_VERTICAL_COMPUTE) && InitFogVertical();
-    if (domainChanged || modeChanged || useVertical != mFogVerticalActive) action = FogFlowAction::Seed;
+    const bool useVertical =
+        !cpuField && vortices && (flow.flags & FAST_FOG_FLOW_VERTICAL_COMPUTE) && InitFogVertical();
+    if (domainChanged || modeChanged || useVertical != mFogVerticalActive)
+        action = FogFlowAction::Seed;
     if (action == FogFlowAction::Reuse) {
         ++mFogFlowReuses;
         return mFogParticlesActive ? mFogParticleFields[mFogFlowIndex].view.Get()
@@ -1807,17 +2201,29 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume
     const float shiftZ = (originZ - mFogDomainZ) / stepZ;
     const bool translateParticles = domainChanged && sameSpacing && tickAction != FogFlowAction::Seed &&
                                     std::abs(shiftX) < width - 1 && std::abs(shiftZ) < depth - 1;
-    const bool keepParticleModeChange = modeChanged && !domainChanged && !newStream && tickAction != FogFlowAction::Seed;
+    const bool keepParticleModeChange =
+        modeChanged && !domainChanged && !newStream && tickAction != FogFlowAction::Seed;
     const bool seedParticles = !mFogParticlesActive || (seed && !translateParticles && !keepParticleModeChange);
     // In CPU mode the seed kernel copies the submitted state. Particle and visual history
     // still follow the tick cursor, so they continue across consecutive snapshots.
     const bool copySnapshot = seed || cpuField;
     const FogFlowConstants constants{
-        width, depth, uint32_t(copySnapshot), volume.grid[2], flow.dt, stepX, stepZ,
+        width,
+        depth,
+        uint32_t(copySnapshot),
+        volume.grid[2],
+        flow.dt,
+        stepX,
+        stepZ,
         std::exp(-(vortices ? 1.35f : 3.5f) * flow.dt),
-        flow.tick, FAST_FOG_PARTICLE_COUNT, vortices ? FAST_FOG_VORTEX_REST_DENSITY : 1.0f, 0.30f,
-        translateParticles ? shiftX : 0.0f, translateParticles ? shiftZ : 0.0f,
-        uint32_t(seedParticles), tickAction == FogFlowAction::Reuse ? 0.0f : flow.dt,
+        flow.tick,
+        FAST_FOG_PARTICLE_COUNT,
+        vortices ? FAST_FOG_VORTEX_REST_DENSITY : 1.0f,
+        0.30f,
+        translateParticles ? shiftX : 0.0f,
+        translateParticles ? shiftZ : 0.0f,
+        uint32_t(seedParticles),
+        tickAction == FogFlowAction::Reuse ? 0.0f : flow.dt,
     };
     const D3D11_BOX span{ 0, 0, 0, width * depth * static_cast<UINT>(sizeof(FastFogFlowCell)), 1, 1 };
     mContext->UpdateSubresource(mFogFlowInput.Get(), 0, &span, flow.cells, 0, 0);
@@ -1831,15 +2237,19 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume
     mContext->CSGetConstantBuffers(0, 1, oldCb.GetAddressOf());
     mContext->CSGetShaderResources(0, 1, oldPrevious.GetAddressOf());
     mContext->CSGetShaderResources(1, 1, oldInput.GetAddressOf());
-    if (useVertical || useParticles) mContext->CSGetShaderResources(2, 1, oldTopology.GetAddressOf());
-    if (useParticles) mContext->CSGetShaderResources(3, 1, oldPaths.GetAddressOf());
+    if (useVertical || useParticles)
+        mContext->CSGetShaderResources(2, 1, oldTopology.GetAddressOf());
+    if (useParticles)
+        mContext->CSGetShaderResources(3, 1, oldPaths.GetAddressOf());
     mContext->CSGetUnorderedAccessViews(0, 1, oldTarget.GetAddressOf());
-    if (useVertical) mContext->CSGetUnorderedAccessViews(1, 1, oldVerticalTarget.GetAddressOf());
+    if (useVertical)
+        mContext->CSGetUnorderedAccessViews(1, 1, oldVerticalTarget.GetAddressOf());
 
     auto& output = mFogFlowTextures[mFogFlowIndex ^ 1u];
     auto& particleOutput = mFogParticleFields[mFogFlowIndex ^ 1u];
     ID3D11ShaderResourceView* inputs[] = {
-        copySnapshot ? nullptr : mFogFlowTextures[mFogFlowIndex].view.Get(), mFogFlowInputView.Get(),
+        copySnapshot ? nullptr : mFogFlowTextures[mFogFlowIndex].view.Get(),
+        mFogFlowInputView.Get(),
     };
     mContext->CSSetShader(useVertical ? mFogVerticalCS.Get() : mFogFlowCS.Get(), nullptr, 0);
     mContext->CSSetConstantBuffers(0, 1, mFogFlowCb.GetAddressOf());
@@ -1848,19 +2258,22 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume
     if (useVertical) {
         ID3D11ShaderResourceView* previous = seed ? nullptr : mFogVerticalTextures[mFogFlowIndex].view.Get();
         mContext->CSSetShaderResources(2, 1, &previous);
-        mContext->CSSetUnorderedAccessViews(1, 1, mFogVerticalTextures[mFogFlowIndex ^ 1u].target.GetAddressOf(), nullptr);
+        mContext->CSSetUnorderedAccessViews(1, 1, mFogVerticalTextures[mFogFlowIndex ^ 1u].target.GetAddressOf(),
+                                            nullptr);
     }
     mContext->Dispatch((width + 7) / 8, (depth + 7) / 8, 1);
-    if (useVertical) mContext->CSSetUnorderedAccessViews(1, 1, oldVerticalTarget.GetAddressOf(), nullptr);
+    if (useVertical)
+        mContext->CSSetUnorderedAccessViews(1, 1, oldVerticalTarget.GetAddressOf(), nullptr);
 
     ID3D11ShaderResourceView* emptyInputs[2]{};
     mContext->CSSetShaderResources(0, 2, emptyInputs);
     if (useParticles) {
-        if (particleBegin) mContext->End(particleBegin);
+        if (particleBegin)
+            mContext->End(particleBegin);
         mContext->CSSetShaderResources(2, 1, mFogFlowInputView.GetAddressOf());
         bool topologyChanged = seed || !mFogParticlePathsReady;
         for (UINT i = 0; i < width * depth; ++i) {
-            const auto state = std::pair{flow.cells[i].initial[1], flow.cells[i].open};
+            const auto state = std::pair{ flow.cells[i].initial[1], flow.cells[i].open };
             topologyChanged |= state != mFogParticleTopology[i];
             mFogParticleTopology[i] = state;
         }
@@ -1881,25 +2294,30 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume
         mContext->Dispatch((width + 7) / 8, (depth + 7) / 8, 1);
         mContext->CSSetShaderResources(0, 2, emptyInputs);
         if (++mFogParticleSteps == 1) {
-            SPDLOG_INFO("Fast3D fog particles advancing count={} collision=faces path_cache=true", FAST_FOG_PARTICLE_COUNT);
+            SPDLOG_INFO("Fast3D fog particles advancing count={} collision=faces path_cache=true",
+                        FAST_FOG_PARTICLE_COUNT);
         }
         particles = true;
     }
     mContext->CSSetUnorderedAccessViews(0, 1, oldTarget.GetAddressOf(), nullptr);
-    if (useVertical || useParticles) mContext->CSSetShaderResources(2, 1, oldTopology.GetAddressOf());
-    if (useParticles) mContext->CSSetShaderResources(3, 1, oldPaths.GetAddressOf());
-    ID3D11ShaderResourceView* oldInputs[]{oldPrevious.Get(), oldInput.Get()};
+    if (useVertical || useParticles)
+        mContext->CSSetShaderResources(2, 1, oldTopology.GetAddressOf());
+    if (useParticles)
+        mContext->CSSetShaderResources(3, 1, oldPaths.GetAddressOf());
+    ID3D11ShaderResourceView* oldInputs[]{ oldPrevious.Get(), oldInput.Get() };
     mContext->CSSetShaderResources(0, 2, oldInputs);
     mContext->CSSetConstantBuffers(0, 1, oldCb.GetAddressOf());
     mContext->CSSetShader(oldShader.Get(), nullptr, 0);
-    if (volume.audit || mFogAuditPending) AuditFogFlow(volume, flow, incoming, output.view.Get());
+    if (volume.audit || mFogAuditPending)
+        AuditFogFlow(volume, flow, incoming, output.view.Get());
     mFogFlowIndex ^= 1u;
     mFogExtinction[mFogFlowIndex] = volume.forward[3];
     mFogFlowCursor = incoming;
     mFogCanBlend = !seed && useParticles == mFogParticlesActive && useVertical == mFogVerticalActive;
     mFogParticlesActive = useParticles;
     mFogVerticalActive = useVertical;
-    if (cpuField && modeChanged) SPDLOG_INFO("Fast3D fog using CPU field snapshots {}x{}", width, depth);
+    if (cpuField && modeChanged)
+        SPDLOG_INFO("Fast3D fog using CPU field snapshots {}x{}", width, depth);
     if (keepParticleModeChange) {
         SPDLOG_INFO("Fast3D fog field source={} stream={} tick={} keep_particles={}", cpuField ? "CPU" : "GPU",
                     incoming.stream, incoming.tick, useParticles && !seedParticles);
@@ -1917,10 +2335,11 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume
     if (seed) {
         ++mFogFlowSeeds;
         if (domainChanged) {
-            SPDLOG_INFO("Fast3D fog grid shift cells=({:.2f},{:.2f}) stream={} tick={} keep_particles={}",
-                        shiftX, shiftZ, incoming.stream, incoming.tick, useParticles && !seedParticles);
+            SPDLOG_INFO("Fast3D fog grid shift cells=({:.2f},{:.2f}) stream={} tick={} keep_particles={}", shiftX,
+                        shiftZ, incoming.stream, incoming.tick, useParticles && !seedParticles);
         } else if (!cpuField && (newStream || incoming.tick % 120 == 0)) {
-            SPDLOG_INFO("Fast3D fog compute seed {}x{} stream={} tick={}", width, depth, incoming.stream, incoming.tick);
+            SPDLOG_INFO("Fast3D fog compute seed {}x{} stream={} tick={}", width, depth, incoming.stream,
+                        incoming.tick);
         }
     } else if (!cpuField && ++mFogFlowSteps == 1) {
         SPDLOG_INFO("Fast3D fog compute advancing {}x{} solver={}", width, depth, vortices ? "vortices" : "classic");
@@ -1930,38 +2349,40 @@ ID3D11ShaderResourceView* GfxRenderingAPIDX11::UpdateFogFlow(const FastFogVolume
 
 void GfxRenderingAPIDX11::CollectFogTiming() {
     for (auto& timing : mFogTiming) {
-        if (!timing.pending) continue;
+        if (!timing.pending)
+            continue;
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
         uint64_t first = 0, field = 0, last = 0, particle = 0, lowEnd = 0;
         constexpr UINT flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
         const HRESULT clockStatus = mContext->GetData(timing.disjoint.Get(), &clock, sizeof(clock), flags);
         const HRESULT beginStatus = mContext->GetData(timing.begin.Get(), &first, sizeof(first), flags);
         const HRESULT fieldStatus = mContext->GetData(timing.fieldEnd.Get(), &field, sizeof(field), flags);
-        const HRESULT particleStatus = timing.particles
-            ? mContext->GetData(timing.particleBegin.Get(), &particle, sizeof(particle), flags) : S_OK;
-        const HRESULT lowStatus = timing.reduced
-            ? mContext->GetData(timing.lowEnd.Get(), &lowEnd, sizeof(lowEnd), flags) : S_OK;
+        const HRESULT particleStatus =
+            timing.particles ? mContext->GetData(timing.particleBegin.Get(), &particle, sizeof(particle), flags) : S_OK;
+        const HRESULT lowStatus =
+            timing.reduced ? mContext->GetData(timing.lowEnd.Get(), &lowEnd, sizeof(lowEnd), flags) : S_OK;
         const HRESULT endStatus = mContext->GetData(timing.end.Get(), &last, sizeof(last), flags);
         if (clockStatus == S_FALSE || beginStatus == S_FALSE || fieldStatus == S_FALSE || particleStatus == S_FALSE ||
-            lowStatus == S_FALSE ||
-            endStatus == S_FALSE) continue;
+            lowStatus == S_FALSE || endStatus == S_FALSE)
+            continue;
         timing.pending = false;
         if (FAILED(clockStatus) || FAILED(beginStatus) || FAILED(endStatus) || clock.Disjoint || !clock.Frequency ||
             last < first || mFogTimingReports >= FogReportLimit) {
             continue;
         }
         mFogSamples[mFogSampleCount++] = static_cast<double>(last - first) * 1000.0 / clock.Frequency;
-        if (timing.reduced && SUCCEEDED(fieldStatus) && SUCCEEDED(lowStatus) && field >= first &&
-            lowEnd >= field && last >= lowEnd) {
+        if (timing.reduced && SUCCEEDED(fieldStatus) && SUCCEEDED(lowStatus) && field >= first && lowEnd >= field &&
+            last >= lowEnd) {
             const double milliseconds = 1000.0 / clock.Frequency;
             mFogLowSamples[mFogLodSampleCount] = (lowEnd - field) * milliseconds;
             mFogUpscaleSamples[mFogLodSampleCount++] = (last - lowEnd) * milliseconds;
         }
         if (timing.advanced && SUCCEEDED(fieldStatus) && field >= first && last >= field) {
             const double milliseconds = 1000.0 / clock.Frequency;
-            const bool particleMeasured = timing.particles && SUCCEEDED(particleStatus) &&
-                                          particle >= first && particle <= field;
-            if (particleMeasured) mFogParticleSamples[mFogParticleSampleCount++] = (field - particle) * milliseconds;
+            const bool particleMeasured =
+                timing.particles && SUCCEEDED(particleStatus) && particle >= first && particle <= field;
+            if (particleMeasured)
+                mFogParticleSamples[mFogParticleSampleCount++] = (field - particle) * milliseconds;
             mFogFieldSamples[mFogFlowSampleCount] = ((particleMeasured ? particle : field) - first) * milliseconds;
             mFogRaymarchSamples[mFogFlowSampleCount++] = (last - field) * milliseconds;
         }
@@ -2013,13 +2434,16 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     const auto sun = std::exchange(worldFogSun, WorldFogSun{});
     const bool useSun = sun.depth && sun.context == mContext.Get() && volume.eye[3] == 1.0f;
     const auto& fb = mFrameBuffers[mCurrentFramebuffer];
-    if (!fb.depth_stencil_srv || !fb.render_target_view) return;
+    if (!fb.depth_stencil_srv || !fb.render_target_view)
+        return;
     const bool multisampled = fb.msaa_level > 1;
     D3D11_VIEWPORT viewport{};
     UINT count = 1;
     mContext->RSGetViewports(&count, &viewport);
-    if (!count || viewport.Width <= 0.0f || viewport.Height <= 0.0f || !InitFogVolume()) return;
-    if (multisampled && !InitFogMsaa()) return;
+    if (!count || viewport.Width <= 0.0f || viewport.Height <= 0.0f || !InitFogVolume())
+        return;
+    if (multisampled && !InitFogMsaa())
+        return;
     if (fb.msaa_level != mFogReportedMsaa) {
         mFogReportedMsaa = fb.msaa_level;
         SPDLOG_INFO("Fast3D fog MSAA samples={}", mFogReportedMsaa);
@@ -2027,7 +2451,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
 
     CollectFogTiming();
     FogTiming* measurement = nullptr;
-    if (volume.eye[3] == 1.0f && mFogTimingReports < FogReportLimit) {
+    if (mActiveFrameTiming < 0 && volume.eye[3] == 1.0f && mFogTimingReports < FogReportLimit) {
         for (auto& timing : mFogTiming) {
             if (timing.disjoint && !timing.pending) {
                 measurement = &timing;
@@ -2066,9 +2490,9 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     }
     auto action = FogFlowAction::Stale;
     bool particles = false;
-    auto* fieldView = flow ? UpdateFogFlow(volume, *flow, action,
-                                           measurement ? measurement->particleBegin.Get() : nullptr, particles)
-                           : nullptr;
+    auto* fieldView =
+        flow ? UpdateFogFlow(volume, *flow, action, measurement ? measurement->particleBegin.Get() : nullptr, particles)
+             : nullptr;
     const auto fieldWidth = static_cast<UINT>(volume.grid[0]);
     const auto fieldHeight = static_cast<UINT>(volume.grid[1]);
     const bool liveFlow = fieldView && action != FogFlowAction::Stale;
@@ -2084,8 +2508,8 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         extinction = previous + (current - previous) * fieldFraction;
         if (!mFogExtinctionLogged && fieldFraction > 0.0f && previous != current) {
             mFogExtinctionLogged = true;
-            SPDLOG_INFO("Fast3D fog fade interpolating {:.6f}->{:.6f} fraction={:.3f} extinction={:.6f}",
-                        previous, current, fieldFraction, extinction);
+            SPDLOG_INFO("Fast3D fog fade interpolating {:.6f}->{:.6f} fraction={:.3f} extinction={:.6f}", previous,
+                        current, fieldFraction, extinction);
         }
     }
     constants.parameters[1][3] = extinction;
@@ -2100,9 +2524,9 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         }
     }
     const bool useNoise = constants.visual[1] > 0.0f;
-    const bool useSupport = liveFlow && mFogSupportView &&
-                            std::max(volume.maximum[0] - volume.minimum[0], volume.maximum[2] - volume.minimum[2]) >
-                                1024.0f;
+    const bool useSupport =
+        liveFlow && mFogSupportView &&
+        std::max(volume.maximum[0] - volume.minimum[0], volume.maximum[2] - volume.minimum[2]) > 1024.0f;
     if (useSupport && action != FogFlowAction::Reuse) {
         UpdateFogSupportRanges(volume, *flow, fieldWidth, fieldHeight);
     }
@@ -2115,9 +2539,10 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     }
     const bool useLift = liveFlow && mFogLiftView && (flow->flags & FAST_FOG_FLOW_LIFT) &&
                          (mFogLiftCurrent || (fieldFraction < 1.0f && mFogLiftPrevious));
-    auto* gpuLift = useLift && mFogVerticalActive
-        ? (fieldFraction < 1.0f ? mFogBlendedVertical.view.Get() : mFogVerticalTextures[mFogFlowIndex].view.Get())
-        : nullptr;
+    auto* gpuLift =
+        useLift && mFogVerticalActive
+            ? (fieldFraction < 1.0f ? mFogBlendedVertical.view.Get() : mFogVerticalTextures[mFogFlowIndex].view.Get())
+            : nullptr;
     constants.support[0] = useSupport ? 1.0f : 0.0f;
     constants.support[2] = fieldFraction;
     constants.support[3] = useUpper ? 1.0f : 0.0f;
@@ -2148,8 +2573,8 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         lod = static_cast<int>(volume.grid[3]);
     }
     if (lod != mFogLodMode || width != mFogLodWidth || height != mFogLodHeight) {
-        SPDLOG_INFO("Fast3D fog LOD mode={} full={}x{} low={}x{}", lod, width, height,
-                    lod ? mFogHistoryWidth : width, lod ? mFogHistoryHeight : height);
+        SPDLOG_INFO("Fast3D fog LOD mode={} full={}x{} low={}x{}", lod, width, height, lod ? mFogHistoryWidth : width,
+                    lod ? mFogHistoryHeight : height);
         mFogLodMode = lod;
         mFogLodWidth = width;
         mFogLodHeight = height;
@@ -2188,11 +2613,16 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSGetConstantBuffers(0, 1, oldCb.GetAddressOf());
     mContext->PSGetShaderResources(0, 1, oldSrv.GetAddressOf());
     mContext->PSGetShaderResources(1, 1, oldField.GetAddressOf());
-    if (useSun) mContext->PSGetShaderResources(9, 1, oldSun.GetAddressOf());
-    if (useSupport) mContext->PSGetShaderResources(3, 1, oldSupport.GetAddressOf());
-    if (useLift) mContext->PSGetShaderResources(4, 1, oldLift.GetAddressOf());
-    if (useUpper) mContext->PSGetShaderResources(6, 1, oldUpper.GetAddressOf());
-    if (gpuLift) mContext->PSGetShaderResources(7, 1, oldGpuLift.GetAddressOf());
+    if (useSun)
+        mContext->PSGetShaderResources(9, 1, oldSun.GetAddressOf());
+    if (useSupport)
+        mContext->PSGetShaderResources(3, 1, oldSupport.GetAddressOf());
+    if (useLift)
+        mContext->PSGetShaderResources(4, 1, oldLift.GetAddressOf());
+    if (useUpper)
+        mContext->PSGetShaderResources(6, 1, oldUpper.GetAddressOf());
+    if (gpuLift)
+        mContext->PSGetShaderResources(7, 1, oldGpuLift.GetAddressOf());
     if (useNoise) {
         mContext->PSGetShaderResources(8, 1, oldNoise.GetAddressOf());
         mContext->PSGetSamplers(2, 1, oldNoiseSampler.GetAddressOf());
@@ -2218,11 +2648,16 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSSetConstantBuffers(0, 1, mFogCb.GetAddressOf());
     mContext->PSSetShaderResources(0, 1, fb.depth_stencil_srv.GetAddressOf());
     mContext->PSSetShaderResources(1, 1, &fieldView);
-    if (useSun) mContext->PSSetShaderResources(9, 1, sun.depth.GetAddressOf());
-    if (useSupport) mContext->PSSetShaderResources(3, 1, mFogSupportView.GetAddressOf());
-    if (useLift) mContext->PSSetShaderResources(4, 1, mFogLiftView.GetAddressOf());
-    if (useUpper) mContext->PSSetShaderResources(6, 1, mFogUpperView.GetAddressOf());
-    if (gpuLift) mContext->PSSetShaderResources(7, 1, &gpuLift);
+    if (useSun)
+        mContext->PSSetShaderResources(9, 1, sun.depth.GetAddressOf());
+    if (useSupport)
+        mContext->PSSetShaderResources(3, 1, mFogSupportView.GetAddressOf());
+    if (useLift)
+        mContext->PSSetShaderResources(4, 1, mFogLiftView.GetAddressOf());
+    if (useUpper)
+        mContext->PSSetShaderResources(6, 1, mFogUpperView.GetAddressOf());
+    if (gpuLift)
+        mContext->PSSetShaderResources(7, 1, &gpuLift);
     if (useNoise) {
         mContext->PSSetShaderResources(8, 1, mFogNoiseView.GetAddressOf());
         mContext->PSSetSamplers(2, 1, mFogNoiseSampler.GetAddressOf());
@@ -2252,11 +2687,16 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSSetConstantBuffers(0, 1, oldCb.GetAddressOf());
     mContext->PSSetShaderResources(0, 1, oldSrv.GetAddressOf());
     mContext->PSSetShaderResources(1, 1, oldField.GetAddressOf());
-    if (useSun) mContext->PSSetShaderResources(9, 1, oldSun.GetAddressOf());
-    if (useSupport) mContext->PSSetShaderResources(3, 1, oldSupport.GetAddressOf());
-    if (useLift) mContext->PSSetShaderResources(4, 1, oldLift.GetAddressOf());
-    if (useUpper) mContext->PSSetShaderResources(6, 1, oldUpper.GetAddressOf());
-    if (gpuLift) mContext->PSSetShaderResources(7, 1, oldGpuLift.GetAddressOf());
+    if (useSun)
+        mContext->PSSetShaderResources(9, 1, oldSun.GetAddressOf());
+    if (useSupport)
+        mContext->PSSetShaderResources(3, 1, oldSupport.GetAddressOf());
+    if (useLift)
+        mContext->PSSetShaderResources(4, 1, oldLift.GetAddressOf());
+    if (useUpper)
+        mContext->PSSetShaderResources(6, 1, oldUpper.GetAddressOf());
+    if (gpuLift)
+        mContext->PSSetShaderResources(7, 1, oldGpuLift.GetAddressOf());
     if (useNoise) {
         mContext->PSSetShaderResources(8, 1, oldNoise.GetAddressOf());
         mContext->PSSetSamplers(2, 1, oldNoiseSampler.GetAddressOf());

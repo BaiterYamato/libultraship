@@ -75,6 +75,18 @@ class GfxRenderingAPI {
     virtual void StartFrame() = 0;
     virtual void EndFrame() = 0;
     virtual void FinishRender() = 0;
+    // Optional world-only presentation contract. Other backends keep the legacy path.
+    virtual bool PrepareWorldPresentation() {
+        return false;
+    }
+    virtual bool PresentWorld(int source, int destination, bool reconstruct) {
+        return false;
+    }
+    virtual void SetGpuFrameTiming(bool enabled, float measuredScale, uint64_t configuration = 0) {
+    }
+    virtual bool GetGpuFrameTime(double& milliseconds, float& measuredScale) {
+        return false;
+    }
     virtual int CreateFramebuffer() = 0;
     virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                              bool opengl_invertY, bool render_target, bool has_depth_buffer,
@@ -93,9 +105,14 @@ class GfxRenderingAPI {
     virtual std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;
     virtual void* GetFramebufferTextureId(int fbId) = 0;
-    virtual bool SupportsFogVolume() const { return false; }
-    virtual bool SupportsFogFlow() const { return false; }
-    virtual void DrawFogVolume(const FastFogVolume&, const FastFogFlow*) {}
+    virtual bool SupportsFogVolume() const {
+        return false;
+    }
+    virtual bool SupportsFogFlow() const {
+        return false;
+    }
+    virtual void DrawFogVolume(const FastFogVolume&, const FastFogFlow*) {
+    }
     virtual void SelectTextureFb(int fbId) = 0;
     virtual void DeleteTexture(uint32_t texId) = 0;
     virtual void SetTextureFilter(FilteringMode mode) = 0;

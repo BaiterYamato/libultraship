@@ -55,10 +55,12 @@ float3 normal : NORMAL;
 @if(o_textures[0]) 
     Texture2D g_texture0 : register(t0);
     SamplerState g_sampler0 : register(s0);
+    SamplerState g_pointSampler0 : register(s8); // R018: exact 3-point magnification
 @end
 @if(o_textures[1]) 
     Texture2D g_texture1 : register(t1);
     SamplerState g_sampler1 : register(s1);
+    SamplerState g_pointSampler1 : register(s9);
 @end
 
 @if(o_masks[0]) Texture2D g_textureMask0 : register(t2);
@@ -104,17 +106,29 @@ cbuffer PerDrawCB : register(b1) {
         uint width;
         uint height;
         bool linear_filtering;
+        bool mipmaps; // occupies the existing C++ padding, 16 bytes per texture
     } textures[2];
 }
 
 #define TEX_OFFSET(tex, tSampler, texCoord, off, texSize) tex.Sample(tSampler, texCoord - off / texSize)
 
-float4 tex2D3PointFilter(in Texture2D tex, in SamplerState tSampler, in float2 texCoord, in float2 texSize) {
+float4 tex2D3PointFilter(in Texture2D tex, in SamplerState tSampler, in SamplerState pointSampler,
+                       in float2 texCoord, in float2 texSize, in bool mipmaps) {
+    // Sample before coordinate snapping/branching: implicit derivatives select
+    // the correct mip footprint, including anisotropic footprints on slopes.
+    // Minification intentionally uses hardware filtering; 3-point is retained
+    // for magnification, HUD and the legacy switch-off path.
+    float4 reduced = tex.Sample(tSampler, texCoord);
+    float2 dx = ddx(texCoord) * texSize;
+    float2 dy = ddy(texCoord) * texSize;
+    if (mipmaps && max(dot(dx, dx), dot(dy, dy)) > 1.0) {
+        return reduced;
+    }
     float2 offset = frac(texCoord * texSize - float2(0.5, 0.5));
     offset -= step(1.0, offset.x + offset.y);
-    float4 c0 = TEX_OFFSET(tex, tSampler, texCoord, offset, texSize);
-    float4 c1 = TEX_OFFSET(tex, tSampler, texCoord, float2(offset.x - sign(offset.x), offset.y), texSize);
-    float4 c2 = TEX_OFFSET(tex, tSampler, texCoord, float2(offset.x, offset.y - sign(offset.y)), texSize);
+    float4 c0 = TEX_OFFSET(tex, pointSampler, texCoord, offset, texSize);
+    float4 c1 = TEX_OFFSET(tex, pointSampler, texCoord, float2(offset.x - sign(offset.x), offset.y), texSize);
+    float4 c2 = TEX_OFFSET(tex, pointSampler, texCoord, float2(offset.x, offset.y - sign(offset.y)), texSize);
     return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);
 }
 @end
@@ -244,19 +258,19 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
                 float4 texVal@{i};
                 if (textures[@{i}].linear_filtering) {
                     @if(o_masks[i])
-                        texVal@{i} = tex2D3PointFilter(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height));
+                        texVal@{i} = tex2D3PointFilter(g_texture@{i}, g_sampler@{i}, g_pointSampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height), textures[@{i}].mipmaps);
                         float2 maskSize@{i};
                         g_textureMask@{i}.GetDimensions(maskSize@{i}.x, maskSize@{i}.y);
-                        float4 maskVal@{i} = tex2D3PointFilter(g_textureMask@{i}, g_sampler@{i}, tc@{i}, maskSize@{i});
+                        float4 maskVal@{i} = tex2D3PointFilter(g_textureMask@{i}, g_sampler@{i}, g_pointSampler@{i}, tc@{i}, maskSize@{i}, textures[@{i}].mipmaps);
                         @if(o_blend[i])
-                            float4 blendVal@{i} = tex2D3PointFilter(g_textureBlend@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height));
+                            float4 blendVal@{i} = tex2D3PointFilter(g_textureBlend@{i}, g_sampler@{i}, g_pointSampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height), textures[@{i}].mipmaps);
                         @else
                             float4 blendVal@{i} = float4(0, 0, 0, 0);
                         @end
 
                         texVal@{i} = lerp(texVal@{i}, blendVal@{i}, maskVal@{i}.a);
                     @else
-                        texVal@{i} = tex2D3PointFilter(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height));
+                        texVal@{i} = tex2D3PointFilter(g_texture@{i}, g_sampler@{i}, g_pointSampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height), textures[@{i}].mipmaps);
                     @end
                 } else {
                     texVal@{i} = g_texture@{i}.Sample(g_sampler@{i}, tc@{i});

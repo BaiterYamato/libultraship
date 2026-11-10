@@ -5,6 +5,9 @@
 #include "ship/controller/controldeck/ControlDeck.h"
 #include "ship/config/ConsoleVariable.h"
 #include "fast/interpreter.h"
+#include "fast/world_postprocess.h"
+#include "fast/world_presentation.h"
+#include "fast/world_presentation_gate.h"
 #include "fast/backends/gfx_sdl.h"
 #include "fast/backends/gfx_dxgi.h"
 #include "fast/backends/gfx_opengl.h"
@@ -17,7 +20,25 @@
 
 #include <fstream>
 
+namespace {
+Fast::WorldPresentationGate<Fast::F3DGfx> gWorldPresentationGate;
+}
+
+void FastBeginWorldPresentationFrame(const void* root) {
+    gWorldPresentationGate.Begin(root);
+}
+
+void FastSetWorldPresentationBoundary(const void* root, const void* marker) {
+    gWorldPresentationGate.Publish(root, marker);
+}
+
+void FastEndWorldPresentationFrame(void) {
+    gWorldPresentationGate.End();
+}
+
 namespace Fast {
+
+static_assert(Interpreter::WorldPresentCommand == FAST_WORLD_PRESENT_COMMAND);
 
 extern void GfxSetInstance(std::shared_ptr<Interpreter> gfx);
 
@@ -178,10 +199,13 @@ void Fast3dWindow::Close() {
 }
 
 void Fast3dWindow::RunGuiOnly() {
+    mInterpreter->SetWorldPresentationForNextFrame(false);
     mInterpreter->RunGuiOnly();
 }
 
 void Fast3dWindow::StartFrame() {
+    // Entrada sem lista: não pode herdar a autorização de DrawAndRunGraphicsCommands.
+    mInterpreter->SetWorldPresentationForNextFrame(false);
     mInterpreter->StartFrame();
 }
 
@@ -195,6 +219,7 @@ bool Fast3dWindow::IsFrameReady() {
 
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
+    mInterpreter->SetWorldPresentationForNextFrame(false);
 
     // Skip dropped frames
     if (!wnd->IsFrameReady()) {
@@ -207,6 +232,11 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     // Setup of the backend frames and draw initial Window and GUI menus
     gui->StartDraw();
     // Setup game framebuffers to match available window space
+    // StartFrame consome a autorização: recalcular para CADA replay interpolado.
+    // Um pedido de debugger surgido após a construção também invalida este replay.
+    const bool debugging = mGfxDebugger->IsDebugging() || mGfxDebugger->IsDebuggingRequested();
+    mInterpreter->SetWorldPresentationForNextFrame(gWorldPresentationGate.Authorize(
+        commands, debugging, (uint32_t(FAST_GFX_WORLD_POSTPROCESS) << 24) | Interpreter::WorldPresentCommand));
     mInterpreter->StartFrame();
     // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);

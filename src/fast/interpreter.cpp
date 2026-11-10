@@ -97,33 +97,39 @@ std::mutex gFogSnapshotMutex;
 std::array<FogSnapshot, 32> gFogSnapshots{};
 uint32_t gFogTicket = 0;
 
-bool ReadFogSnapshot(uint32_t ticket, FastFogVolume& volume, FastFogFlow& flow, bool& hasFlow,
-                     Mtx*& viewing, Mtx*& projection) {
-    if (ticket == 0) return false;
+bool ReadFogSnapshot(uint32_t ticket, FastFogVolume& volume, FastFogFlow& flow, bool& hasFlow, Mtx*& viewing,
+                     Mtx*& projection) {
+    if (ticket == 0)
+        return false;
     const std::lock_guard lock(gFogSnapshotMutex);
     const auto& entry = gFogSnapshots[ticket % gFogSnapshots.size()];
-    if (entry.ticket != ticket) return false;
+    if (entry.ticket != ticket)
+        return false;
     volume = entry.volume;
     viewing = entry.viewing;
     projection = entry.projection;
     hasFlow = entry.hasFlow;
-    if (hasFlow) flow = entry.flow;
+    if (hasFlow)
+        flow = entry.flow;
     return true;
 }
 } // namespace
 
-extern "C" uint32_t FastQueueFogVolume(const FastFogVolume* volume, const FastFogFlow* flow,
-                                       const void* viewing, const void* projection) {
-    if (!volume) return 0;
+extern "C" uint32_t FastQueueFogVolume(const FastFogVolume* volume, const FastFogFlow* flow, const void* viewing,
+                                       const void* projection) {
+    if (!volume)
+        return 0;
     const std::lock_guard lock(gFogSnapshotMutex);
-    if (++gFogTicket == 0) ++gFogTicket;
+    if (++gFogTicket == 0)
+        ++gFogTicket;
     auto& entry = gFogSnapshots[gFogTicket % gFogSnapshots.size()];
     entry.ticket = gFogTicket;
     entry.volume = *volume;
     entry.viewing = const_cast<Mtx*>(static_cast<const Mtx*>(viewing));
     entry.projection = const_cast<Mtx*>(static_cast<const Mtx*>(projection));
     entry.hasFlow = flow != nullptr;
-    if (flow) entry.flow = *flow;
+    if (flow)
+        entry.flow = *flow;
     return gFogTicket;
 }
 
@@ -219,7 +225,8 @@ static_assert(WorldCutoutTextureSlots == SHADER_MAX_TEXTURES);
 void CaptureCutoutBatch(GfxRenderingAPI* renderer) {
     auto& capture = worldGeometry;
     const auto end = static_cast<unsigned>(capture.cutoutVertices.size());
-    if (end == capture.pendingOffset) return;
+    if (end == capture.pendingOffset)
+        return;
     auto* dx11 = dynamic_cast<GfxRenderingAPIDX11*>(renderer);
     if (!dx11 || capture.cutoutBatches.size() == MaxWorldCutoutBatches) {
         capture.cutoutVertices.resize(capture.pendingOffset);
@@ -245,14 +252,16 @@ void CaptureCutoutBatch(GfxRenderingAPI* renderer) {
     }
     // The three-point filter uses the actual uploaded texture size and the RDP linear flag.
     for (unsigned i = 0; i < batch.filter.size(); ++i) {
-        if (!batch.views[i]) continue;
+        if (!batch.views[i])
+            continue;
         Microsoft::WRL::ComPtr<ID3D11Resource> resource;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
         batch.views[i]->GetResource(resource.GetAddressOf());
-        if (FAILED(resource.As(&texture))) continue;
+        if (FAILED(resource.As(&texture)))
+            continue;
         D3D11_TEXTURE2D_DESC desc{};
         texture->GetDesc(&desc);
-        batch.filter[i] = {desc.Width, desc.Height, capture.linear[i] ? 1u : 0u, 0u};
+        batch.filter[i] = { desc.Width, desc.Height, capture.linear[i] ? 1u : 0u, 0u };
     }
 }
 #endif
@@ -1676,7 +1685,8 @@ extern "C" void Fast_SetQuantizeFloatMtx(bool on) {
 bool TryReadInterpolatedMatrix(const Interpreter& interpreter, const void* key, float (&matrix)[4][4]) {
     const auto& replacements = *interpreter.mCurMtxReplacements;
     const auto it = replacements.find(static_cast<Mtx*>(const_cast<void*>(key)));
-    if (it == replacements.end()) return false;
+    if (it == replacements.end())
+        return false;
 #if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
     // Float matrices only need the original fixed-point quantization in vanilla mode.
     if (!sQuantizeFloatMtx) {
@@ -1796,7 +1806,7 @@ std::span<const WorldTransmissionTriangle> ReadWorldTransmission() {
 #ifdef _WIN32
 WorldCutoutGeometry ReadWorldCutouts() {
 #ifdef ENABLE_DX11
-    return {worldGeometry.cutoutVertices, worldGeometry.cutoutBatches};
+    return { worldGeometry.cutoutVertices, worldGeometry.cutoutBatches };
 #else
     return {};
 #endif
@@ -1832,7 +1842,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         x = AdjXForAspectRatio(x);
 
-        if (dest_index < MAX_VERTICES) worldGeometry.transmissionVertices[dest_index] = worldGeometry.transmissionArmed;
+        if (dest_index < MAX_VERTICES)
+            worldGeometry.transmissionVertices[dest_index] = worldGeometry.transmissionArmed;
         if (worldGeometry.armed || worldGeometry.transmissionArmed ||
             ((mRsp->geometry_mode & G_LIGHTING) && (mRdp->toon || mRdp->toon_shadow))) {
             const auto& mv = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
@@ -2047,16 +2058,18 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     // Capture before camera triangle clipping and backface culling. Depth-writing opaque triangles have a
     // usable silhouette without replaying the N64 combiner. Alpha-tested materials need a separate path.
-    const bool shadowCandidate = worldGeometry.armed && !mFbActive && !is_rect &&
-        vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES && vtx3_idx < MAX_VERTICES &&
-        (mRsp->geometry_mode & G_ZBUFFER) && (mRdp->other_mode_l & (Z_CMP | Z_UPD)) == (Z_CMP | Z_UPD) &&
+    const bool shadowCandidate =
+        worldGeometry.armed && !mFbActive && !is_rect && vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES &&
+        vtx3_idx < MAX_VERTICES && (mRsp->geometry_mode & G_ZBUFFER) &&
+        (mRdp->other_mode_l & (Z_CMP | Z_UPD)) == (Z_CMP | Z_UPD) &&
         (mRdp->other_mode_l & (G_ZS_PRIM | FORCE_BL)) == 0 && (mRdp->other_mode_l & ZMODE_DEC) != ZMODE_DEC;
     if (shadowCandidate && !worldGeometry.overflow &&
         (mRdp->other_mode_l & (CVG_X_ALPHA | (3U << G_MDSFT_ALPHACOMPARE))) == 0) {
         if (worldGeometry.vertices.size() == MaxWorldGeometryVertices) {
             worldGeometry.overflow = true;
         } else {
-            for (const auto* v : v_arr) worldGeometry.vertices.push_back({v->wx, v->wy, v->wz});
+            for (const auto* v : v_arr)
+                worldGeometry.vertices.push_back({ v->wx, v->wy, v->wz });
         }
     }
 
@@ -2071,14 +2084,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             const auto baseTile = mRdp->first_tile_index;
             for (unsigned i = 0; i < 2; ++i) {
                 const auto tile = baseTile + (baseTile >= 2 ? 0 : i);
-                const auto& resource = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata.resource;
-                if (!resource) continue;
+                const auto& resource =
+                    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata.resource;
+                if (!resource)
+                    continue;
                 auto path = GetBaseTexturePath(resource->GetInitData()->Path);
-                if (path.starts_with("__OTR__")) path.remove_prefix(7);
-                if (!match(worldGeometry.transmissionScene, path)) continue;
-                const auto* combiner = LookupOrCreateColorCombiner(
-                    {mRdp->combine_mode, twoCycles ? SHADER_OPT(_2CYC) : 0u});
-                if (!combiner->usedTextures[i]) continue;
+                if (path.starts_with("__OTR__"))
+                    path.remove_prefix(7);
+                if (!match(worldGeometry.transmissionScene, path))
+                    continue;
+                const auto* combiner =
+                    LookupOrCreateColorCombiner({ mRdp->combine_mode, twoCycles ? SHADER_OPT(_2CYC) : 0u });
+                if (!combiner->usedTextures[i])
+                    continue;
                 if (worldGeometry.transmission.size() == MaxWorldTransmissionTriangles) {
                     worldGeometry.transmissionOverflow = true;
                     break;
@@ -2087,7 +2105,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 triangle.texture = path;
                 for (unsigned vertex = 0; vertex < 3; ++vertex) {
                     const auto* v = v_arr[vertex];
-                    triangle.vertices[vertex] = {v->wx, v->wy, v->wz};
+                    triangle.vertices[vertex] = { v->wx, v->wy, v->wz };
                 }
                 break;
             }
@@ -2664,8 +2682,9 @@ void Interpreter::AdjustVIewportOrScissor(XYWidthHeight* area) {
         area->x *= RATIO_X(mActiveFrameBuffer, mCurDimensions);
         area->y *= RATIO_Y(mActiveFrameBuffer, mCurDimensions);
 
-        if (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                              mCurDimensions.height == mGameWindowViewport.height)) {
+        if (!mWorldPresentationActive &&
+            (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
+                               mCurDimensions.height == mGameWindowViewport.height))) {
             area->x += mGameWindowViewport.x;
             area->y += mGfxCurrentWindowDimensions.height - (mGameWindowViewport.y + mGameWindowViewport.height);
         }
@@ -4515,13 +4534,22 @@ void SetWorldPostProcess(WorldPostProcess callback) {
 static bool gfx_world_postprocess(F3DGfx** command) {
     auto gfx = mInstance.lock();
     switch ((*command)->words.w0 & 0xFFu) {
-        case FAST_WORLD_GEOMETRY_BEGIN: worldGeometry.armed = !gfx->mFbActive; return false;
-        case FAST_WORLD_GEOMETRY_END: worldGeometry.armed = false; return false;
+        case Interpreter::WorldPresentCommand:
+            gfx->PresentWorldBeforeHud();
+            return false;
+        case FAST_WORLD_GEOMETRY_BEGIN:
+            worldGeometry.armed = !gfx->mFbActive;
+            return false;
+        case FAST_WORLD_GEOMETRY_END:
+            worldGeometry.armed = false;
+            return false;
         case FAST_WORLD_TRANSMISSION_BEGIN:
             worldGeometry.transmissionArmed = !gfx->mFbActive;
             worldGeometry.transmissionScene = static_cast<uint16_t>((*command)->words.w1);
             return false;
-        case FAST_WORLD_TRANSMISSION_END: worldGeometry.transmissionArmed = false; return false;
+        case FAST_WORLD_TRANSMISSION_END:
+            worldGeometry.transmissionArmed = false;
+            return false;
     }
     worldGeometry.armed = false;
     worldGeometry.transmissionArmed = false;
@@ -5181,7 +5209,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     gfx->Flush();
     gfx->mFbActive = false;
     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
-    gfx->mRapi->StartDrawToFramebuffer(gfx->mRendersToFb ? gfx->mGameFb : 0,
+    gfx->mRapi->StartDrawToFramebuffer(gfx->MainDrawFramebuffer(),
                                        (float)gfx->mCurDimensions.height / gfx->mNativeDimensions.height);
     // Force viewport and scissor to reapply against the main framebuffer, in case a previous smaller
     // framebuffer truncated the values
@@ -5393,15 +5421,13 @@ bool gfx_draw_fog_volume(F3DGfx** cmd0) {
                     cofactors[axis][i] = m[a][j] * m[b][k] - m[b][j] * m[a][k];
                 }
             }
-            const float determinant = m[0][0] * cofactors[0][0] + m[1][0] * cofactors[0][1] +
-                                      m[2][0] * cofactors[0][2];
+            const float determinant = m[0][0] * cofactors[0][0] + m[1][0] * cofactors[0][1] + m[2][0] * cofactors[0][2];
             if (std::abs(determinant) > 0.0001f) {
                 for (int i = 0; i < 3; ++i) {
                     volume.right[i] = cofactors[0][i] / determinant;
                     volume.up[i] = cofactors[1][i] / determinant;
                     volume.forward[i] = -cofactors[2][i] / determinant;
-                    volume.eye[i] = -m[3][0] * volume.right[i] - m[3][1] * volume.up[i] +
-                                    m[3][2] * volume.forward[i];
+                    volume.eye[i] = -m[3][0] * volume.right[i] - m[3][1] * volume.up[i] + m[3][2] * volume.forward[i];
                 }
             }
         }
@@ -6249,6 +6275,67 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 void Interpreter::StartFrame() {
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const bool dynamic = cvars->GetInteger("gSettings.DynamicResolution", 0) != 0;
+    mSpatialUpscale = cvars->GetInteger("gSettings.SpatialUpscale", 0) == 1;
+    // The host currently provides no unconditional world/HUD split. Never infer
+    // one from depth-test state, shaderpack callbacks or last frame's commands.
+    const bool requested = (dynamic || mSpatialUpscale) && mNextFrameHasWorldBoundary;
+    if ((dynamic || mSpatialUpscale) && !mNextFrameHasWorldBoundary) {
+        if (!mMissingWorldBoundaryWarned)
+            SPDLOG_WARN("R069/R070: host has no world/HUD boundary; keeping legacy presentation");
+        mMissingWorldBoundaryWarned = true;
+    } else {
+        mMissingWorldBoundaryWarned = false;
+    }
+    mNextFrameHasWorldBoundary = false;
+    const bool wasActive = mWorldPresentationActive;
+    const bool wasDynamic = mDynamicResolution;
+    mWorldPresented = false;
+    mWorldPresentationActive = requested && mGameWindowViewport.width > 0 && mGameWindowViewport.height > 0 &&
+                               mCurDimensions.width > 0 && mCurDimensions.height > 0 &&
+                               // Pixel-perfect presentation intentionally uses integer sampling, not this path.
+                               !(cvars->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0) &&
+                                 cvars->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".PixelPerfectMode", 0)) &&
+                               mRapi->PrepareWorldPresentation();
+    mDynamicResolution = dynamic && mWorldPresentationActive;
+    if (mWorldPresentationActive) {
+        // Fit native output inside the game viewport, preserving the requested aspect.
+        const double aspect = double(mCurDimensions.width) / mCurDimensions.height;
+        uint32_t outWidth = mGameWindowViewport.width, outHeight = mGameWindowViewport.height;
+        if (double(outWidth) / outHeight > aspect)
+            outWidth = std::max(1u, uint32_t(outHeight * aspect));
+        else
+            outHeight = std::max(1u, uint32_t(outWidth / aspect));
+        if (!wasActive || wasDynamic != mDynamicResolution || outWidth != mPresentationWidth ||
+            outHeight != mPresentationHeight) {
+            mDynresController.Reset();
+        }
+        mPresentationWidth = outWidth;
+        mPresentationHeight = outHeight;
+        mDynresController.SetBudget(cvars->GetFloat("gSettings.DynamicResolutionBudgetMs", 16.6f));
+        const uint64_t configuration = (uint64_t(outWidth) << 32) ^ (uint64_t(outHeight) << 8) ^ mMsaaLevel;
+        // Invalidate queries from the old output size BEFORE reading a delayed sample.
+        mRapi->SetGpuFrameTiming(mDynamicResolution, mDynresController.Scale(), configuration);
+        mDynresController.Tick();
+        double gpuMs;
+        float measuredScale;
+        if (mDynamicResolution && mRapi->GetGpuFrameTime(gpuMs, measuredScale))
+            mDynresController.Observe(gpuMs, measuredScale);
+        if (mDynamicResolution) {
+            // 1/32 scale steps and 8-pixel sizing reduce resource churn. 1.0 is exact native.
+            mCurDimensions.width = mDynresController.ScaledDimension(outWidth);
+            mCurDimensions.height = mDynresController.ScaledDimension(outHeight);
+        }
+        if (mPresentationFb < 0)
+            mPresentationFb = mRapi->CreateFramebuffer();
+        mRapi->UpdateFramebufferParameters(mPresentationFb, outWidth, outHeight, 1, false, true, true, false);
+    } else {
+        mDynresController.Reset();
+    }
+    const uint64_t timingConfiguration =
+        (uint64_t(mPresentationWidth) << 32) ^ (uint64_t(mPresentationHeight) << 8) ^ mMsaaLevel;
+    mRapi->SetGpuFrameTiming(mDynamicResolution, mDynresController.Scale(), timingConfiguration);
     if (mCurDimensions.height == 0) {
         // Avoid division by zero
         mCurDimensions.height = 1;
@@ -6275,9 +6362,9 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    if (mWorldPresentationActive || !ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
         mRendersToFb = true;
-        if (!ViewportMatchesRendererResolution()) {
+        if (mWorldPresentationActive || !ViewportMatchesRendererResolution()) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
                                                true, true, true);
         } else {
@@ -6286,7 +6373,7 @@ void Interpreter::StartFrame() {
             mRapi->UpdateFramebufferParameters(mGameFb, mGfxCurrentWindowDimensions.width,
                                                mGfxCurrentWindowDimensions.height, mMsaaLevel, false, true, true, true);
         }
-        if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
+        if (mMsaaLevel > 1 && (mWorldPresentationActive || !ViewportMatchesRendererResolution())) {
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
                                                false, false, false, false);
         }
@@ -6295,6 +6382,30 @@ void Interpreter::StartFrame() {
     }
 
     mFbActive = false;
+    mWorldDimensions = mCurDimensions;
+}
+
+bool Interpreter::PresentWorldBeforeHud() {
+    if (!mWorldPresentationActive || mWorldPresented || mFbActive)
+        return false;
+    FlushToonShadow();
+    Flush();
+    if (!mRapi->PresentWorld(mGameFb, mPresentationFb, mSpatialUpscale)) {
+        // Resource failure: retain a visible frame at internal resolution.
+        // The host must treat a false return as a failed presentation, not success.
+        SPDLOG_ERROR("R069/R070: world presentation failed; frame kept at internal resolution");
+        return false;
+    }
+    mWorldPresented = true;
+    mCurDimensions.width = mPresentationWidth;
+    mCurDimensions.height = mPresentationHeight;
+    mCurDimensions.aspect_ratio = float(mPresentationWidth) / mPresentationHeight;
+    mRapi->StartDrawToFramebuffer(mPresentationFb, float(mPresentationHeight) / mNativeDimensions.height);
+    mRapi->ClearFramebuffer(false, true); // native HUD has its own depth, world depth stays intact
+    mRdp->viewport_or_scissor_changed = true;
+    mRenderingState.viewport = {};
+    mRenderingState.scissor = {};
+    return true;
 }
 
 GfxExecStack g_exec_stack = {};
@@ -6308,7 +6419,7 @@ void Interpreter::RunGuiOnly() {
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
-    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
+    mRapi->StartDrawToFramebuffer(MainDrawFramebuffer(), (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
@@ -6317,11 +6428,15 @@ void Interpreter::RunGuiOnly() {
     Flush();
     mGfxFrameBuffer = 0;
 
-    if (mRendersToFb) {
+    if (mWorldPresented) {
+        mRapi->StartDrawToFramebuffer(0, 1);
+        mRapi->ClearFramebuffer(true, true);
+        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mPresentationFb);
+    } else if (mRendersToFb) {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (mWorldPresentationActive || !ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
@@ -6363,7 +6478,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
-    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
+    mRapi->StartDrawToFramebuffer(MainDrawFramebuffer(), (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
@@ -6381,7 +6496,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
                 // soft locking the renderer
                 if (mFbActive) {
                     mFbActive = 0;
-                    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, 1);
+                    mRapi->StartDrawToFramebuffer(MainDrawFramebuffer(), 1);
                 }
 
                 break;
@@ -6394,12 +6509,19 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     Flush();
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
+    if (mWorldPresentationActive && !mWorldPresented) {
+        SPDLOG_ERROR("R069/R070: host promised but did not complete the world/HUD boundary");
+    }
 
-    if (mRendersToFb) {
+    if (mWorldPresented) {
+        mRapi->StartDrawToFramebuffer(0, 1);
+        mRapi->ClearFramebuffer(true, true);
+        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mPresentationFb);
+    } else if (mRendersToFb) {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (mWorldPresentationActive || !ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
@@ -6469,7 +6591,7 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 
     if (fb_src_id == 0 && mRendersToFb) {
         // read from the framebuffer we've been rendering to
-        fb_src_id = mGameFb;
+        fb_src_id = MainDrawFramebuffer();
     }
 
     int srcX0, srcY0, srcX1, srcY1;
@@ -6477,8 +6599,9 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 
     // When rendering to the main window buffer or MSAA is enabled with a buffer size equal to the view port,
     // then the source coordinates must account for any docked ImGui elements
-    if (fb_src_id == 0 || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                           mCurDimensions.height == mGameWindowViewport.height)) {
+    if (fb_src_id == 0 ||
+        (!mWorldPresentationActive && mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
+         mCurDimensions.height == mGameWindowViewport.height)) {
         srcX0 = mGameWindowViewport.x;
         srcY0 = mGameWindowViewport.y;
         srcX1 = mGameWindowViewport.x + mGameWindowViewport.width;
@@ -6504,15 +6627,18 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 }
 
 void Interpreter::ResetFrameBuffer() {
-    mRapi->StartDrawToFramebuffer(0, (float)mCurDimensions.height / mNativeDimensions.height);
+    mRapi->StartDrawToFramebuffer(mWorldPresentationActive ? MainDrawFramebuffer() : 0,
+                                  (float)mCurDimensions.height / mNativeDimensions.height);
 }
 
 void Interpreter::AdjustPixelDepthCoordinates(float& x, float& y) {
-    x = x * RATIO_X(mActiveFrameBuffer, mCurDimensions) -
-        (mNativeDimensions.width * RATIO_X(mActiveFrameBuffer, mCurDimensions) - mCurDimensions.width) / 2;
-    y *= RATIO_Y(mActiveFrameBuffer, mCurDimensions);
-    if (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                          mCurDimensions.height == mGameWindowViewport.height)) {
+    const auto& depthDimensions = mWorldPresented ? mWorldDimensions : mCurDimensions;
+    x = x * RATIO_X(mActiveFrameBuffer, depthDimensions) -
+        (mNativeDimensions.width * RATIO_X(mActiveFrameBuffer, depthDimensions) - depthDimensions.width) / 2;
+    y *= RATIO_Y(mActiveFrameBuffer, depthDimensions);
+    if (!mWorldPresentationActive &&
+        (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
+                           mCurDimensions.height == mGameWindowViewport.height))) {
         x += mGameWindowViewport.x;
         y += mGfxCurrentWindowDimensions.height - (mGameWindowViewport.y + mGameWindowViewport.height);
     }
