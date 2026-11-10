@@ -31,6 +31,8 @@ Texture2D<float4> raisedField : register(t4);
 Texture2D<float4> upperField : register(t6);
 Texture2D<float4> computedLiftField : register(t7);
 Texture2D<float> noiseField : register(t8);
+Texture2D<float> solarDepth : register(t9);
+Texture2D<float> reducedSun : register(t10);
 #if FOG_MSAA
 Texture2D<float4> uniformFog : register(t5);
 #endif
@@ -54,10 +56,12 @@ cbuffer FogConstants : register(b0) {
     float4 grid;
     float4 viewport;
     float4 support; // x: support ranges, y: raised offset, z: interpolation, w: upper support
-    float4 lighting; // x: number of point lights
+    float4 lighting; // x: point light count, y: unoccluded solar control
     float4 atmosphere;
     float4 visual; // x: computed lift, y: texture detail, zw: wind offset
     FogLight lights[6];
+    float4 sunProjection[4];
+    float4 sunRadiance;
 };
 
 cbuffer FogTemporalConstants : register(b1) {
@@ -266,8 +270,34 @@ float CompactFogProfile(float height, float thickness, float scale, float topFea
 
 )hlsl"
 R"hlsl(
-// Opacity, depth of the density-weighted sample, scene depth, and end of the visible segment.
-float4 March(float3 ray, float zView, float offset, int steps) {
+float SolarVisibility(float3 samplePosition, uint2 size) {
+    float4 world = float4(samplePosition, 1.0);
+    float2 uv = float2(dot(world, sunProjection[0]), dot(world, sunProjection[1]));
+    float edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+    float scale = sunProjection[3].w;
+    float receiver = (dot(world, sunProjection[2]) + 1.5 - sunProjection[3].z) * scale;
+    if (edge <= 0.0 || receiver <= 0.0 || receiver >= 1.0) return 0.0;
+    float coverage = smoothstep(0.0, 0.04, edge);
+    if (lighting.y > 0.5) return coverage;
+
+    float2 pixel = uv * size - 0.5;
+    int2 base = int2(floor(pixel));
+    float2 subpixel = frac(pixel);
+    float visibility = 0.0;
+    [unroll] for (int y = 0; y < 2; ++y) {
+        [unroll] for (int x = 0; x < 2; ++x) {
+            int2 coord = clamp(base + int2(x, y), 0, int2(size) - 1);
+            float nearest = solarDepth.Load(int3(coord, 0));
+            float2 weight = 1.0 - abs(float2(x, y) - subpixel);
+            visibility += weight.x * weight.y * (1.0 - smoothstep(0.0, 4.0 * scale, nearest - receiver));
+        }
+    }
+    return visibility * coverage;
+}
+
+// Opacity, density-weighted depth, scene depth, and the segment end.
+float4 March(float3 ray, float zView, float offset, int steps, out float sunlight) {
+    sunlight = 0.0;
     float3 invRay = 1.0 / float3(NonZero(ray.x), NonZero(ray.y), NonZero(ray.z));
     float3 t0 = (boundsMin.xyz - cameraEye.xyz) * invRay;
     float3 t1 = (boundsMax.xyz - cameraEye.xyz) * invRay;
@@ -289,6 +319,11 @@ float4 March(float3 ray, float zView, float offset, int steps) {
     float stepSize = minimumStep;
     float integral = 0.0;
     float weightedDepth = 0.0;
+    const bool useSun = sunRadiance.w > 0.0;
+    uint2 sunSize = 0;
+    if (useSun) solarDepth.GetDimensions(sunSize.x, sunSize.y);
+    float opticalScale = rayLength * cameraForward.w;
+    float transmittance = 1.0;
     float travelled = 0.0;
     uint textureWidth, textureHeight;
     fogField.GetDimensions(textureWidth, textureHeight);
@@ -411,6 +446,12 @@ float4 March(float3 ray, float zView, float offset, int steps) {
         float sampleDensity = (opticalDensity + upperDensity) * edge * width;
         integral += sampleDensity;
         weightedDepth += sampleDensity * t;
+        [branch]
+        if (useSun && sampleDensity > 0.0) {
+            float stepTransmittance = exp(-sampleDensity * opticalScale);
+            sunlight += transmittance * (1.0 - stepTransmittance) * SolarVisibility(samplePoint, sunSize);
+            transmittance *= stepTransmittance;
+        }
     }
     float alpha = 1.0 - exp(-integral * rayLength * cameraForward.w);
     return float4(alpha, weightedDepth / max(integral, 0.00001), zView, last);
@@ -418,7 +459,7 @@ float4 March(float3 ray, float zView, float offset, int steps) {
 
 )hlsl"
 R"hlsl(
-float4 FogColor(float2 uv, float alpha, float anchor) {
+float4 FogColor(float2 uv, float alpha, float anchor, float sunlight) {
     float3 color = fogColor.rgb;
     float3 ray = 0.0;
     [branch]
@@ -447,7 +488,12 @@ float4 FogColor(float2 uv, float alpha, float anchor) {
         float3 tint = saturate(0.35 * color + radiance / max(strength, 0.0001));
         color = lerp(color, tint, saturate(0.58 * strength));
     }
-    return float4(color * alpha, alpha);
+    float3 premultiplied = color * alpha;
+    if (sunRadiance.w > 0.0) {
+        float3 tint = lerp(float3(1.0, 0.86, 0.67), sunRadiance.rgb, 0.45);
+        premultiplied += tint * min(sunlight, alpha) * (1.0 - color) * sunRadiance.w;
+    }
+    return float4(premultiplied, alpha);
 }
 
 float4 FullFog(float2 position, float zView) {
@@ -456,8 +502,9 @@ float4 FullFog(float2 position, float zView) {
         return float4(gray, gray, gray, 1.0);
     }
     float2 uv = (position - viewport.xy) / viewport.zw;
-    float4 fog = March(WorldRay(uv), zView, 0.5, 16);
-    return FogColor(uv, fog.x, fog.y);
+    float sunlight;
+    float4 fog = March(WorldRay(uv), zView, 0.5, 16, sunlight);
+    return FogColor(uv, fog.x, fog.y, sunlight);
 }
 
 #if FOG_MSAA
@@ -502,7 +549,12 @@ float HistoryOpacity(int2 pixel, float3 ray, float4 current) {
     return opacity;
 }
 
-float4 PSLow(float4 position : SV_Position) : SV_Target {
+struct ReducedFogOutput {
+    float4 optical : SV_Target0;
+    float sunlight : SV_Target1;
+};
+
+ReducedFogOutput PSLow(float4 position : SV_Position) {
     float2 uv = position.xy / low.xy;
     float2 footprint = viewport.zw / low.xy;
     int2 base = int2(viewport.xy + (position.xy - 0.5) * footprint);
@@ -511,9 +563,10 @@ float4 PSLow(float4 position : SV_Position) : SV_Target {
     float depth = min(min(NearestDepth(base), NearestDepth(int2(end.x, base.y))),
                       min(NearestDepth(int2(base.x, end.y)), NearestDepth(end)));
     float3 ray = WorldRay(uv);
-    float4 current = March(ray, DecodeDepth(depth), low.w, grid.w == 2.0 ? 8 : 12);
-    current.x = HistoryOpacity(int2(position.xy), ray, current);
-    return current;
+    ReducedFogOutput result;
+    result.optical = March(ray, DecodeDepth(depth), low.w, grid.w == 2.0 ? 8 : 12, result.sunlight);
+    result.optical.x = HistoryOpacity(int2(position.xy), ray, result.optical);
+    return result;
 }
 
 float4 UpscaleFog(float2 position, float zView) {
@@ -521,10 +574,12 @@ float4 UpscaleFog(float2 position, float zView) {
     float tolerance = max(5.0, 0.018 * zView);
     float4 depths = reducedFog.GatherBlue(fogSampler, uv);
     float4 depthErrors = abs(depths - zView);
+    bool useSun = sunRadiance.w > 0.0;
     [branch]
     if (all(depthErrors < tolerance * 0.5)) {
-        float2 fog = reducedFog.SampleLevel(fogSampler, uv, 0.0).xy;
-        return FogColor(uv, fog.x, fog.y);
+        float4 fog = reducedFog.SampleLevel(fogSampler, uv, 0.0);
+        float sunlight = useSun ? reducedSun.SampleLevel(fogSampler, uv, 0.0) : 0.0;
+        return FogColor(uv, fog.x, fog.y, sunlight);
     }
 
     float2 f = frac(uv * low.xy - 0.5);
@@ -533,7 +588,7 @@ float4 UpscaleFog(float2 position, float zView) {
     float4 spatial = float4(inv.x * f.y, f.x * f.y, f.x * inv.y, inv.x * inv.y);
     float4 mismatch = smoothstep(tolerance * 0.5, tolerance, depthErrors);
     float4 compatible = 1.0 - mismatch;
-    float2 estimate = 0.0;
+    float3 estimate = 0.0;
     float confidence = 0.0;
     [branch]
     if (any(spatial * compatible > 0.0)) {
@@ -546,16 +601,18 @@ float4 UpscaleFog(float2 position, float zView) {
         // The weight cap still fades that corner out as its spatial contribution vanishes.
         float best = max(max(compatible.x, compatible.y), max(compatible.z, compatible.w));
         confidence = min(best, 16.0 * weightSum);
-        estimate = float2(dot(reducedFog.GatherRed(fogSampler, uv), weights), dot(anchors, weights)) /
+        float solar = useSun ? dot(reducedSun.GatherRed(fogSampler, uv), weights) : 0.0;
+        estimate = float3(dot(reducedFog.GatherRed(fogSampler, uv), weights), dot(anchors, weights), solar) /
                    max(weightSum, 0.0001);
         [branch]
-        if (confidence >= 0.6) return FogColor(uv, estimate.x, estimate.y);
+        if (confidence >= 0.6) return FogColor(uv, estimate.x, estimate.y, estimate.z);
     }
     // Resolve thin foreground features against their actual depth. Fade the reduced estimate out
     // as its footprint becomes unreliable so edges remain continuous during camera motion.
-    float2 exact = March(WorldRay(uv), zView, 0.5, 4).xy;
-    float2 fog = lerp(exact, estimate, smoothstep(0.0, 0.6, confidence));
-    return FogColor(uv, fog.x, fog.y);
+    float exactSun;
+    float2 exact = March(WorldRay(uv), zView, 0.5, 4, exactSun).xy;
+    float3 fog = lerp(float3(exact, exactSun), estimate, smoothstep(0.0, 0.6, confidence));
+    return FogColor(uv, fog.x, fog.y, fog.z);
 }
 
 #if FOG_MSAA

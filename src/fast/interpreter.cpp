@@ -6340,6 +6340,9 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+#ifdef _WIN32
+    worldFogSun = {};
+#endif
     SpReset();
     worldGeometry.armed = worldGeometry.overflow = false;
     worldGeometry.vertices.clear();

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <utility>
 #include <cmath>
 
 #include <map>
@@ -38,6 +39,7 @@
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/interpreter.h"
 #include "fast/fog_volume.h"
+#include "fast/world_postprocess.h"
 #include "fog_field_blend_shader.h"
 #include "fog_volume_shader.h"
 #include "fog_flow_shader.h"
@@ -1058,6 +1060,8 @@ struct FogConstants {
     float atmosphere[4];
     float visual[4];
     FastFogLight lights[FAST_FOG_LIGHT_COUNT];
+    std::array<std::array<float, 4>, 4> sunProjection;
+    std::array<float, 4> sunRadiance;
 };
 static_assert(offsetof(FastFogVolume, cells) == sizeof(FogConstants::parameters));
 
@@ -1285,7 +1289,7 @@ static bool CreateFogColorTarget(ID3D11Device* device, UINT width, UINT height, 
            SUCCEEDED(device->CreateShaderResourceView(texture.Get(), nullptr, view));
 }
 
-bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled) {
+bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled, bool useSun) {
     auto& shaders = mFogLodShaders[multisampled];
     if (mFogLodFailed || shaders.failed) return false;
     if (!shaders.upscale) {
@@ -1310,20 +1314,35 @@ bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled)
             return false;
         }
     }
-    if (width == mFogHistoryWidth && height == mFogHistoryHeight) return true;
-
-    std::array<FogHistoryTarget, 2> targets;
-    for (auto& slot : targets) {
-        if (!CreateFogColorTarget(mDevice.Get(), width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                  slot.target.GetAddressOf(), slot.view.GetAddressOf())) {
-            SPDLOG_WARN("Fast3D fog could not allocate LOD textures {}x{}", width, height);
-            mFogLodFailed = true;
+    if (width != mFogHistoryWidth || height != mFogHistoryHeight) {
+        std::array<FogHistoryTarget, 2> targets;
+        for (auto& slot : targets) {
+            if (!CreateFogColorTarget(mDevice.Get(), width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                      slot.target.GetAddressOf(), slot.view.GetAddressOf())) {
+                SPDLOG_WARN("Fast3D fog could not allocate LOD textures {}x{}", width, height);
+                mFogLodFailed = true;
+                return false;
+            }
+        }
+        mFogHistory = std::move(targets);
+        mFogHistoryWidth = width;
+        mFogHistoryHeight = height;
+        mFogReducedSun = {};
+        mFogReducedSunFailed = false;
+        mFogLastFrame = 0;
+    }
+    if (useSun && !mFogReducedSun.view) {
+        if (mFogReducedSunFailed) return false;
+        FogHistoryTarget solar;
+        if (!CreateFogColorTarget(mDevice.Get(), width, height, DXGI_FORMAT_R16_FLOAT, solar.target.GetAddressOf(),
+                                  solar.view.GetAddressOf())) {
+            SPDLOG_WARN("Fast3D fog could not allocate solar target {}x{}", width, height);
+            mFogReducedSunFailed = true;
             return false;
         }
+        mFogReducedSun = std::move(solar);
+        SPDLOG_INFO("Fast3D fog solar target={}x{} R16_FLOAT", width, height);
     }
-    mFogHistory = std::move(targets);
-    mFogHistoryWidth = width;
-    mFogHistoryHeight = height;
     return true;
 }
 
@@ -1358,7 +1377,7 @@ bool GfxRenderingAPIDX11::InitFogMsaaCache(UINT width, UINT height) {
 
 void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
                                     const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction,
-                                    ID3D11Query* lowEnd) {
+                                    bool useSun, ID3D11Query* lowEnd) {
     const auto& fb = mFrameBuffers[mCurrentFramebuffer];
     const auto& shaders = mFogLodShaders[fb.msaa_level > 1];
     const auto sameViewport = viewport.TopLeftX == mFogLastViewport.TopLeftX &&
@@ -1392,7 +1411,8 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
                             std::equal(volume.up, volume.up + 4, old.previousUp);
     const bool sameField = action == FogFlowAction::Reuse && fieldFraction == mFogLastFieldFraction &&
                            extinction == old.previousForward[3];
-    const bool reuseReduced = mode == 2 && !reset && sameCamera && sameField;
+    // The depth map can change with moving casters even when the view and density stay fixed.
+    const bool reuseReduced = mode == 2 && !useSun && !reset && sameCamera && sameField;
     constants.previousForward[3] = sameCamera ? 0.0f : 1.0f;
     constants.low[0] = static_cast<float>(mFogHistoryWidth);
     constants.low[1] = static_cast<float>(mFogHistoryHeight);
@@ -1405,7 +1425,7 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         } else if (!reuseReduced) {
             constexpr float offsets[]{ 0.28f, 0.72f, 0.43f, 0.57f };
             constants.low[2] = sameField ? 0.78f : 0.38f;
-            constants.low[3] = offsets[mFogFrame % std::size(offsets)];
+            if (!useSun) constants.low[3] = offsets[mFogFrame % std::size(offsets)];
             ++mFogHistoryFrames;
         }
     }
@@ -1420,7 +1440,8 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         mFogHistoryIndex ^= 1u;
         const D3D11_VIEWPORT reduced{ 0.0f, 0.0f, constants.low[0], constants.low[1], 0.0f, 1.0f };
         mContext->RSSetViewports(1, &reduced);
-        mContext->OMSetRenderTargets(1, mFogHistory[mFogHistoryIndex].target.GetAddressOf(), nullptr);
+        ID3D11RenderTargetView* targets[]{mFogHistory[mFogHistoryIndex].target.Get(), mFogReducedSun.target.Get()};
+        mContext->OMSetRenderTargets(useSun ? 2 : 1, targets, nullptr);
         mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         mContext->PSSetShader(shaders.low.Get(), nullptr, 0);
         mContext->Draw(3, 0);
@@ -1431,6 +1452,11 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     if (lowEnd) mContext->End(lowEnd);
 
     mContext->PSSetShaderResources(2, 1, mFogHistory[mFogHistoryIndex].view.GetAddressOf());
+    ComPtr<ID3D11ShaderResourceView> oldReducedSun;
+    if (useSun) {
+        mContext->PSGetShaderResources(10, 1, oldReducedSun.GetAddressOf());
+        mContext->PSSetShaderResources(10, 1, mFogReducedSun.view.GetAddressOf());
+    }
     const auto width = static_cast<UINT>(viewport.Width);
     const auto height = static_cast<UINT>(viewport.Height);
     const bool cache = fb.msaa_level >= 4 && viewport.Width == float(width) && viewport.Height == float(height) &&
@@ -1457,6 +1483,7 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         mContext->Draw(3, 0);
     }
 
+    if (useSun) mContext->PSSetShaderResources(10, 1, oldReducedSun.GetAddressOf());
     mFogLastFrame = mode == 2 ? mFogFrame : 0;
     mFogLastStream = flow.stream;
     mFogLastViewport = viewport;
@@ -1983,6 +2010,8 @@ void GfxRenderingAPIDX11::CollectFogTiming() {
 }
 
 void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastFogFlow* flow) {
+    const auto sun = std::exchange(worldFogSun, WorldFogSun{});
+    const bool useSun = sun.depth && sun.context == mContext.Get() && volume.eye[3] == 1.0f;
     const auto& fb = mFrameBuffers[mCurrentFramebuffer];
     if (!fb.depth_stencil_srv || !fb.render_target_view) return;
     const bool multisampled = fb.msaa_level > 1;
@@ -2013,6 +2042,17 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     std::memcpy(constants.parameters, &volume, sizeof(constants.parameters));
     const auto lightCount = std::min<uint32_t>(volume.lightCount, FAST_FOG_LIGHT_COUNT);
     constants.lighting[0] = static_cast<float>(lightCount);
+    if (useSun) {
+        constants.sunProjection = sun.projection;
+        constants.sunRadiance = sun.radiance;
+        constants.lighting[1] = sun.unoccluded ? 1.0f : 0.0f;
+    }
+    thread_local int lastSun = 0;
+    const int sunMode = useSun ? (sun.unoccluded ? 2 : 1) : 0;
+    if (sunMode != lastSun) {
+        SPDLOG_INFO("Fast3D fog solar={} (0=off, 1=shadow map, 2=unoccluded)", sunMode);
+        lastSun = sunMode;
+    }
     std::copy_n(volume.lights, lightCount, constants.lights);
     std::copy_n(volume.atmosphere, 4, constants.atmosphere);
     if (volume.atmosphere[3] > 0.0f && !mFogAtmosphereLogged) {
@@ -2104,7 +2144,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     int lod = 0;
     if (flow && action != FogFlowAction::Stale && volume.eye[3] == 1.0f &&
         (volume.grid[3] == 1.0f || volume.grid[3] == 2.0f) && width >= 320 && height >= 240 &&
-        InitFogLod((width + 1) / 2, (height + 1) / 2, multisampled)) {
+        InitFogLod((width + 1) / 2, (height + 1) / 2, multisampled, useSun)) {
         lod = static_cast<int>(volume.grid[3]);
     }
     if (lod != mFogLodMode || width != mFogLodWidth || height != mFogLodHeight) {
@@ -2135,6 +2175,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     ComPtr<ID3D11ShaderResourceView> oldUpper;
     ComPtr<ID3D11ShaderResourceView> oldGpuLift;
     ComPtr<ID3D11ShaderResourceView> oldNoise;
+    ComPtr<ID3D11ShaderResourceView> oldSun;
     ComPtr<ID3D11SamplerState> oldFogSampler, oldNoiseSampler;
     ComPtr<ID3D11RasterizerState> oldRaster;
     ComPtr<ID3D11BlendState> oldBlend;
@@ -2147,6 +2188,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSGetConstantBuffers(0, 1, oldCb.GetAddressOf());
     mContext->PSGetShaderResources(0, 1, oldSrv.GetAddressOf());
     mContext->PSGetShaderResources(1, 1, oldField.GetAddressOf());
+    if (useSun) mContext->PSGetShaderResources(9, 1, oldSun.GetAddressOf());
     if (useSupport) mContext->PSGetShaderResources(3, 1, oldSupport.GetAddressOf());
     if (useLift) mContext->PSGetShaderResources(4, 1, oldLift.GetAddressOf());
     if (useUpper) mContext->PSGetShaderResources(6, 1, oldUpper.GetAddressOf());
@@ -2176,6 +2218,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSSetConstantBuffers(0, 1, mFogCb.GetAddressOf());
     mContext->PSSetShaderResources(0, 1, fb.depth_stencil_srv.GetAddressOf());
     mContext->PSSetShaderResources(1, 1, &fieldView);
+    if (useSun) mContext->PSSetShaderResources(9, 1, sun.depth.GetAddressOf());
     if (useSupport) mContext->PSSetShaderResources(3, 1, mFogSupportView.GetAddressOf());
     if (useLift) mContext->PSSetShaderResources(4, 1, mFogLiftView.GetAddressOf());
     if (useUpper) mContext->PSSetShaderResources(6, 1, mFogUpperView.GetAddressOf());
@@ -2186,7 +2229,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     }
     mContext->PSSetSamplers(1, 1, mFogGridSampler.GetAddressOf());
     if (lod) {
-        DrawFogLod(volume, *flow, action, viewport, lod, fieldFraction, extinction,
+        DrawFogLod(volume, *flow, action, viewport, lod, fieldFraction, extinction, useSun,
                    measurement ? measurement->lowEnd.Get() : nullptr);
         mContext->PSSetShaderResources(2, 1, oldReduced.GetAddressOf());
         mContext->PSSetConstantBuffers(1, 1, oldTemporalCb.GetAddressOf());
@@ -2209,6 +2252,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSSetConstantBuffers(0, 1, oldCb.GetAddressOf());
     mContext->PSSetShaderResources(0, 1, oldSrv.GetAddressOf());
     mContext->PSSetShaderResources(1, 1, oldField.GetAddressOf());
+    if (useSun) mContext->PSSetShaderResources(9, 1, oldSun.GetAddressOf());
     if (useSupport) mContext->PSSetShaderResources(3, 1, oldSupport.GetAddressOf());
     if (useLift) mContext->PSSetShaderResources(4, 1, oldLift.GetAddressOf());
     if (useUpper) mContext->PSSetShaderResources(6, 1, oldUpper.GetAddressOf());

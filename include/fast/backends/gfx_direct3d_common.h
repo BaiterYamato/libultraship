@@ -154,10 +154,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void UpdateFogLift(const FastFogFlow& flow, FogFlowAction action, UINT width, UINT height);
     void UpdateFogUpper(const FastFogVolume& volume, FogFlowAction action, UINT width, UINT height);
     bool InitFogMsaa();
-    bool InitFogLod(UINT width, UINT height, bool multisampled);
+    bool InitFogLod(UINT width, UINT height, bool multisampled, bool useSun);
     bool InitFogMsaaCache(UINT width, UINT height);
     void DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
-                    const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction, ID3D11Query* lowEnd);
+                    const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction,
+                    bool useSun, ID3D11Query* lowEnd);
     bool InitFogFlow();
     bool InitFogVertical();
     bool InitFogParticles();
@@ -194,6 +195,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
         Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
     };
     std::array<FogHistoryTarget, 2> mFogHistory{};
+    FogHistoryTarget mFogReducedSun{};
+    bool mFogReducedSunFailed = false;
     FogHistoryTarget mFogUniformCache{};
     Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogUniformPs, mFogCachedUpscalePs;
     UINT mFogCacheWidth = 0, mFogCacheHeight = 0;

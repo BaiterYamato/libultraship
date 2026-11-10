@@ -50,6 +50,16 @@ struct WorldCutoutGeometry {
     std::span<const WorldCutoutBatch> batches;
 };
 WorldCutoutGeometry ReadWorldCutouts();
+
+// Valid only for the current display-list replay on the publishing context.
+struct WorldFogSun {
+    ID3D11DeviceContext* context = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> depth;
+    std::array<std::array<float, 4>, 4> projection{};
+    std::array<float, 4> radiance{};
+    bool unoccluded = false;
+};
+inline thread_local WorldFogSun worldFogSun;
 #endif
 } // namespace Fast
 #endif
