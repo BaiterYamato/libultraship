@@ -7,6 +7,9 @@
 #include "imconfig.h"
 #include "fast/toon_shading.h"
 
+struct FastFogVolume;
+struct FastFogFlow;
+
 namespace Fast {
 struct ShaderProgram;
 
@@ -90,6 +93,9 @@ class GfxRenderingAPI {
     virtual std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;
     virtual void* GetFramebufferTextureId(int fbId) = 0;
+    virtual bool SupportsFogVolume() const { return false; }
+    virtual bool SupportsFogFlow() const { return false; }
+    virtual void DrawFogVolume(const FastFogVolume&, const FastFogFlow*) {}
     virtual void SelectTextureFb(int fbId) = 0;
     virtual void DeleteTexture(uint32_t texId) = 0;
     virtual void SetTextureFilter(FilteringMode mode) = 0;

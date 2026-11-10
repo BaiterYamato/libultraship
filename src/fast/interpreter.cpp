@@ -12,6 +12,8 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <mutex>
 #include <any>
 #include <map>
 #include <set>
@@ -30,6 +32,9 @@
 #include <string>
 
 #include "fast/interpreter.h"
+#include "fast/fog_volume.h"
+#include "fast/world_postprocess.h"
+#include <atomic>
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -46,6 +51,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifdef ENABLE_DX11
+#include "fast/backends/gfx_direct3d_common.h"
+#endif
 #endif
 
 std::stack<std::string> currentDir;
@@ -72,6 +80,52 @@ std::stack<std::string> currentDir;
     ((mFbActive ? activeFb->second.applied_height : dims.height) / (2.0f * HALF_SCREEN_HEIGHT(activeFb)))
 
 #define TEXTURE_CACHE_MAX_SIZE 8192 // SOH [Unbound] was 1024
+
+namespace {
+struct FogSnapshot {
+    uint32_t ticket = 0;
+    FastFogVolume volume{};
+    Mtx* viewing = nullptr;
+    Mtx* projection = nullptr;
+    bool hasFlow = false;
+    FastFogFlow flow{};
+};
+
+// Retain enough recent frames for replay and interpolation. Display lists
+// carry a ticket, never a raw address supplied by an archive.
+std::mutex gFogSnapshotMutex;
+std::array<FogSnapshot, 32> gFogSnapshots{};
+uint32_t gFogTicket = 0;
+
+bool ReadFogSnapshot(uint32_t ticket, FastFogVolume& volume, FastFogFlow& flow, bool& hasFlow,
+                     Mtx*& viewing, Mtx*& projection) {
+    if (ticket == 0) return false;
+    const std::lock_guard lock(gFogSnapshotMutex);
+    const auto& entry = gFogSnapshots[ticket % gFogSnapshots.size()];
+    if (entry.ticket != ticket) return false;
+    volume = entry.volume;
+    viewing = entry.viewing;
+    projection = entry.projection;
+    hasFlow = entry.hasFlow;
+    if (hasFlow) flow = entry.flow;
+    return true;
+}
+} // namespace
+
+extern "C" uint32_t FastQueueFogVolume(const FastFogVolume* volume, const FastFogFlow* flow,
+                                       const void* viewing, const void* projection) {
+    if (!volume) return 0;
+    const std::lock_guard lock(gFogSnapshotMutex);
+    if (++gFogTicket == 0) ++gFogTicket;
+    auto& entry = gFogSnapshots[gFogTicket % gFogSnapshots.size()];
+    entry.ticket = gFogTicket;
+    entry.volume = *volume;
+    entry.viewing = const_cast<Mtx*>(static_cast<const Mtx*>(viewing));
+    entry.projection = const_cast<Mtx*>(static_cast<const Mtx*>(projection));
+    entry.hasFlow = flow != nullptr;
+    if (flow) entry.flow = *flow;
+    return gFogTicket;
+}
 
 namespace Fast {
 
@@ -137,6 +191,73 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
+namespace {
+struct WorldGeometryCapture {
+    bool armed = false;
+    bool overflow = false;
+    std::vector<std::array<float, 3>> vertices;
+    bool transmissionArmed = false;
+    bool transmissionOverflow = false;
+    uint16_t transmissionScene = 0;
+    std::array<bool, MAX_VERTICES> transmissionVertices{};
+    std::vector<WorldTransmissionTriangle> transmission;
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    std::vector<float> cutoutVertices;
+    std::vector<WorldCutoutBatch> cutoutBatches;
+    unsigned pendingOffset = 0;
+    unsigned stride = 0;
+    std::array<bool, 2> linear{};
+#endif
+};
+thread_local WorldGeometryCapture worldGeometry;
+std::atomic<WorldMaterialMatcher> worldMaterialMatcher = nullptr;
+
+#if defined(_WIN32) && defined(ENABLE_DX11)
+constexpr unsigned MaxWorldCutoutBatches = 512;
+static_assert(WorldCutoutTextureSlots == SHADER_MAX_TEXTURES);
+
+void CaptureCutoutBatch(GfxRenderingAPI* renderer) {
+    auto& capture = worldGeometry;
+    const auto end = static_cast<unsigned>(capture.cutoutVertices.size());
+    if (end == capture.pendingOffset) return;
+    auto* dx11 = dynamic_cast<GfxRenderingAPIDX11*>(renderer);
+    if (!dx11 || capture.cutoutBatches.size() == MaxWorldCutoutBatches) {
+        capture.cutoutVertices.resize(capture.pendingOffset);
+        return;
+    }
+
+    auto& batch = capture.cutoutBatches.emplace_back();
+    batch.offset = capture.pendingOffset;
+    batch.count = (end - batch.offset) / capture.stride;
+    batch.stride = capture.stride;
+    capture.pendingOffset = end;
+    auto& ctx = *dx11->mContext.Get();
+    ctx.VSGetShader(batch.vertex.GetAddressOf(), nullptr, nullptr);
+    ctx.PSGetShader(batch.pixel.GetAddressOf(), nullptr, nullptr);
+    ctx.IAGetInputLayout(batch.layout.GetAddressOf());
+    std::array<ID3D11ShaderResourceView*, WorldCutoutTextureSlots> views{};
+    std::array<ID3D11SamplerState*, WorldCutoutTextureSlots> samplers{};
+    ctx.PSGetShaderResources(0, static_cast<UINT>(views.size()), views.data());
+    ctx.PSGetSamplers(0, static_cast<UINT>(samplers.size()), samplers.data());
+    for (unsigned i = 0; i < views.size(); ++i) {
+        batch.views[i].Attach(views[i]);
+        batch.samplers[i].Attach(samplers[i]);
+    }
+    // The three-point filter uses the actual uploaded texture size and the RDP linear flag.
+    for (unsigned i = 0; i < batch.filter.size(); ++i) {
+        if (!batch.views[i]) continue;
+        Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        batch.views[i]->GetResource(resource.GetAddressOf());
+        if (FAILED(resource.As(&texture))) continue;
+        D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+        batch.filter[i] = {desc.Width, desc.Height, capture.linear[i] ? 1u : 0u, 0u};
+    }
+}
+#endif
+} // namespace
+
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
@@ -144,6 +265,9 @@ void Interpreter::Flush() {
         // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
         mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        CaptureCutoutBatch(mRapi);
+#endif
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -1549,33 +1673,30 @@ extern "C" void Fast_SetQuantizeFloatMtx(bool on) {
     sQuantizeFloatMtx = on;
 }
 
+bool TryReadInterpolatedMatrix(const Interpreter& interpreter, const void* key, float (&matrix)[4][4]) {
+    const auto& replacements = *interpreter.mCurMtxReplacements;
+    const auto it = replacements.find(static_cast<Mtx*>(const_cast<void*>(key)));
+    if (it == replacements.end()) return false;
+#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
+    // Float matrices only need the original fixed-point quantization in vanilla mode.
+    if (!sQuantizeFloatMtx) {
+        memcpy(matrix, it->second.mf, sizeof(matrix));
+        return true;
+    }
+#endif
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            const int fixed = static_cast<int>(it->second.mf[i][j] * 65536.0f);
+            matrix[i][j] = fixed * (1.0f / 65536.0f);
+        }
+    }
+    return true;
+}
+
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
-    if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
-#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
-        // Float matrices: no fixed-point quantisation (the int cast below overflows past +/-32767).
-        if (sQuantizeFloatMtx) {
-            for (int i = 0; i < 4; i++) {
-                for (int j = 0; j < 4; j++) {
-                    float v = it->second.mf[i][j];
-                    int as_int = (int)(v * 65536.0f);
-                    matrix[i][j] = as_int * (1.0f / 65536.0f);
-                }
-            }
-        } else {
-            memcpy(matrix, it->second.mf, sizeof(matrix));
-        }
-#else
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                float v = it->second.mf[i][j];
-                int as_int = (int)(v * 65536.0f);
-                matrix[i][j] = as_int * (1.0f / 65536.0f);
-            }
-        }
-#endif
-    } else {
+    if (!TryReadInterpolatedMatrix(*this, addr, matrix)) {
 #if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
         // For a modified GBI where fixed point values are replaced with floats
         memcpy(matrix, addr, sizeof(matrix));
@@ -1659,6 +1780,29 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
     }
 }
 
+std::span<const std::array<float, 3>> ReadWorldGeometry() {
+    return worldGeometry.overflow ? std::span<const std::array<float, 3>>{} : worldGeometry.vertices;
+}
+
+void SetWorldMaterialMatcher(WorldMaterialMatcher matcher) {
+    worldMaterialMatcher.store(matcher);
+}
+
+std::span<const WorldTransmissionTriangle> ReadWorldTransmission() {
+    return worldGeometry.transmissionOverflow ? std::span<const WorldTransmissionTriangle>{}
+                                              : worldGeometry.transmission;
+}
+
+#ifdef _WIN32
+WorldCutoutGeometry ReadWorldCutouts() {
+#ifdef ENABLE_DX11
+    return {worldGeometry.cutoutVertices, worldGeometry.cutoutBatches};
+#else
+    return {};
+#endif
+}
+#endif
+
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
@@ -1687,6 +1831,15 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         }
 
         x = AdjXForAspectRatio(x);
+
+        if (dest_index < MAX_VERTICES) worldGeometry.transmissionVertices[dest_index] = worldGeometry.transmissionArmed;
+        if (worldGeometry.armed || worldGeometry.transmissionArmed ||
+            ((mRsp->geometry_mode & G_LIGHTING) && (mRdp->toon || mRdp->toon_shadow))) {
+            const auto& mv = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+            d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
+            d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
+            d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
+        }
 
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
@@ -1781,13 +1934,6 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // shader renormalizes, so uniform limb scale is harmless.)
             if (mRdp->toon || mRdp->toon_shadow) {
                 float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-                // SOH [Enhancement] Actor shadow: world-space position (same object->world transform as the
-                // normal). The shadow pass flattens these onto the ground plane; the camera lives in the
-                // projection matrix, so world pos x P_matrix later yields clip space. Computed whenever the
-                // shadow is armed, so shadows work even when the cel relight (mRdp->toon) is off.
-                d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
-                d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
-                d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
                 if (mRdp->toon) {
                     d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
                     d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
@@ -1898,6 +2044,55 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+
+    // Capture before camera triangle clipping and backface culling. Depth-writing opaque triangles have a
+    // usable silhouette without replaying the N64 combiner. Alpha-tested materials need a separate path.
+    const bool shadowCandidate = worldGeometry.armed && !mFbActive && !is_rect &&
+        vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES && vtx3_idx < MAX_VERTICES &&
+        (mRsp->geometry_mode & G_ZBUFFER) && (mRdp->other_mode_l & (Z_CMP | Z_UPD)) == (Z_CMP | Z_UPD) &&
+        (mRdp->other_mode_l & (G_ZS_PRIM | FORCE_BL)) == 0 && (mRdp->other_mode_l & ZMODE_DEC) != ZMODE_DEC;
+    if (shadowCandidate && !worldGeometry.overflow &&
+        (mRdp->other_mode_l & (CVG_X_ALPHA | (3U << G_MDSFT_ALPHACOMPARE))) == 0) {
+        if (worldGeometry.vertices.size() == MaxWorldGeometryVertices) {
+            worldGeometry.overflow = true;
+        } else {
+            for (const auto* v : v_arr) worldGeometry.vertices.push_back({v->wx, v->wy, v->wz});
+        }
+    }
+
+    // A lamp can illuminate a receiver through a pane outside the camera frustum.
+    if (worldGeometry.transmissionArmed && !worldGeometry.transmissionOverflow && !mFbActive && !is_rect &&
+        vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES && vtx3_idx < MAX_VERTICES &&
+        worldGeometry.transmissionVertices[vtx1_idx] && worldGeometry.transmissionVertices[vtx2_idx] &&
+        worldGeometry.transmissionVertices[vtx3_idx] && (mRsp->geometry_mode & G_ZBUFFER) &&
+        (mRdp->other_mode_l & (Z_CMP | FORCE_BL | G_ZS_PRIM)) == (Z_CMP | FORCE_BL)) {
+        if (const auto match = worldMaterialMatcher.load()) {
+            const bool twoCycles = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
+            const auto baseTile = mRdp->first_tile_index;
+            for (unsigned i = 0; i < 2; ++i) {
+                const auto tile = baseTile + (baseTile >= 2 ? 0 : i);
+                const auto& resource = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata.resource;
+                if (!resource) continue;
+                auto path = GetBaseTexturePath(resource->GetInitData()->Path);
+                if (path.starts_with("__OTR__")) path.remove_prefix(7);
+                if (!match(worldGeometry.transmissionScene, path)) continue;
+                const auto* combiner = LookupOrCreateColorCombiner(
+                    {mRdp->combine_mode, twoCycles ? SHADER_OPT(_2CYC) : 0u});
+                if (!combiner->usedTextures[i]) continue;
+                if (worldGeometry.transmission.size() == MaxWorldTransmissionTriangles) {
+                    worldGeometry.transmissionOverflow = true;
+                    break;
+                }
+                auto& triangle = worldGeometry.transmission.emplace_back();
+                triangle.texture = path;
+                for (unsigned vertex = 0; vertex < 3; ++vertex) {
+                    const auto* v = v_arr[vertex];
+                    triangle.vertices[vertex] = {v->wx, v->wy, v->wz};
+                }
+                break;
+            }
+        }
+    }
 
     // SOH [Enhancement] Actor shadow: while the shadow pass is armed for this object, record its world-space
     // triangles here (before any culling, so the whole silhouette is captured). FlushToonShadow drains them
@@ -2224,6 +2419,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    const size_t cutoutStart = mBufVboLen;
+#endif
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (clip_parameters.z_is_from_0_to_1) {
@@ -2412,6 +2610,29 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // mBufVbo[mBufVboLen++] = color->a / 255.0f;
     }
 
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    // Keep the original packed attributes. Only the first four floats will be projected from the light.
+    if (shadowCandidate && use_alpha && (texture_edge || alpha_threshold) && !use_noise && !invisible &&
+        (usedTextures[0] || usedTextures[1]) && worldGeometry.cutoutBatches.size() < MaxWorldCutoutBatches) {
+        auto& capture = worldGeometry;
+        const size_t size = mBufVboLen - cutoutStart;
+        if (capture.cutoutVertices.size() + size <= MaxWorldCutoutFloats) {
+            capture.stride = static_cast<unsigned>(size / 3);
+            for (unsigned i = 0; i < capture.linear.size(); ++i) {
+                const auto* node = mRenderingState.mTextures[i];
+                capture.linear[i] = node && node->second.linear_filter;
+            }
+            const auto first = capture.cutoutVertices.size();
+            capture.cutoutVertices.insert(capture.cutoutVertices.end(), mBufVbo + cutoutStart, mBufVbo + mBufVboLen);
+            for (unsigned i = 0; i < 3; ++i) {
+                auto* vertex = capture.cutoutVertices.data() + first + i * capture.stride;
+                vertex[0] = v_arr[i]->wx;
+                vertex[1] = v_arr[i]->wy;
+                vertex[2] = v_arr[i]->wz;
+            }
+        }
+    }
+#endif
     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
         // if (++mBufVbo_num_tris == 1) {
         Flush();
@@ -4285,6 +4506,33 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
     return false;
 }
 
+static WorldPostProcess worldPostProcess = nullptr;
+
+void SetWorldPostProcess(WorldPostProcess callback) {
+    worldPostProcess = callback;
+}
+
+static bool gfx_world_postprocess(F3DGfx** command) {
+    auto gfx = mInstance.lock();
+    switch ((*command)->words.w0 & 0xFFu) {
+        case FAST_WORLD_GEOMETRY_BEGIN: worldGeometry.armed = !gfx->mFbActive; return false;
+        case FAST_WORLD_GEOMETRY_END: worldGeometry.armed = false; return false;
+        case FAST_WORLD_TRANSMISSION_BEGIN:
+            worldGeometry.transmissionArmed = !gfx->mFbActive;
+            worldGeometry.transmissionScene = static_cast<uint16_t>((*command)->words.w1);
+            return false;
+        case FAST_WORLD_TRANSMISSION_END: worldGeometry.transmissionArmed = false; return false;
+    }
+    worldGeometry.armed = false;
+    worldGeometry.transmissionArmed = false;
+    if (worldPostProcess && !gfx->mFbActive) {
+        gfx->FlushToonShadow();
+        gfx->Flush();
+        worldPostProcess(*gfx, static_cast<uint32_t>((*command)->words.w1));
+    }
+    return false;
+}
+
 bool gfx_push_shader(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -5125,6 +5373,55 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
 }
 
 // SOH [Enhancement] World light casting: set the stencil mode for the stencil light-volume technique.
+bool gfx_draw_fog_volume(F3DGfx** cmd0) {
+    auto* gfx = mInstance.lock().get();
+    FastFogVolume volume{};
+    thread_local FastFogFlow flow;
+    bool hasFlow = false;
+    Mtx* viewing = nullptr;
+    Mtx* projection = nullptr;
+    if (ReadFogSnapshot(static_cast<uint32_t>((*cmd0)->words.w1), volume, flow, hasFlow, viewing, projection)) {
+        const auto& matrices = *gfx->mCurMtxReplacements;
+        if (const auto it = matrices.find(viewing); it != matrices.end()) {
+            const auto& m = it->second.mf;
+            // Linear interpolation of the view matrix does not preserve an orthonormal basis.
+            float cofactors[3][3];
+            for (int axis = 0; axis < 3; ++axis) {
+                const int j = (axis + 1) % 3, k = (axis + 2) % 3;
+                for (int i = 0; i < 3; ++i) {
+                    const int a = (i + 1) % 3, b = (i + 2) % 3;
+                    cofactors[axis][i] = m[a][j] * m[b][k] - m[b][j] * m[a][k];
+                }
+            }
+            const float determinant = m[0][0] * cofactors[0][0] + m[1][0] * cofactors[0][1] +
+                                      m[2][0] * cofactors[0][2];
+            if (std::abs(determinant) > 0.0001f) {
+                for (int i = 0; i < 3; ++i) {
+                    volume.right[i] = cofactors[0][i] / determinant;
+                    volume.up[i] = cofactors[1][i] / determinant;
+                    volume.forward[i] = -cofactors[2][i] / determinant;
+                    volume.eye[i] = -m[3][0] * volume.right[i] - m[3][1] * volume.up[i] +
+                                    m[3][2] * volume.forward[i];
+                }
+            }
+        }
+        if (const auto it = matrices.find(projection); it != matrices.end()) {
+            const auto& m = it->second.mf;
+            if (std::abs(m[0][0]) > 0.0001f && std::abs(m[1][1]) > 0.0001f && m[2][3] < 0.0f) {
+                volume.right[3] = -m[2][3] / m[0][0];
+                volume.up[3] = -m[2][3] / m[1][1];
+                volume.depth[0] = m[2][2];
+                volume.depth[1] = m[2][3];
+                volume.depth[2] = m[3][2];
+            }
+        }
+        volume.interpolation = gfx->mInterpolationT;
+        gfx->Flush();
+        gfx->mRapi->DrawFogVolume(volume, hasFlow ? &flow : nullptr);
+    }
+    return false;
+}
+
 // Mirrors the toon-key handler's flush-then-set: the mode change must not retroactively apply to already
 // batched geometry, so flush the pending tris (under the previous mode) before switching.
 bool gfx_set_stencil_handler_custom(F3DGfx** cmd0) {
@@ -5631,6 +5928,8 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },
     { OTR_G_SETTOONSHADOW, { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } },
     { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } },
+    { OPCODE(FAST_GFX_FOG_VOLUME), { "G_DRAW_FOG_VOLUME", gfx_draw_fog_volume } },
+    { OPCODE(FAST_GFX_WORLD_POSTPROCESS), { "G_WORLD_POSTPROCESS", gfx_world_postprocess } },
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } }, // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
@@ -6042,6 +6341,16 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
+    worldGeometry.armed = worldGeometry.overflow = false;
+    worldGeometry.vertices.clear();
+    worldGeometry.transmissionArmed = worldGeometry.transmissionOverflow = false;
+    worldGeometry.transmissionVertices.fill(false);
+    worldGeometry.transmission.clear();
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    worldGeometry.cutoutBatches.clear();
+    worldGeometry.cutoutVertices.clear();
+    worldGeometry.pendingOffset = 0;
+#endif
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();

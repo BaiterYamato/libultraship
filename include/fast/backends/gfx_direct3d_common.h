@@ -4,6 +4,8 @@
 
 #ifdef __cplusplus
 #include "../interpreter.h"
+#include "../fog_volume.h"
+#include <array>
 #include <cstdint>
 #include <string>
 #include "gfx_rendering_api.h"
@@ -129,6 +131,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
     void* GetFramebufferTextureId(int fbId) override;
+    bool SupportsFogVolume() const override { return true; }
+    bool SupportsFogFlow() const override { return true; }
+    void DrawFogVolume(const FastFogVolume& volume, const FastFogFlow* flow) override;
     void SelectTextureFb(int fbId) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
@@ -143,6 +148,142 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     D3D_FEATURE_LEVEL mFeatureLevel;
 
   private:
+    bool CompileFogShader(const char* entry, const char* profile, ID3DBlob** blob, bool multisampled = false);
+    bool InitFogVolume();
+    void UpdateFogSupportRanges(const FastFogVolume& volume, const FastFogFlow& flow, UINT width, UINT height);
+    void UpdateFogLift(const FastFogFlow& flow, FogFlowAction action, UINT width, UINT height);
+    void UpdateFogUpper(const FastFogVolume& volume, FogFlowAction action, UINT width, UINT height);
+    bool InitFogMsaa();
+    bool InitFogLod(UINT width, UINT height, bool multisampled);
+    bool InitFogMsaaCache(UINT width, UINT height);
+    void DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
+                    const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction, ID3D11Query* lowEnd);
+    bool InitFogFlow();
+    bool InitFogVertical();
+    bool InitFogParticles();
+    bool InitFogFieldBlend();
+    ID3D11ShaderResourceView* BlendFogField(ID3D11ShaderResourceView* current, UINT width, UINT height, float fraction);
+    ID3D11ShaderResourceView* UpdateFogFlow(const FastFogVolume& volume, const FastFogFlow& flow,
+                                          FogFlowAction& action, ID3D11Query* particleBegin, bool& particles);
+    void AuditFogFlow(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowCursor cursor,
+                      ID3D11ShaderResourceView* source);
+    void CollectFogTiming();
+    struct FogTiming {
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+        Microsoft::WRL::ComPtr<ID3D11Query> begin;
+        Microsoft::WRL::ComPtr<ID3D11Query> fieldEnd;
+        Microsoft::WRL::ComPtr<ID3D11Query> particleBegin;
+        Microsoft::WRL::ComPtr<ID3D11Query> lowEnd;
+        Microsoft::WRL::ComPtr<ID3D11Query> end;
+        bool advanced = false;
+        bool particles = false;
+        bool reduced = false;
+        bool pending = false;
+    };
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mFogVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogPs, mFogMsaaPs;
+    struct FogLodShaders {
+        Microsoft::WRL::ComPtr<ID3D11PixelShader> low, upscale;
+        bool failed = false;
+    };
+    std::array<FogLodShaders, 2> mFogLodShaders{};
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogTemporalCb;
+    struct FogHistoryTarget {
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
+    };
+    std::array<FogHistoryTarget, 2> mFogHistory{};
+    FogHistoryTarget mFogUniformCache{};
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogUniformPs, mFogCachedUpscalePs;
+    UINT mFogCacheWidth = 0, mFogCacheHeight = 0;
+    bool mFogMsaaCacheFailed = false;
+    FogTemporalConstants mFogLastCamera{};
+    std::array<float, 4> mFogLastDepth{};
+    float mFogLastFieldFraction = 1.0f;
+    D3D11_VIEWPORT mFogLastViewport{};
+    UINT mFogHistoryWidth = 0, mFogHistoryHeight = 0;
+    UINT mFogLodWidth = 0, mFogLodHeight = 0;
+    UINT mFogLastMsaa = 0, mFogReportedMsaa = 0;
+    UINT mFogReportedLights = 0;
+    bool mFogAtmosphereLogged = false;
+    uint64_t mFogFrame = 0, mFogLastFrame = 0, mFogLastStream = 0;
+    int mFogLastFramebuffer = -1, mFogLodMode = -1;
+    unsigned mFogHistoryIndex = 0, mFogHistoryFrames = 0, mFogHistoryResets = 0, mFogReducedReuses = 0;
+    bool mFogLodFailed = false;
+    bool mFogMsaaFailed = false;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFogBlend;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mFogRaster;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mFogDepth;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogGridTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogGridView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogSupportTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogSupportView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogLiftTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogLiftView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogUpperTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogUpperView;
+    std::array<std::array<float, 2>, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogUpperLatest{};
+    bool mFogUpperHasHistory = false, mFogUpperLogged = false;
+    std::array<std::array<float, 2>, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogLiftLatest{};
+    bool mFogLiftCurrent = false, mFogLiftPrevious = false;
+    bool mFogCpuField = false;
+    float mFogDomainX = 0.0f, mFogDomainZ = 0.0f;
+    float mFogStepX = 0.0f, mFogStepZ = 0.0f;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mFogGridSampler;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogNoiseView;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mFogNoiseSampler;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogFlowCS;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogFlowCb, mFogFlowInput;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogFlowInputView;
+    struct FogFlowTexture {
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> target;
+    };
+    std::array<FogFlowTexture, 2> mFogFlowTextures{};
+    std::array<FogFlowTexture, 2> mFogVerticalTextures{};
+    FogFlowTexture mFogBlendedVertical{};
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogVerticalCS;
+    bool mFogVerticalActive = false, mFogVerticalFailed = false, mFogVerticalLogged = false;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogParticleStepCS, mFogParticleDepositCS, mFogParticlePathsCS;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogParticleView;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mFogParticleTarget;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogParticlePathsView;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mFogParticlePathsTarget;
+    std::array<std::pair<float, uint32_t>, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogParticleTopology{};
+    bool mFogParticlePathsReady = false;
+    std::array<FogFlowTexture, 2> mFogParticleFields{};
+    FogFlowTexture mFogBlendedField{};
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogFieldBlendCS;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogFieldBlendCb;
+    bool mFogCanBlend = false, mFogFieldBlendFailed = false, mFogBlendLogged = false;
+    std::array<float, 2> mFogExtinction{};
+    bool mFogExtinctionLogged = false;
+    unsigned mFogParticleSteps = 0;
+    bool mFogParticlesFailed = false, mFogParticlesActive = false;
+    FogFlowCursor mFogFlowCursor{};
+    unsigned mFogFlowIndex = 0;
+    unsigned mFogFlowSteps = 0, mFogFlowSeeds = 0, mFogFlowReuses = 0;
+    bool mFogFlowFailed = false;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogAuditStaging;
+    Microsoft::WRL::ComPtr<ID3D11Query> mFogAuditReady;
+    FogFlowCursor mFogAuditCursor{}, mFogAuditPrevious{};
+    std::array<uint8_t, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogAuditMask{};
+    std::array<float, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogAuditDensity{}, mFogAuditSpeed{};
+    float mFogAuditRestDensity = 1.0f;
+    bool mFogAuditPending = false, mFogAuditFailed = false;
+    std::array<FogTiming, 4> mFogTiming{};
+    std::array<double, 120> mFogSamples{};
+    std::array<double, 120> mFogFieldSamples{}, mFogRaymarchSamples{};
+    std::array<double, 120> mFogParticleSamples{};
+    std::array<double, 120> mFogLowSamples{}, mFogUpscaleSamples{};
+    size_t mFogSampleCount = 0;
+    size_t mFogFlowSampleCount = 0;
+    size_t mFogParticleSampleCount = 0;
+    size_t mFogLodSampleCount = 0;
+    unsigned mFogTimingReports = 0;
+    bool mFogInitFailed = false;
+    bool mFogGridLogged = false;
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
 

@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <cstddef>
+#include <cstring>
 
 #include <map>
 #include <unordered_map>
@@ -26,6 +28,8 @@
 #include "ship/resource/factory/ShaderFactory.h"
 #include "fast/interpreter.h"
 #include "ship/config/ConsoleVariable.h"
+#include "fast/fog_volume.h"
+#include "fog_volume_glsl.h"
 
 namespace Fast {
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
@@ -804,6 +808,198 @@ void GfxRenderingAPIOGL::Init() {
     mPixelDepthRbSize = 1;
 
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
+#if !USE_OPENGLES
+    int major = 0, minor = 0;
+    if (const auto* version = glGetString(GL_VERSION)) {
+        std::sscanf(reinterpret_cast<const char*>(version), "%d.%d", &major, &minor);
+    }
+    mFogSupported = major > 3 || (major == 3 && minor >= 2);
+    if (major >= 4) glGetIntegerv(GL_MAX_DEPTH_TEXTURE_SAMPLES, &mFogMaxSamples);
+#endif
+}
+
+bool GfxRenderingAPIOGL::SupportsFogVolume() const {
+#if !USE_OPENGLES
+    const auto samples = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_MSAA_VALUE, 1);
+    return mFogSupported && !mFogFailed && std::min(samples, mMaxMsaaLevel) <= mFogMaxSamples;
+#else
+    return false;
+#endif
+}
+
+#if !USE_OPENGLES
+namespace {
+GLuint CompileFogStage(GLenum stage, const char* version, const char* source) {
+    const GLuint shader = glCreateShader(stage);
+    const char* parts[]{version, source};
+    glShaderSource(shader, 2, parts, nullptr);
+    glCompileShader(shader);
+    GLint ok = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (ok) return shader;
+    char log[1024]{};
+    glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+    SPDLOG_ERROR("Fast3D OpenGL fog shader: {}", log);
+    glDeleteShader(shader);
+    return 0;
+}
+
+GLuint CreateFogProgram(bool multisampled) {
+    const char* version = multisampled ? "#version 400\n#define FOG_MSAA\n" : "#version 150\n";
+    const GLuint vs = CompileFogStage(GL_VERTEX_SHADER, version, FogVertexGLSL);
+    const GLuint fs = CompileFogStage(GL_FRAGMENT_SHADER, version, FogFragmentGLSL);
+    GLuint program = 0;
+    if (vs && fs) {
+        program = glCreateProgram();
+        glAttachShader(program, vs);
+        glAttachShader(program, fs);
+        glLinkProgram(program);
+        GLint ok = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[1024]{};
+            glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+            SPDLOG_ERROR("Fast3D OpenGL fog program: {}", log);
+            glDeleteProgram(program);
+            program = 0;
+        }
+    }
+    if (vs) glDeleteShader(vs);
+    if (fs) glDeleteShader(fs);
+    return program;
+}
+} // namespace
+
+bool GfxRenderingAPIOGL::PrepareFogDepth(const FramebufferOGL& fb) {
+    if (mFogDepth && mFogWidth == fb.width && mFogHeight == fb.height && mFogSamples == fb.msaa_level) return true;
+    if (!mFogDepthFb) glGenFramebuffers(1, &mFogDepthFb);
+    if (mFogDepth) glDeleteTextures(1, &mFogDepth);
+    glGenTextures(1, &mFogDepth);
+    const GLenum target = fb.msaa_level > 1 ? GL_TEXTURE_2D_MULTISAMPLE : GL_TEXTURE_2D;
+    glBindTexture(target, mFogDepth);
+    if (fb.msaa_level > 1) {
+        glTexImage2DMultisample(target, fb.msaa_level, GL_DEPTH24_STENCIL8, fb.width, fb.height, GL_TRUE);
+    } else {
+        glTexImage2D(target, 0, GL_DEPTH24_STENCIL8, fb.width, fb.height, 0, GL_DEPTH_STENCIL,
+                     GL_UNSIGNED_INT_24_8, nullptr);
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, mFogDepthFb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, target, mFogDepth, 0);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        SPDLOG_ERROR("Fast3D OpenGL fog depth framebuffer incomplete for {} samples", fb.msaa_level);
+        return false;
+    }
+    mFogWidth = fb.width;
+    mFogHeight = fb.height;
+    mFogSamples = fb.msaa_level;
+    return true;
+}
+#endif
+
+void GfxRenderingAPIOGL::DrawFogVolume(const FastFogVolume& volume, const FastFogFlow*) {
+#if !USE_OPENGLES
+    const auto& fb = mFrameBuffers[mCurrentFrameBuffer];
+    if (!mFogSupported || mFogFailed || !fb.has_depth_buffer || fb.msaa_level > uint32_t(mFogMaxSamples)) return;
+    const bool msaa = fb.msaa_level > 1;
+    const GLenum depthTarget = msaa ? GL_TEXTURE_2D_MULTISAMPLE : GL_TEXTURE_2D;
+    auto& program = mFogPrograms[msaa];
+    if (!program.id) {
+        program.id = CreateFogProgram(msaa);
+        if (!program.id) {
+            mFogFailed = true;
+            return;
+        }
+        program.parameters = glGetUniformLocation(program.id, "parameters[0]");
+        program.view = glGetUniformLocation(program.id, "viewport");
+        program.flipY = glGetUniformLocation(program.id, "flipY");
+    }
+
+    GLint readFb, drawFb, active, oldDepth, oldGrid, oldProgram, oldVao;
+    GLint view[4];
+    glGetIntegerv(GL_VIEWPORT, view);
+    if (view[2] <= 0 || view[3] <= 0) return;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFb);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFb);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(msaa ? GL_TEXTURE_BINDING_2D_MULTISAMPLE : GL_TEXTURE_BINDING_2D, &oldDepth);
+    const bool prepared = PrepareFogDepth(fb);
+    if (prepared) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, drawFb);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mFogDepthFb);
+        const bool scissor = glIsEnabled(GL_SCISSOR_TEST);
+        if (scissor) glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, 0, fb.width, fb.height, 0, 0, fb.width, fb.height, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        if (scissor) glEnable(GL_SCISSOR_TEST);
+    }
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFb);
+    if (!prepared) {
+        mFogFailed = true;
+        glBindTexture(depthTarget, oldDepth);
+        glActiveTexture(active);
+        return;
+    }
+    glBindTexture(depthTarget, mFogDepth);
+    glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldGrid);
+    if (!mFogGrid) {
+        glGenTextures(1, &mFogGrid);
+        glBindTexture(GL_TEXTURE_2D, mFogGrid);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, FAST_FOG_GRID_SIDE, FAST_FOG_GRID_SIDE, 0, GL_RG, GL_FLOAT, nullptr);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, mFogGrid);
+    }
+    if (volume.grid[0] >= 2.0f) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GLsizei(volume.grid[0]), GLsizei(volume.grid[1]), GL_RG, GL_FLOAT,
+                        volume.cells);
+    }
+
+    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &oldVao);
+    if (!mFogVao) glGenVertexArrays(1, &mFogVao);
+    glBindVertexArray(mFogVao);
+    glUseProgram(program.id);
+    glUniform1i(glGetUniformLocation(program.id, "worldDepth"), 0);
+    glUniform1i(glGetUniformLocation(program.id, "fogField"), 1);
+    float parameters[9][4];
+    static_assert(sizeof(parameters) == offsetof(FastFogVolume, cells));
+    std::memcpy(parameters, &volume, sizeof(parameters));
+    glUniform4fv(program.parameters, 9, parameters[0]);
+    glUniform4f(program.view, float(view[0]), float(view[1]), float(view[2]), float(view[3]));
+    glUniform1f(program.flipY, fb.invertY ? -1.0f : 1.0f);
+
+    const bool depth = glIsEnabled(GL_DEPTH_TEST), stencil = glIsEnabled(GL_STENCIL_TEST);
+    const bool blend = glIsEnabled(GL_BLEND);
+    if (depth) glDisable(GL_DEPTH_TEST);
+    if (stencil) glDisable(GL_STENCIL_TEST);
+    if (!blend) glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (!blend) glDisable(GL_BLEND);
+    if (stencil) glEnable(GL_STENCIL_TEST);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    glUseProgram(oldProgram);
+    glBindVertexArray(oldVao);
+    glBindTexture(GL_TEXTURE_2D, oldGrid);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(depthTarget, oldDepth);
+    glActiveTexture(active);
+    if (mFogLastSamples != fb.msaa_level) {
+        SPDLOG_INFO("Fast3D OpenGL fog volume samples={} grid={}x{}", fb.msaa_level, int(volume.grid[0]),
+                    int(volume.grid[1]));
+        mFogLastSamples = fb.msaa_level;
+    }
+#endif
 }
 
 void GfxRenderingAPIOGL::OnResize() {
