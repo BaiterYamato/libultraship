@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <math.h>
 
+#include <cstddef>
 #include <map>
 #include <set>
 #include <string>
@@ -22,6 +23,7 @@
 #endif
 
 #include "ship/config/ConsoleVariable.h"
+#include "ship/controller/controldevice/controller/mapping/keyboard/KeyboardScancodes.h"
 #include "ship/config/Config.h"
 #include "ship/Context.h"
 #include "ship/window/FileDropMgr.h"
@@ -207,14 +209,81 @@ void GfxWindowBackendDXGI::ToggleBorderlessWindowFullScreen(bool enable, bool ca
     }
 }
 
+namespace {
+
+int KeyboardScanCode(WPARAM virtualKey, LPARAM data) {
+    const int scanCode = (data >> 16) & 0x1FF;
+    if (scanCode != 0) {
+        return scanCode;
+    }
+
+    // Some injected or remapped key messages supply only the virtual key.
+    const UINT mapped = MapVirtualKeyW(static_cast<UINT>(virtualKey), MAPVK_VK_TO_VSC_EX);
+    return (mapped & 0xFF) | ((mapped & 0xFF00) == 0xE000 ? 0x100 : 0);
+}
+
+struct AbsoluteMouseSample {
+    int x;
+    int y;
+    int width;
+    int height;
+    bool virtualDesktop;
+};
+
+// Single-threaded by construction, so no lock: the window is created in Init (CreateWindowW) and its messages are
+// only pumped by HandleEvents (PeekMessageW/DispatchMessage), which OTRGlobals.cpp calls from the game loop
+// (menu loop and RunCommands). The writers (WndProc/HandleRawInputBuffered/DecodeMouseDelta) and the clearers
+// (SetMouseCapture from Gui::StartFrame -> UpdateMouseCapture, and Mouse.cpp Start/StopFlyCamera via the
+// OnGameStateMainStart hook) all run on that thread. The only std::thread in the host is OTRAudio_Thread, which
+// never touches the window. If a caller ever moves off this thread, guard this map and mRawMouseDeltaBuf.
+std::map<HANDLE, AbsoluteMouseSample> absoluteMouseSamples;
+
+POINT DecodeMouseDelta(HANDLE device, const RAWMOUSE& mouse) {
+    if (!(mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+        return { mouse.lLastX, mouse.lLastY };
+    }
+
+    const bool virtualDesktop = (mouse.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+    const int width = GetSystemMetrics(virtualDesktop ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
+    const int height = GetSystemMetrics(virtualDesktop ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+    constexpr int kAbsoluteMax = 65535;
+    if (width < 1 || height < 1 || mouse.lLastX < 0 || mouse.lLastX > kAbsoluteMax ||
+        mouse.lLastY < 0 || mouse.lLastY > kAbsoluteMax) {
+        absoluteMouseSamples.erase(device);
+        return {};
+    }
+
+    // A desktop origin cancels when taking the difference of successive points.
+    const AbsoluteMouseSample next{
+        MulDiv(mouse.lLastX, width - 1, kAbsoluteMax),
+        MulDiv(mouse.lLastY, height - 1, kAbsoluteMax),
+        width,
+        height,
+        virtualDesktop,
+    };
+    POINT delta{};
+    const auto previous = absoluteMouseSamples.find(device);
+    if (previous != absoluteMouseSamples.end() && !(mouse.usFlags & MOUSE_ATTRIBUTES_CHANGED) &&
+        previous->second.width == width && previous->second.height == height &&
+        previous->second.virtualDesktop == virtualDesktop) {
+        delta = { next.x - previous->second.x, next.y - previous->second.y };
+    }
+    absoluteMouseSamples.insert_or_assign(device, next);
+    return delta;
+}
+
+} // namespace
+
 void GfxWindowBackendDXGI::OnKeydown(WPARAM wParam, LPARAM lParam) {
-    int key = ((lParam >> 16) & 0x1ff);
+    // Mesmo mapeamento do keyup: o latch do F8 (Fast3dWindow) exige o par down/up com o mesmo código.
+    const int key = wParam == VK_F8 ? Ship::KbScancode::LUS_KB_F8 : KeyboardScanCode(wParam, lParam);
     if (mOnKeyDown != nullptr) {
         mOnKeyDown(key);
     }
 }
 void GfxWindowBackendDXGI::OnKeyup(WPARAM wParam, LPARAM lParam) {
-    int key = ((lParam >> 16) & 0x1ff);
+    // F8 is a window shortcut. Use its virtual key when a remapper omits the scan code.
+    const int key = wParam == VK_F8 ? Ship::KbScancode::LUS_KB_F8 : KeyboardScanCode(wParam, lParam);
     if (mOnKeyUp != nullptr) {
         mOnKeyUp(key);
     }
@@ -343,8 +412,9 @@ void GfxWindowBackendDXGI::HandleRawInputBuffered() {
                 while (count--) {
                     if (input->header.dwType == RIM_TYPEMOUSE) {
                         RAWMOUSE* rawmouse = (RAWMOUSE*)((BYTE*)input + offset);
-                        mRawMouseDeltaBuf.x += rawmouse->lLastX;
-                        mRawMouseDeltaBuf.y += rawmouse->lLastY;
+                        const POINT delta = DecodeMouseDelta(input->header.hDevice, *rawmouse);
+                        mRawMouseDeltaBuf.x += delta.x;
+                        mRawMouseDeltaBuf.y += delta.y;
                     }
                     input = NEXTRAWINPUTBLOCK(input);
                 }
@@ -468,13 +538,14 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
             // At this point the top most message should already be off the queue.
             // So we don't need to get it all, if mouse isn't captured.
             if (self->mIsMouseCaptured && self->mInFocus) {
-                uint32_t size = sizeof(RAWINPUT);
-                RAWINPUT raw[sizeof(RAWINPUT)];
-                GetRawInputData((HRAWINPUT)l_param, RID_INPUT, raw, &size, sizeof(RAWINPUTHEADER));
-
-                if (raw->header.dwType == RIM_TYPEMOUSE) {
-                    self->mRawMouseDeltaBuf.x += raw->data.mouse.lLastX;
-                    self->mRawMouseDeltaBuf.y += raw->data.mouse.lLastY;
+                UINT size = sizeof(RAWINPUT);
+                RAWINPUT raw{};
+                const UINT read = GetRawInputData((HRAWINPUT)l_param, RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER));
+                if (read != static_cast<UINT>(-1) && read >= offsetof(RAWINPUT, data) + sizeof(RAWMOUSE) &&
+                    raw.header.dwType == RIM_TYPEMOUSE) {
+                    const POINT delta = DecodeMouseDelta(raw.header.hDevice, raw.data.mouse);
+                    self->mRawMouseDeltaBuf.x += delta.x;
+                    self->mRawMouseDeltaBuf.y += delta.y;
                 }
             }
             // The rest still needs to use that, to get them off the queue.
@@ -496,6 +567,7 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
             Ship::Context::GetRawInstance()->GetFileDropMgr()->SetDroppedFile(fileName);
             break;
         case WM_DISPLAYCHANGE:
+            absoluteMouseSamples.clear();
             self->monitor_list = GetMonitorList();
             GetMonitorAtCoords(self->monitor_list, self->mPosX, self->mPosY, self->current_width, self->current_height,
                                self->mMonitor);
@@ -509,6 +581,11 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
             }
             break;
         case WM_KILLFOCUS:
+            absoluteMouseSamples.clear();
+            self->mRawMouseDeltaBuf = {};
+            if (self->mOnAllKeysUp != nullptr) {
+                self->mOnAllKeysUp();
+            }
             if (auto ctx = Ship::Context::GetRawInstance(); ctx && ctx->GetConsoleVariables()) {
                 if (!ctx->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
                     ControllerBlockGameInput(ALLOW_BACKGROUND_INPUTS_BLOCK_ID);
@@ -698,6 +775,10 @@ bool GfxWindowBackendDXGI::GetMouseState(uint32_t btn) {
 }
 
 void GfxWindowBackendDXGI::SetMouseCapture(bool capture) {
+    if (mIsMouseCaptured != capture) {
+        absoluteMouseSamples.clear();
+        mRawMouseDeltaBuf = {};
+    }
     mIsMouseCaptured = capture;
     if (capture) {
         ApplyMouseCaptureClip();
@@ -1046,7 +1127,14 @@ void GfxWindowBackendDXGI::CreateFactoryAndDevice(bool debug, int d3d_version, c
     }
     // Try preferred hardware adapter and then try software adapter (WARP), if that fails.
     // Maybe we can try a different renderer (like OpenGL) here first before software?
-    if (!createFunc(self, false) && !createFunc(self, true)) {
+    // Diagnóstico (experimento de memória M35, modo D): LINKSPAN_FORCE_WARP=1 pula o hardware e vai direto ao WARP.
+    // Sem a variável o comportamento é o de sempre. O adaptador escolhido é logado em CreateDeviceFunc.
+    const char* forceWarp = std::getenv("LINKSPAN_FORCE_WARP");
+    const bool forceWarpOn = forceWarp != nullptr && std::strcmp(forceWarp, "1") == 0;
+    if (forceWarpOn) {
+        SPDLOG_INFO("DX11: WARP forçado por LINKSPAN_FORCE_WARP");
+    }
+    if ((forceWarpOn || !createFunc(self, false)) && !createFunc(self, true)) {
         SPDLOG_CRITICAL("Creating D3D renderer failed. Exiting");
         MessageBoxA(self->mWindowBackend->GetWindowHandle(), "Creating D3D renderer failed. Exiting", "Error",
                     MB_OK | MB_ICONERROR);

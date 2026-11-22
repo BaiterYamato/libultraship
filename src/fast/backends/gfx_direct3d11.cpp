@@ -4,12 +4,22 @@
 #include <cstddef>
 #include <cstring>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <vector>
 #include <utility>
 #include <cmath>
 
 #include <map>
 #include <unordered_map>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <stb_image.h>
 
 #include <windows.h>
 #include <versionhelpers.h>
@@ -39,10 +49,14 @@
 
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/interpreter.h"
+#include "fast/labpbr_kokiri.h"
+
+#include <utility>
 #include "fast/fog_volume.h"
 #include "fast/world_postprocess.h"
 #include "fog_field_blend_shader.h"
 #include "fog_volume_shader.h"
+#include <fast/fog_air_profile.h>
 #include "fog_flow_shader.h"
 #include "fog_particle_shader.h"
 #include "spatial_upscale_shader.h"
@@ -62,10 +76,504 @@ using namespace Microsoft::WRL; // For ComPtr
 
 namespace Fast {
 
+static std::string BuildDirect3DShader(size_t& numFloats, const CCFeatures& ccFeatures,
+                                       bool includeRootSignature, bool threePointFiltering, bool useSrgb, bool labPbr);
+
+namespace {
+
+struct KokiriLabPbrMaterialTarget {
+    std::array<ComPtr<ID3D11RenderTargetView>, 2> targets;
+    std::array<ComPtr<ID3D11ShaderResourceView>, 2> views;
+    ID3D11DeviceContext* context = nullptr;
+    ID3D11RenderTargetView* mainTarget = nullptr; // Identity only. Do not retain the swap-chain RTV.
+    ID3D11DepthStencilView* mainDepth = nullptr; // Identity only.
+    uint32_t width = 0, height = 0;
+    DXGI_SAMPLE_DESC samples{};
+    uint64_t replay = 0;
+    bool written = false;
+};
+
+// Failed map loads (missing or invalid _n/_s pair) are retried on the render thread: back off 1, 2, 4... up to 30 s.
+constexpr std::chrono::seconds KokiriLabPbrMapRetryInitial{1};
+constexpr std::chrono::seconds KokiriLabPbrMapRetryMax{30};
+
+struct KokiriLabPbrMaps {
+    ComPtr<ID3D11ShaderResourceView> normal;
+    ComPtr<ID3D11ShaderResourceView> specular;
+    std::chrono::steady_clock::time_point retryAt{};
+    std::chrono::seconds retryDelay = KokiriLabPbrMapRetryInitial;
+    bool loadFailureReported = false;
+};
+
+struct KokiriLabPbrDevice {
+    ID3D11Device* device = nullptr;
+    std::array<KokiriLabPbrMaps, KokiriLabPbrSurfaces.size()> maps;
+    ComPtr<ID3D11Buffer> constantBuffer;
+    ComPtr<ID3D11SamplerState> sampler;
+    std::map<std::pair<uint64_t, uint64_t>, std::optional<ShaderProgramD3D11>> shaders;
+    std::map<const ShaderProgramD3D11*, ComPtr<ID3D11PixelShader>> sampleShaders;
+    // Programs of a replaced device; the renderer may still reference them until the interpreter reloads a shader.
+    std::map<std::pair<uint64_t, uint64_t>, std::optional<ShaderProgramD3D11>> retiredShaders;
+    KokiriLabPbrMaterialTarget material;
+};
+
+using KokiriLabPbrRegistry = std::map<const GfxRenderingAPIDX11*, KokiriLabPbrDevice>;
+// The last renderer releases this registry. A namespace-scope map can be
+// destroyed before the renderer during shutdown across translation units.
+KokiriLabPbrRegistry* kokiriLabPbrDevices = nullptr;
+
+KokiriLabPbrDevice* FindKokiriLabPbrDevice(const GfxRenderingAPIDX11* renderer) {
+    if (!kokiriLabPbrDevices)
+        return nullptr;
+    const auto entry = kokiriLabPbrDevices->find(renderer);
+    return entry == kokiriLabPbrDevices->end() ? nullptr : &entry->second;
+}
+thread_local KokiriLabPbrLighting kokiriLabPbrLighting{};
+thread_local KokiriLabPbrMaterial kokiriLabPbrMaterial = KokiriLabPbrMaterial::None;
+static_assert(sizeof(KokiriLabPbrLighting) == 32);
+
+bool KokiriLabPbrMaterialBufferEnabled() {
+    return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(FAST_KOKIRI_LABPBR_BUFFER_CVAR, 0) != 0;
+}
+
+constexpr const char* KokiriLabPbrMaterialBufferMaxMiBCVar = "gDeveloperTools.KokiriLabPbrMaterialBufferMaxMiB";
+constexpr int32_t KokiriLabPbrMaterialBufferMaxMiBDefault = 1024;
+constexpr uint64_t KokiriLabPbrBytesPerSample = 16 + 8; // R32G32B32A32_FLOAT + R16G16B16A16_FLOAT
+constexpr uint64_t BytesPerMiB = 1024 * 1024;
+
+// The single material target follows the current framebuffer, so alternating framebuffers would recreate it on every
+// switch; log each size/MSAA/outcome once (remembers the last 8 combinations logged). Render thread only.
+bool KokiriLabPbrMaterialLogOnce(const KokiriLabPbrMaterialTarget& material, int outcome) {
+    static std::array<uint64_t, 8> logged{};
+    static size_t next = 0;
+    const uint64_t key = (static_cast<uint64_t>(material.width) << 40) | (static_cast<uint64_t>(material.height) << 16) |
+                         (static_cast<uint64_t>(material.samples.Count) << 4) | static_cast<uint64_t>(outcome) |
+                         (1ull << 63);
+    if (std::find(logged.begin(), logged.end(), key) != logged.end())
+        return false;
+    logged[next] = key;
+    next = (next + 1) % logged.size();
+    return true;
+}
+
+bool CreateKokiriLabPbrMaterialTargets(ID3D11Device& device, KokiriLabPbrMaterialTarget& material) {
+    const uint64_t estimatedBytes = static_cast<uint64_t>(material.width) * material.height *
+                                    std::max<uint32_t>(material.samples.Count, 1) * KokiriLabPbrBytesPerSample;
+    const int32_t maxMiB = std::max(0, Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                                           KokiriLabPbrMaterialBufferMaxMiBCVar, KokiriLabPbrMaterialBufferMaxMiBDefault));
+    if (estimatedBytes > static_cast<uint64_t>(maxMiB) * BytesPerMiB) {
+        if (KokiriLabPbrMaterialLogOnce(material, 1))
+            SPDLOG_WARN("LabPBR Kokiri: buffer de material recusado, {}x{} MSAA {}x pediria ~{} MiB (teto {} MiB). "
+                        "Para permitir, suba a CVar {} (vale ao mudar resolução/MSAA ou reiniciar).",
+                        material.width, material.height, material.samples.Count, estimatedBytes / BytesPerMiB, maxMiB,
+                        KokiriLabPbrMaterialBufferMaxMiBCVar);
+        return false;
+    }
+
+    constexpr std::array formats{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = material.width;
+    desc.Height = material.height;
+    desc.MipLevels = desc.ArraySize = 1;
+    desc.SampleDesc = material.samples;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    decltype(material.targets) targets;
+    decltype(material.views) views;
+    for (size_t i = 0; i < formats.size(); ++i) {
+        desc.Format = formats[i];
+        if (desc.SampleDesc.Count > 1) {
+            constexpr UINT flags = D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET |
+                                   D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
+            UINT support = 0, levels = 0;
+            if (FAILED(device.CheckFormatSupport(desc.Format, &support)) || (support & flags) != flags ||
+                FAILED(device.CheckMultisampleQualityLevels(desc.Format, desc.SampleDesc.Count, &levels)) ||
+                desc.SampleDesc.Quality >= levels) {
+                if (KokiriLabPbrMaterialLogOnce(material, 2))
+                    SPDLOG_WARN("LabPBR Kokiri: formato {} sem suporte a MSAA {}x; buffer de material indisponível.",
+                                static_cast<int>(desc.Format), desc.SampleDesc.Count);
+                return false;
+            }
+        }
+        ComPtr<ID3D11Texture2D> texture;
+        if (FAILED(device.CreateTexture2D(&desc, nullptr, texture.GetAddressOf())) ||
+            FAILED(device.CreateRenderTargetView(texture.Get(), nullptr, targets[i].GetAddressOf())) ||
+            FAILED(device.CreateShaderResourceView(texture.Get(), nullptr, views[i].GetAddressOf()))) {
+            if (KokiriLabPbrMaterialLogOnce(material, 3))
+                SPDLOG_WARN("LabPBR Kokiri: falha ao criar o alvo de material {} ({}x{} MSAA {}x).", i,
+                            material.width, material.height, material.samples.Count);
+            return false;
+        }
+    }
+    material.targets = std::move(targets);
+    material.views = std::move(views);
+    if (KokiriLabPbrMaterialLogOnce(material, 0))
+        SPDLOG_INFO("LabPBR Kokiri: buffer de material alocado, {}x{} MSAA {}x, ~{} MiB.", material.width,
+                    material.height, material.samples.Count, estimatedBytes / BytesPerMiB);
+    return true;
+}
+
+// The shader-pack passes bind their inputs in PS slots 0..PolicromaV3MaxInputs-1 (16), so only those can hold the
+// borrowed views; querying all 128 slots would AddRef/Release 128 times per material draw.
+constexpr UINT KokiriLabPbrMaterialConsumerSlots = 16;
+
+// The borrowed views are PS inputs to the world-pass consumer. Leave their bindings alone if a
+// draw reaches this point while the consumer still has the view bound.
+bool KokiriLabPbrMaterialViewInUse(ID3D11DeviceContext& context, const KokiriLabPbrMaterialTarget& material) {
+    if (!material.views[0] && !material.views[1])
+        return false;
+    std::array<ID3D11ShaderResourceView*, KokiriLabPbrMaterialConsumerSlots> views{};
+    context.PSGetShaderResources(0, static_cast<UINT>(views.size()), views.data());
+    bool inUse = false;
+    for (auto* view : views) {
+        if (view) {
+            inUse |= view == material.views[0].Get() || view == material.views[1].Get();
+            view->Release();
+        }
+    }
+    return inUse;
+}
+
+bool PrepareKokiriLabPbrMaterialTargets(ID3D11DeviceContext& context, ID3D11Device& device,
+                                       KokiriLabPbrMaterialTarget& material, const D3D11_TEXTURE2D_DESC& desc,
+                                       ID3D11RenderTargetView* expectedColor, ID3D11DepthStencilView* expectedDepth,
+                                       ComPtr<ID3D11RenderTargetView>& color, ComPtr<ID3D11DepthStencilView>& depth) {
+    if (desc.Width == 0 || desc.Height == 0 || !expectedColor || !expectedDepth)
+        return false;
+
+    std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets{};
+    context.OMGetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), depth.GetAddressOf());
+    color.Attach(targets[0]);
+    bool hasAdditionalTarget = false;
+    for (size_t i = 1; i < targets.size(); ++i) {
+        if (targets[i]) {
+            hasAdditionalTarget = true;
+            targets[i]->Release();
+        }
+    }
+    if (hasAdditionalTarget || color.Get() != expectedColor || depth.Get() != expectedDepth)
+        return false;
+
+    // Check before anything is released: a target still bound as SRV must not be recreated or bound as RTV.
+    if (KokiriLabPbrMaterialViewInUse(context, material))
+        return false;
+
+    if (material.context != &context || material.width != desc.Width || material.height != desc.Height ||
+        material.samples.Count != desc.SampleDesc.Count || material.samples.Quality != desc.SampleDesc.Quality) {
+        material = {};
+        material.context = &context;
+        material.width = desc.Width;
+        material.height = desc.Height;
+        material.samples = desc.SampleDesc;
+        CreateKokiriLabPbrMaterialTargets(device, material); // a causa da falha é registrada lá
+    }
+    if (!material.targets[0])
+        return false;
+
+    const auto replay = WorldPostProcessReplay();
+    if (material.replay != replay || material.mainTarget != expectedColor || material.mainDepth != expectedDepth) {
+        constexpr float empty[4]{};
+        for (const auto& target : material.targets)
+            context.ClearRenderTargetView(target.Get(), empty);
+        material.replay = replay;
+        material.mainTarget = expectedColor;
+        material.mainDepth = expectedDepth;
+        material.written = false;
+    }
+
+    ID3D11RenderTargetView* outputs[] = {color.Get(), material.targets[0].Get(), material.targets[1].Get()};
+    context.OMSetRenderTargets(ARRAYSIZE(outputs), outputs, depth.Get());
+    return true;
+}
+
+bool LoadKokiriLabPbrMap(ID3D11Device* device, const std::filesystem::path& path,
+                         ID3D11ShaderResourceView** view) {
+    constexpr size_t maxFileBytes = 1024 * 1024;
+    constexpr int maxDimension = 2048;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size < 8 || size > maxFileBytes)
+        return false;
+
+    std::ifstream input(path, std::ios::binary);
+    std::vector<stbi_uc> bytes(static_cast<size_t>(size));
+    if (!input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())) ||
+        input.peek() != EOF || std::memcmp(bytes.data(), "\x89PNG\r\n\x1a\n", 8) != 0)
+        return false;
+
+    const auto length = static_cast<int>(bytes.size());
+    int width = 0, height = 0, channels = 0;
+    if (!stbi_info_from_memory(bytes.data(), length, &width, &height, &channels) ||
+        width < 1 || height < 1 || width > maxDimension || height > maxDimension)
+        return false;
+
+    const std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
+        stbi_load_from_memory(bytes.data(), length, &width, &height, &channels, STBI_rgb_alpha),
+        stbi_image_free);
+    if (!pixels || width < 1 || height < 1 || width > maxDimension || height > maxDimension)
+        return false;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA data{};
+    data.pSysMem = pixels.get();
+    data.SysMemPitch = static_cast<UINT>(width) * 4;
+    ComPtr<ID3D11Texture2D> texture;
+    return SUCCEEDED(device->CreateTexture2D(&desc, &data, texture.GetAddressOf())) &&
+           SUCCEEDED(device->CreateShaderResourceView(texture.Get(), nullptr, view));
+}
+
+bool LoadKokiriLabPbrMaps(ID3D11Device* device, const char* stem, KokiriLabPbrMaps& maps) {
+    const auto appDirectory = Ship::Context::GetAppDirectoryPath();
+    if (appDirectory.empty())
+        return false;
+    const std::u8string utf8Directory(appDirectory.begin(), appDirectory.end());
+    const auto directory = std::filesystem::path(utf8Directory) / "materials";
+    const auto normalPath = directory / (std::string(stem) + "_n.png");
+    const auto specularPath = directory / (std::string(stem) + "_s.png");
+    // Both files must exist before paying for a PNG decode: a lone _n.png would otherwise be decoded and dropped.
+    std::error_code error;
+    if (!std::filesystem::exists(normalPath, error) || !std::filesystem::exists(specularPath, error))
+        return false;
+    ComPtr<ID3D11ShaderResourceView> normal, specular;
+    if (!LoadKokiriLabPbrMap(device, normalPath, normal.GetAddressOf()) ||
+        !LoadKokiriLabPbrMap(device, specularPath, specular.GetAddressOf()))
+        return false;
+
+    maps.normal = std::move(normal);
+    maps.specular = std::move(specular);
+    return true;
+}
+
+bool CreateKokiriLabPbrResources(ID3D11Device* device, KokiriLabPbrDevice& state) {
+    D3D11_BUFFER_DESC constantDesc{};
+    constantDesc.ByteWidth = sizeof(KokiriLabPbrLighting);
+    constantDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ComPtr<ID3D11Buffer> constants;
+    if (FAILED(device->CreateBuffer(&constantDesc, nullptr, constants.GetAddressOf())))
+        return false;
+
+    D3D11_SAMPLER_DESC samplerDesc{};
+    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    samplerDesc.MaxAnisotropy = 1;
+    samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    ComPtr<ID3D11SamplerState> sampler;
+    if (FAILED(device->CreateSamplerState(&samplerDesc, sampler.GetAddressOf())))
+        return false;
+
+    state.constantBuffer = std::move(constants);
+    state.sampler = std::move(sampler);
+    return true;
+}
+
+// Disk cache for D3DCompile. The fog volume shader alone takes ~2.4 s at OPTIMIZATION_LEVEL3 and runs on the boot
+// path; combiner shaders compile mid-game. The bytecode is stored under <app>/cache/fast3d, keyed by everything
+// that reaches the compiler. Calls with an include handler go straight to the compiler.
+pD3DCompile gRawD3DCompile = nullptr;
+decltype(&D3DCreateBlob) gCreateBlob = nullptr;
+std::once_flag gShaderCacheOnce;
+std::filesystem::path gShaderCacheDirectory;
+constexpr char ShaderCacheMagic[8] = { 'L', 'U', 'S', 'C', 'S', 'O', '0', '1' };
+constexpr size_t ShaderCacheMaxBytes = 16u * 1024u * 1024u;
+constexpr size_t ShaderCacheMaxFiles = 2048;
+
+struct ShaderCacheKey {
+    uint64_t a = 14695981039346656037ull;
+    uint64_t b = 0x84222325cbf29ce4ull;
+
+    void Add(const void* data, size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < size; ++i) {
+            a = (a ^ bytes[i]) * 1099511628211ull;
+            b = (b ^ bytes[i]) * 0x100000001b3ull + 0x9e3779b97f4a7c15ull;
+        }
+        for (size_t i = 0; i < sizeof(size); ++i) {
+            const auto c = static_cast<unsigned char>(size >> (8 * i));
+            a = (a ^ c) * 1099511628211ull;
+            b = (b ^ c) * 0x100000001b3ull + 0x9e3779b97f4a7c15ull;
+        }
+    }
+    void Add(const char* text) {
+        Add(text ? text : "", text ? std::strlen(text) : 0);
+    }
+};
+
+void PrepareShaderCache() {
+    try {
+        const auto app = Ship::Context::GetAppDirectoryPath();
+        if (app.empty())
+            return;
+        gShaderCacheDirectory = std::filesystem::path(app) / "cache" / "fast3d";
+        std::error_code error;
+        std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> entries;
+        for (std::filesystem::directory_iterator it(gShaderCacheDirectory, error), end; !error && it != end;
+             it.increment(error)) {
+            if (it->path().extension() == ".cso")
+                entries.emplace_back(it->last_write_time(error), it->path());
+        }
+        if (entries.size() > ShaderCacheMaxFiles) {
+            std::sort(entries.begin(), entries.end());
+            for (size_t i = 0; i + ShaderCacheMaxFiles < entries.size(); ++i)
+                std::filesystem::remove(entries[i].second, error);
+        }
+    } catch (...) { gShaderCacheDirectory.clear(); }
+}
+
+bool LoadCachedShader(const std::filesystem::path& path, const ShaderCacheKey& key, ID3DBlob** code) {
+    std::ifstream file(path, std::ios::binary);
+    char magic[sizeof(ShaderCacheMagic)];
+    uint64_t stored[2]{};
+    uint32_t size = 0;
+    if (!file || !file.read(magic, sizeof(magic)) || std::memcmp(magic, ShaderCacheMagic, sizeof(magic)) != 0 ||
+        !file.read(reinterpret_cast<char*>(stored), sizeof(stored)) || stored[0] != key.a || stored[1] != key.b ||
+        !file.read(reinterpret_cast<char*>(&size), sizeof(size)) || size == 0 || size > ShaderCacheMaxBytes)
+        return false;
+    ComPtr<ID3DBlob> blob;
+    if (FAILED(gCreateBlob(size, blob.GetAddressOf())) ||
+        !file.read(static_cast<char*>(blob->GetBufferPointer()), size) || file.peek() != EOF)
+        return false;
+    *code = blob.Detach();
+    return true;
+}
+
+void StoreCachedShader(const std::filesystem::path& path, const ShaderCacheKey& key, ID3DBlob& code) {
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    if (error || code.GetBufferSize() == 0 || code.GetBufferSize() > ShaderCacheMaxBytes)
+        return;
+    auto temporary = path;
+    temporary += ".tmp" + std::to_string(GetCurrentThreadId());
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        const uint64_t stored[2] = { key.a, key.b };
+        const auto size = static_cast<uint32_t>(code.GetBufferSize());
+        file.write(ShaderCacheMagic, sizeof(ShaderCacheMagic));
+        file.write(reinterpret_cast<const char*>(stored), sizeof(stored));
+        file.write(reinterpret_cast<const char*>(&size), sizeof(size));
+        file.write(static_cast<const char*>(code.GetBufferPointer()), size);
+        if (!file.good()) {
+            file.close();
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::filesystem::rename(temporary, path, error);
+    if (error)
+        std::filesystem::remove(temporary, error);
+}
+
+HRESULT WINAPI CachedD3DCompile(LPCVOID data, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO* macros,
+                                ID3DInclude* include, LPCSTR entry, LPCSTR target, UINT flags, UINT effectFlags,
+                                ID3DBlob** code, ID3DBlob** errors) {
+    std::call_once(gShaderCacheOnce, PrepareShaderCache);
+    if (include || !data || !code || !gCreateBlob || gShaderCacheDirectory.empty())
+        return gRawD3DCompile(data, size, name, macros, include, entry, target, flags, effectFlags, code, errors);
+    ShaderCacheKey key;
+    key.Add("d3dcompiler_47");
+    key.Add(data, size);
+    key.Add(name);
+    for (auto* macro = macros; macro && macro->Name; ++macro) {
+        key.Add(macro->Name);
+        key.Add(macro->Definition);
+    }
+    key.Add(entry);
+    key.Add(target);
+    key.Add(&flags, sizeof(flags));
+    key.Add(&effectFlags, sizeof(effectFlags));
+    char hex[33];
+    std::snprintf(hex, sizeof(hex), "%016llx%016llx", static_cast<unsigned long long>(key.a),
+                  static_cast<unsigned long long>(key.b));
+    const auto path = gShaderCacheDirectory / (std::string(hex) + ".cso");
+    if (LoadCachedShader(path, key, code))
+        return S_OK;
+    const auto result = gRawD3DCompile(data, size, name, macros, include, entry, target, flags, effectFlags, code, errors);
+    if (SUCCEEDED(result) && *code)
+        StoreCachedShader(path, key, **code);
+    return result;
+}
+
+} // namespace
+
+bool PrepareKokiriLabPbr(GfxRenderingAPIDX11& renderer, KokiriLabPbrMaterial material) {
+    const auto index = static_cast<size_t>(material);
+    if (index >= KokiriLabPbrSurfaces.size())
+        return false;
+
+    auto* device = renderer.mDevice.Get();
+    if (!device || !renderer.mContext)
+        return false;
+    if (!kokiriLabPbrDevices)
+        kokiriLabPbrDevices = new KokiriLabPbrRegistry;
+    auto& state = (*kokiriLabPbrDevices)[&renderer];
+    if (state.device != device) {
+        // mShaderProgram/mLastShaderProgram (private to the renderer) can point at nodes of state.shaders. Keep those
+        // nodes alive, since the reset cannot null the pointers; ClearShaderCache drops them for the same reason.
+        auto retired = std::move(state.shaders);
+        state = {};
+        state.retiredShaders = std::move(retired);
+        state.device = device;
+    }
+    auto& maps = state.maps[index];
+    if (maps.normal)
+        return true;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now < maps.retryAt)
+        return false;
+    const auto* stem = KokiriLabPbrSurfaces[index].maps;
+    if ((state.constantBuffer || CreateKokiriLabPbrResources(device, state)) &&
+        LoadKokiriLabPbrMaps(device, stem, maps)) {
+        SPDLOG_INFO("LabPBR Kokiri: mapas locais carregados para {}.", stem);
+        return true;
+    }
+    maps.retryAt = now + maps.retryDelay;
+    maps.retryDelay = std::min(maps.retryDelay * 2, KokiriLabPbrMapRetryMax);
+    if (!maps.loadFailureReported) {
+        SPDLOG_WARN("LabPBR Kokiri indisponível para {}: confira o par _n e _s em materials/.", stem);
+        maps.loadFailureReported = true;
+    }
+    return false;
+}
+
+void SetKokiriLabPbrDraw(KokiriLabPbrMaterial material, const KokiriLabPbrLighting& lighting) {
+    kokiriLabPbrMaterial = material;
+    kokiriLabPbrLighting = lighting;
+}
+
+KokiriLabPbrMaterialViews ReadKokiriLabPbrMaterialBuffer(ID3D11DeviceContext& context,
+                                                       ID3D11RenderTargetView* color, ID3D11DepthStencilView* depth) {
+    if (!kokiriLabPbrDevices || !KokiriLabPbrMaterialBufferEnabled())
+        return {};
+
+    const auto replay = WorldPostProcessReplay();
+    for (const auto& entry : *kokiriLabPbrDevices) {
+        const auto& material = entry.second.material;
+        if (material.written && material.context == &context && material.replay == replay &&
+            material.mainTarget == color && material.mainDepth == depth)
+            return {material.views[0].Get(), material.views[1].Get()};
+    }
+    return {};
+}
+
 static_assert(sizeof(PerDrawCB::Texture) == 16, "R018 HLSL texture constants must occupy one register");
 static_assert(offsetof(PerDrawCB::Texture, mipmaps) == 12, "R018 mipmaps flag must replace the old padding");
 
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
+    if (kokiriLabPbrDevices) {
+        kokiriLabPbrDevices->erase(this);
+        if (kokiriLabPbrDevices->empty()) {
+            delete kokiriLabPbrDevices;
+            kokiriLabPbrDevices = nullptr;
+        }
+    }
 }
 
 GfxRenderingAPIDX11::GfxRenderingAPIDX11(GfxWindowBackendDXGI* backend) {
@@ -227,6 +735,11 @@ void GfxRenderingAPIDX11::Init() {
                       "D3DCompiler_47.dll not found");
     }
     mD3dCompile = (pD3DCompile)GetProcAddress(mCompilerModule, "D3DCompile");
+    // Every compile in this backend goes through the disk cache when D3DCreateBlob is available.
+    gRawD3DCompile = mD3dCompile;
+    gCreateBlob = reinterpret_cast<decltype(&D3DCreateBlob)>(GetProcAddress(mCompilerModule, "D3DCreateBlob"));
+    if (mD3dCompile && gCreateBlob)
+        mD3dCompile = CachedD3DCompile;
 
     // Create D3D11 mDevice
 
@@ -414,17 +927,46 @@ void GfxRenderingAPIDX11::LoadShader(struct ShaderProgram* new_prg) {
 
 void GfxRenderingAPIDX11::ClearShaderCache() {
     mShaderProgramPool.clear();
+    if (auto* state = FindKokiriLabPbrDevice(this)) {
+        state->sampleShaders.clear();
+        state->shaders.clear();
+        state->retiredShaders.clear(); // ponteiros do renderer são anulados abaixo; solta o device antigo
+    }
+    mShaderProgram = nullptr;
+    mLastShaderProgram = nullptr;
 }
 
-struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) try {
+    const auto key = std::make_pair(shader_id0, shader_id1);
+    const bool labPbr = (shader_id1 & KokiriLabPbrShaderBit) != 0;
+    KokiriLabPbrDevice* device = nullptr;
+    std::optional<ShaderProgramD3D11>* materialProgram = nullptr;
+    if (labPbr) {
+        device = FindKokiriLabPbrDevice(this);
+        if (!device || !device->constantBuffer)
+            return nullptr;
+        auto [program, inserted] = device->shaders.try_emplace(key);
+        if (!inserted)
+            return program->second ? reinterpret_cast<ShaderProgram*>(mShaderProgram = &*program->second) : nullptr;
+        materialProgram = &program->second;
+    }
+
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
     char* buf;
     size_t len, numFloats;
 
-    auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
-                                                   mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+    if (labPbr && !cc_features.usedTextures[0])
+        return nullptr;
+    auto shader = BuildDirect3DShader(numFloats, cc_features, false,
+                                     mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode, labPbr);
+    if (labPbr) {
+        if (shader.find("MATERIAL_POS") == std::string::npos)
+            throw std::runtime_error("O soh.o2r não contém o shader LabPBR de Kokiri.");
+        if (numFloats > VBO_MAX_FLOATS_PER_VERTEX)
+            throw std::runtime_error("O layout LabPBR excede o limite de vértices do Fast3D.");
+    }
 
     buf = shader.data();
     len = shader.size();
@@ -442,21 +984,27 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                              vs.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
+        const auto* err = error_blob ? static_cast<const char*>(error_blob->GetBufferPointer()) : nullptr;
+        if (labPbr)
+            throw std::runtime_error(err ? err : "Falha na compilação do vertex shader.");
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw Ship::HResultException(hr, "Vertex shader compilation failed");
     }
 
+    error_blob.Reset();
     hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
                      error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
+        const auto* err = error_blob ? static_cast<const char*>(error_blob->GetBufferPointer()) : nullptr;
+        if (labPbr)
+            throw std::runtime_error(err ? err : "Falha na compilação do pixel shader.");
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw Ship::HResultException(hr, "Pixel shader compilation failed");
     }
 
-    struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
+    ShaderProgramD3D11 candidate{};
+    auto* prg = materialProgram ? &candidate : &mShaderProgramPool[key];
 
     ThrowIfFailed(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
                                               prg->vertex_shader.GetAddressOf()));
@@ -465,7 +1013,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     // Input Layout
 
-    D3D11_INPUT_ELEMENT_DESC ied[16];
+    D3D11_INPUT_ELEMENT_DESC ied[18];
     uint8_t ied_index = 0;
     ied[ied_index++] = {
         "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
@@ -519,6 +1067,10 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         DXGI_FORMAT format = cc_features.opt_alpha ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32_FLOAT;
         ied[ied_index++] = { "INPUT", i, format, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 };
     }
+    if (labPbr) {
+        ied[ied_index++] = { "MATERIAL_POS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT,
+                             D3D11_INPUT_PER_VERTEX_DATA, 0 };
+    }
 
     ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vs->GetBufferPointer(), vs->GetBufferSize(),
                                              prg->input_layout.GetAddressOf()));
@@ -543,6 +1095,12 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     }
 
+    if (labPbr && cc_features.opt_alpha && mFeatureLevel >= D3D_FEATURE_LEVEL_10_1) {
+        // Keep the stock blend state on scene color; material metadata must retain its own alpha.
+        blend_desc.IndependentBlendEnable = true;
+        blend_desc.RenderTarget[1].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        blend_desc.RenderTarget[2].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    }
     ThrowIfFailed(mDevice->CreateBlendState(&blend_desc, prg->blend_state.GetAddressOf()));
 
     // Save some values
@@ -559,11 +1117,42 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     prg->usedTextures[4] = cc_features.used_blend[0];
     prg->usedTextures[5] = cc_features.used_blend[1];
 
+    if (materialProgram) {
+        prg = &materialProgram->emplace(std::move(candidate));
+        if (mFeatureLevel >= D3D_FEATURE_LEVEL_10_1 && shader.find("LINKSPAN_LABPBR_MSAA") != std::string::npos) {
+            constexpr D3D_SHADER_MACRO macros[] = {{"LINKSPAN_LABPBR_MSAA", "1"}, {nullptr, nullptr}};
+            ComPtr<ID3DBlob> sampleCode, diagnostic;
+            ComPtr<ID3D11PixelShader> sampleShader;
+            if (SUCCEEDED(mD3dCompile(buf, len, "LabPBR MSAA", macros, nullptr, "PSMain", "ps_4_1", compile_flags, 0,
+                                     sampleCode.GetAddressOf(), diagnostic.GetAddressOf())) &&
+                SUCCEEDED(mDevice->CreatePixelShader(sampleCode->GetBufferPointer(), sampleCode->GetBufferSize(),
+                                                     nullptr, sampleShader.GetAddressOf()))) {
+                device->sampleShaders.emplace(prg, std::move(sampleShader));
+            } else {
+                SPDLOG_WARN("LabPBR Kokiri: variante MSAA indisponível: {}",
+                            diagnostic ? static_cast<const char*>(diagnostic->GetBufferPointer()) : "CreatePixelShader");
+            }
+        }
+    }
     return (struct ShaderProgram*)(mShaderProgram = prg);
+} catch (const std::exception& error) {
+    if ((shader_id1 & KokiriLabPbrShaderBit) == 0)
+        throw;
+    SPDLOG_WARN("LabPBR Kokiri: variante DX11 recusada, usando o shader original. {}", error.what());
+    return nullptr;
 }
 
 struct ShaderProgram* GfxRenderingAPIDX11::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
-    auto it = mShaderProgramPool.find(std::make_pair(shader_id0, shader_id1));
+    const auto key = std::make_pair(shader_id0, shader_id1);
+    if ((shader_id1 & KokiriLabPbrShaderBit) != 0) {
+        auto* device = FindKokiriLabPbrDevice(this);
+        if (!device)
+            return nullptr;
+        auto& shaders = device->shaders;
+        const auto program = shaders.find(key);
+        return program == shaders.end() || !program->second ? nullptr : reinterpret_cast<ShaderProgram*>(&*program->second);
+    }
+    auto it = mShaderProgramPool.find(key);
     return it == mShaderProgramPool.end() ? nullptr : (struct ShaderProgram*)&it->second;
 }
 
@@ -573,6 +1162,223 @@ void GfxRenderingAPIDX11::ShaderGetInfo(struct ShaderProgram* prg, uint8_t* numI
     *numInputs = p->numInputs;
     usedTextures[0] = p->usedTextures[0];
     usedTextures[1] = p->usedTextures[1];
+}
+
+bool GfxRenderingAPIDX11::IsCutoutTexture(unsigned tile) const {
+    if (tile >= 2 || mCurrentTextureIds[tile] >= mTextures.size())
+        return false;
+    const auto& texture = mTextures[mCurrentTextureIds[tile]];
+    return !texture.is_framebuffer && texture.resource_view && texture.alphaCoverage.IsCutout();
+}
+
+ID3D11PixelShader* GfxRenderingAPIDX11::GetFoliageShadowShader() {
+    auto& program = *mShaderProgram;
+    if (program.foliage_shadow_attempted)
+        return program.foliage_shadow.Get();
+    program.foliage_shadow_attempted = true;
+    CCFeatures features{};
+    gfx_cc_get_features(program.shader_id0, program.shader_id1, &features);
+    // Keep exactly the same input layout/combiner; replace only the shadow cutoff.
+    features.opt_texture_edge = false;
+    features.opt_alpha_threshold = false;
+    size_t floats = 0;
+    auto source = gfx_direct3d_common_build_shader(floats, features, false,
+                                                   mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+    if (floats != program.numFloats)
+        return nullptr;
+    source += R"(
+void PSFoliageShadow(PSInput input, float4 screenSpace : SV_Position) {
+    PSOutput output = PSMain(input, screenSpace);
+    clip(output.color.a - 0.5);
+}
+)";
+    ComPtr<ID3DBlob> code, errors;
+    const auto hr = mD3dCompile(source.data(), source.size(), "foliage.shadow", nullptr, nullptr,
+                               "PSFoliageShadow", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL2, 0,
+                               code.GetAddressOf(), errors.GetAddressOf());
+    if (FAILED(hr) || FAILED(mDevice->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                                                       program.foliage_shadow.GetAddressOf()))) {
+        SPDLOG_WARN("Foliage shadow shader unavailable; skipping this caster: {}",
+                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "CreatePixelShader failed");
+    }
+    return program.foliage_shadow.Get();
+}
+
+ID3D11PixelShader* GfxRenderingAPIDX11::GetFoliageDepthShader(bool multisampled, bool debug) {
+    if (!multisampled && !debug)
+        return GetFoliageShadowShader();
+    auto& program = *mShaderProgram;
+    auto& shader = debug ? program.foliage_depth_debug[multisampled ? 1 : 0] : program.foliage_depth_msaa;
+    auto& attempted = debug ? program.foliage_depth_debug_attempted[multisampled ? 1 : 0]
+                            : program.foliage_depth_msaa_attempted;
+    if (attempted)
+        return shader.Get();
+    attempted = true;
+    CCFeatures features{};
+    gfx_cc_get_features(program.shader_id0, program.shader_id1, &features);
+    features.opt_texture_edge = false;
+    features.opt_alpha_threshold = false;
+    size_t floats = 0;
+    auto source = gfx_direct3d_common_build_shader(floats, features, false,
+                                                   mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+    if (floats != program.numFloats)
+        return nullptr;
+    // Compile only the PS from this source. The VS/layout stay those of the normal draw.
+    // Sample-qualified UV/clamp inputs force sample-frequency shading AND sample-location alpha.
+    // SV_SampleIndex alone would run per sample but still interpolate unqualified UVs at pixel center.
+    if (multisampled) {
+        const auto inputBegin = source.find("struct PSInput {");
+        auto inputEnd = source.find("};", inputBegin);
+        if (inputBegin == std::string::npos || inputEnd == std::string::npos) {
+            SPDLOG_WARN("Foliage depth MSAA: generated PSInput unavailable; skipping depth");
+            return nullptr;
+        }
+        for (auto pos = source.find("float", inputBegin); pos < inputEnd; pos = source.find("float", pos + 12)) {
+            const auto end = source.find(';', pos);
+            if (end == std::string::npos || end >= inputEnd)
+                return nullptr;
+            const auto field = source.substr(pos, end - pos);
+            if (field.find("SV_POSITION") != std::string::npos)
+                continue;
+            source.insert(pos, "sample ");
+            inputEnd += 7;
+        }
+    }
+    if (debug) {
+        source += multisampled ? R"(
+float4 PSFoliageDepth(PSInput input, float4 screenSpace : SV_Position,
+                      uint sampleIndex : SV_SampleIndex) : SV_Target {
+    PSOutput output = PSMain(input, screenSpace);
+    clip(output.color.a - 0.5);
+    return float4(1.0, 0.0, 1.0, 0.5);
+}
+)" : R"(
+float4 PSFoliageDepth(PSInput input, float4 screenSpace : SV_Position) : SV_Target {
+    PSOutput output = PSMain(input, screenSpace);
+    clip(output.color.a - 0.5);
+    return float4(1.0, 0.0, 1.0, 0.5);
+}
+)";
+    } else {
+        source += R"(
+void PSFoliageDepth(PSInput input, float4 screenSpace : SV_Position, uint sampleIndex : SV_SampleIndex) {
+    PSOutput output = PSMain(input, screenSpace);
+    clip(output.color.a - 0.5);
+}
+)";
+    }
+    ComPtr<ID3DBlob> code, errors;
+    const auto hr = mD3dCompile(source.data(), source.size(), debug ? "foliage.depth.debug" : "foliage.depth.msaa",
+                               nullptr, nullptr, "PSFoliageDepth", multisampled ? "ps_4_1" : "ps_4_0",
+                               D3DCOMPILE_OPTIMIZATION_LEVEL2, 0,
+                               code.GetAddressOf(), errors.GetAddressOf());
+    if (FAILED(hr) || FAILED(mDevice->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                                                       shader.GetAddressOf()))) {
+        SPDLOG_WARN("Foliage depth shader unavailable; skipping extra draw: {}",
+                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "CreatePixelShader failed");
+    }
+    return shader.Get();
+}
+
+// Called immediately after DrawTriangles: reuse its uploaded VBO, constants, textures, samplers,
+// layout, viewport and scissor. Never bind a different render target or upload the vertices again.
+void GfxRenderingAPIDX11::DrawFoliageDepth(size_t numTris, int worldFramebuffer) {
+    if (!numTris || mFoliageDepthStateFailed || !mCurrentDepthTest || mCurrentDepthMask ||
+        mCurrentZmodeDecal || mStencilMode != static_cast<int>(StencilMode::Off) ||
+        mCurrentFramebuffer != worldFramebuffer || worldFramebuffer < 0 ||
+        static_cast<size_t>(worldFramebuffer) >= mFrameBuffers.size())
+        return;
+    const auto& fb = mFrameBuffers[worldFramebuffer];
+    ComPtr<ID3D11RenderTargetView> target;
+    ComPtr<ID3D11DepthStencilView> attachment;
+    mContext->OMGetRenderTargets(1, target.GetAddressOf(), attachment.GetAddressOf());
+    if (!fb.has_depth_buffer || !attachment || target.Get() != fb.render_target_view.Get() ||
+        attachment.Get() != fb.depth_stencil_view.Get())
+        return;
+    D3D11_DEPTH_STENCIL_VIEW_DESC attachmentDesc{};
+    attachment->GetDesc(&attachmentDesc);
+    if (attachmentDesc.Flags & D3D11_DSV_READ_ONLY_DEPTH)
+        return;
+    const bool debug = (mFoliageDiagnosticMode & 2) != 0;
+    // Falha do overlay nunca desliga a profundidade normal ao voltar Debug para 0.
+    if (debug && mFoliageDepthDebugBlendFailed)
+        return;
+    auto* pixel = GetFoliageDepthShader(fb.msaa_level > 1, debug);
+    if (!pixel)
+        return;
+
+    ComPtr<ID3D11BlendState> oldBlend;
+    ComPtr<ID3D11DepthStencilState> oldDepth;
+    ComPtr<ID3D11PixelShader> oldPixel;
+    ComPtr<ID3D11RasterizerState> oldRaster;
+    FLOAT blendFactor[4]{};
+    UINT sampleMask = 0, stencilRef = 0;
+    mContext->OMGetBlendState(oldBlend.GetAddressOf(), blendFactor, &sampleMask);
+    mContext->OMGetDepthStencilState(oldDepth.GetAddressOf(), &stencilRef);
+    mContext->PSGetShader(oldPixel.GetAddressOf(), nullptr, nullptr);
+    mContext->RSGetState(oldRaster.GetAddressOf());
+    if (!oldDepth || !oldRaster)
+        return;
+    D3D11_DEPTH_STENCIL_DESC depthDesc{};
+    oldDepth->GetDesc(&depthDesc);
+    if (!depthDesc.DepthEnable || depthDesc.StencilEnable || depthDesc.DepthFunc < D3D11_COMPARISON_NEVER ||
+        depthDesc.DepthFunc > D3D11_COMPARISON_ALWAYS)
+        return;
+    // Clone the ACTUALLY bound comparison, including the upstream stale-decal behavior. Only Z_UPD changes.
+    const auto key = static_cast<unsigned>(depthDesc.DepthFunc);
+    auto& depth = mFoliageDepthStates[key];
+    depthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    D3D11_BLEND_DESC blendDesc{};
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = 0;
+    D3D11_RASTERIZER_DESC rasterDesc{};
+    oldRaster->GetDesc(&rasterDesc);
+    rasterDesc.MultisampleEnable = TRUE;
+    // All fallible creation precedes mutation of pipeline bindings. Failure preserves the normal draw.
+    if ((!mFoliageDepthBlend && FAILED(mDevice->CreateBlendState(&blendDesc, mFoliageDepthBlend.GetAddressOf()))) ||
+        (!depth && FAILED(mDevice->CreateDepthStencilState(&depthDesc, depth.GetAddressOf()))) ||
+        (fb.msaa_level > 1 && mFoliageDepthRasterSource.Get() != oldRaster.Get() &&
+         FAILED(mDevice->CreateRasterizerState(&rasterDesc, mFoliageDepthRaster.ReleaseAndGetAddressOf())))) {
+        mFoliageDepthStateFailed = true;
+        SPDLOG_WARN("Foliage depth states unavailable; skipping extra depth for this device");
+        return;
+    }
+    if (debug && !mFoliageDepthDebugBlend) {
+        D3D11_BLEND_DESC overlay{};
+        auto& rt = overlay.RenderTarget[0];
+        rt.BlendEnable = TRUE;
+        rt.SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        rt.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        rt.BlendOp = D3D11_BLEND_OP_ADD;
+        // Preservar o alfa do destino; escrever somente RGB.
+        rt.SrcBlendAlpha = D3D11_BLEND_ZERO;
+        rt.DestBlendAlpha = D3D11_BLEND_ONE;
+        rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN |
+                                   D3D11_COLOR_WRITE_ENABLE_BLUE;
+        if (FAILED(mDevice->CreateBlendState(&overlay, mFoliageDepthDebugBlend.GetAddressOf()))) {
+            mFoliageDepthDebugBlendFailed = true;
+            SPDLOG_WARN("Foliage depth debug blend unavailable; skipping overlay");
+            return;
+        }
+    }
+    BeginFoliageDepthDraw(fb);
+    if (fb.msaa_level > 1) {
+        mFoliageDepthRasterSource = oldRaster;
+        mContext->RSSetState(mFoliageDepthRaster.Get());
+    }
+    // No alpha-to-coverage: clip decides each geometrically covered sample, without a second coverage mask.
+    mContext->OMSetBlendState(debug ? mFoliageDepthDebugBlend.Get() : mFoliageDepthBlend.Get(),
+                              blendFactor, sampleMask);
+    mContext->OMSetDepthStencilState(depth.Get(), stencilRef);
+    mContext->PSSetShader(pixel, nullptr, 0);
+    mContext->Draw(static_cast<UINT>(numTris * 3), 0);
+    mContext->PSSetShader(oldPixel.Get(), nullptr, 0);
+    mContext->OMSetDepthStencilState(oldDepth.Get(), stencilRef);
+    mContext->OMSetBlendState(oldBlend.Get(), blendFactor, sampleMask);
+    if (fb.msaa_level > 1)
+        mContext->RSSetState(oldRaster.Get());
+    EndFoliageDepthDraw(numTris);
+    // mLast* and mCurrent* still describe the restored normal draw. No cache invalidation required.
 }
 
 uint32_t GfxRenderingAPIDX11::NewTexture() {
@@ -607,6 +1413,9 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     TextureData* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
     texture_data->width = width;
     texture_data->height = height;
+    // All ImportTexture* decoders converge here. Recomputed only on upload/cache miss,
+    // also when the feature is off so a live 0 -> 1 toggle needs no texture reimport.
+    texture_data->alphaCoverage = AlphaCutout::Analyze(rgba32_buf, size_t(width) * height);
 
     D3D11_TEXTURE2D_DESC texture_desc;
     ZeroMemory(&texture_desc, sizeof(D3D11_TEXTURE2D_DESC));
@@ -963,6 +1772,63 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
 
+    if ((mShaderProgram->shader_id1 & KokiriLabPbrShaderBit) != 0) {
+        const auto selected = std::exchange(kokiriLabPbrMaterial, KokiriLabPbrMaterial::None);
+        auto* device = FindKokiriLabPbrDevice(this);
+        KokiriLabPbrMaterialTarget* materialTarget = nullptr;
+        ID3D11PixelShader* sampleShader = nullptr;
+        ComPtr<ID3D11RenderTargetView> oldColor;
+        ComPtr<ID3D11DepthStencilView> oldDepth;
+        if (device && device->constantBuffer && selected != KokiriLabPbrMaterial::None) {
+            auto& material = *device;
+            const auto index = static_cast<size_t>(selected);
+            const auto& maps = material.maps[index];
+            const bool materialBlendSupported = (mShaderProgram->shader_id1 & SHADER_OPT(ALPHA)) == 0 ||
+                                                mFeatureLevel >= D3D_FEATURE_LEVEL_10_1;
+            if (materialBlendSupported && KokiriLabPbrMaterialBufferEnabled() && mCurrentDepthTest && mCurrentDepthMask &&
+                mCurrentFramebuffer >= 0 && static_cast<size_t>(mCurrentFramebuffer) < mFrameBuffers.size()) {
+                const auto& fb = mFrameBuffers[mCurrentFramebuffer];
+                const auto& color = mTextures[fb.texture_id];
+                const auto sample = material.sampleShaders.find(mShaderProgram);
+                if (fb.has_depth_buffer && color.texture &&
+                    (fb.msaa_level == 1 || (fb.msaa_level == 4 && sample != material.sampleShaders.end()))) {
+                    D3D11_TEXTURE2D_DESC desc{};
+                    color.texture->GetDesc(&desc);
+                    if (PrepareKokiriLabPbrMaterialTargets(*mContext.Get(), *mDevice.Get(), material.material, desc,
+                                                         fb.render_target_view.Get(), fb.depth_stencil_view.Get(),
+                                                         oldColor, oldDepth)) {
+                        materialTarget = &material.material;
+                        if (fb.msaa_level == 4)
+                            sampleShader = sample->second.Get();
+                    }
+                }
+            }
+            ID3D11ShaderResourceView* views[2] = { maps.normal.Get(), maps.specular.Get() };
+            auto lighting = kokiriLabPbrLighting;
+            lighting.eye[3] = materialTarget ? 1.0f : 0.0f;
+            lighting.sun[3] = KokiriLabPbrSurfaces[index].clampT ? 1.0f : 0.0f;
+            mContext->UpdateSubresource(material.constantBuffer.Get(), 0, nullptr, &lighting, 0, 0);
+            mContext->PSSetConstantBuffers(4, 1, material.constantBuffer.GetAddressOf());
+            mContext->PSSetShaderResources(6, 2, views);
+            mContext->PSSetSamplers(6, 1, material.sampler.GetAddressOf());
+        }
+        if (sampleShader)
+            mContext->PSSetShader(sampleShader, nullptr, 0);
+        mContext->Draw(buf_vbo_num_tris * 3, 0);
+        if (sampleShader)
+            mContext->PSSetShader(mShaderProgram->pixel_shader.Get(), nullptr, 0);
+        if (materialTarget) {
+            mContext->OMSetRenderTargets(1, oldColor.GetAddressOf(), oldDepth.Get());
+            materialTarget->written = true;
+        }
+        ID3D11ShaderResourceView* noViews[2]{};
+        ID3D11Buffer* noBuffer = nullptr;
+        ID3D11SamplerState* noSampler = nullptr;
+        mContext->PSSetShaderResources(6, 2, noViews);
+        mContext->PSSetConstantBuffers(4, 1, &noBuffer);
+        mContext->PSSetSamplers(6, 1, &noSampler);
+        return;
+    }
     mContext->Draw(buf_vbo_num_tris * 3, 0);
 }
 
@@ -972,6 +1838,7 @@ void GfxRenderingAPIDX11::OnResize() {
 
 void GfxRenderingAPIDX11::StartFrame() {
     BeginGpuFrameTiming();
+    BeginFoliageDepthFrame();
     auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
     const bool mipmaps = cvars->GetInteger("gSettings.TextureMipmaps", 1) != 0;
     const int requested = cvars->GetInteger("gSettings.TextureAnisotropy", 8);
@@ -1001,14 +1868,229 @@ void GfxRenderingAPIDX11::StartFrame() {
 }
 
 void GfxRenderingAPIDX11::EndFrame() {
+    EndFoliageDepthFrame();
     if (mActiveFrameTiming >= 0) {
         auto& timing = mFrameTiming[mActiveFrameTiming];
         mContext->End(timing.end.Get());
-        mContext->End(timing.disjoint.Get());
         timing.pending = true;
         mActiveFrameTiming = -1;
     }
+    if (mGpuFrameClock) {
+        mContext->End(mGpuFrameClock->disjoint.Get());
+        mGpuFrameClock->ended = true;
+        mGpuFrameClock.reset();
+    }
     mContext->Flush();
+}
+
+// Diagnostico por StartFrame, independente da posicao do opcode WorldPass.
+bool GfxRenderingAPIDX11::InitFoliageDepthTiming() {
+    if (mFoliageQueriesReady || mFoliageQueriesFailed)
+        return mFoliageQueriesReady;
+    const D3D11_QUERY_DESC timestamp{ D3D11_QUERY_TIMESTAMP, 0 };
+    for (auto& slot : mFoliageTiming) {
+        for (auto& pair : slot.timestamps) {
+            for (auto& query : pair) {
+                if (FAILED(mDevice->CreateQuery(&timestamp, query.ReleaseAndGetAddressOf()))) {
+                    mFoliageQueriesFailed = true;
+                    SPDLOG_WARN("Foliage depth timestamps unavailable; toggle PackGpuTimings to retry");
+                    return false;
+                }
+            }
+        }
+    }
+    // Aquecer o pool compartilhado uma vez ao habilitar, sem make_shared por quadro.
+    const D3D11_QUERY_DESC disjoint{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+    for (auto& clock : mGpuTimingClocks) {
+        if (clock)
+            continue;
+        auto created = std::make_shared<GpuTimingClock>();
+        if (FAILED(mDevice->CreateQuery(&disjoint, created->disjoint.GetAddressOf()))) {
+            mFoliageQueriesFailed = true;
+            SPDLOG_WARN("Foliage depth shared clock unavailable; toggle PackGpuTimings to retry");
+            return false;
+        }
+        clock = std::move(created);
+    }
+    mFoliageQueriesReady = true;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::CollectFoliageDepthTiming(FoliageTimingSlot& slot) {
+    if (!slot.pending)
+        return true;
+    // Nunca consultar um disjoint ainda aberto nem reutilizar queries em voo.
+    if (!slot.clock->ended) {
+        slot.discard = true;
+        return false;
+    }
+    constexpr UINT flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
+    const auto hr = mContext->GetData(slot.clock->disjoint.Get(), &clock, sizeof(clock), flags);
+    if (hr == S_FALSE) {
+        slot.discard = true;
+        return false;
+    }
+    auto& sample = slot.sample;
+    sample.valid = sample.valid && !slot.discard && !sample.overflow && SUCCEEDED(hr) &&
+                   !clock.Disjoint && clock.Frequency != 0;
+    FoliageDepth::TickSum sum{};
+    if (sample.valid) {
+        for (std::size_t i = 0; i < slot.intervals; ++i) {
+            UINT64 ticks[2]{};
+            for (std::size_t edge = 0; edge < 2; ++edge) {
+                const auto status = mContext->GetData(slot.timestamps[i][edge].Get(), &ticks[edge],
+                                                      sizeof(UINT64), flags);
+                if (status == S_FALSE) {
+                    slot.discard = true;
+                    return false;
+                }
+                if (FAILED(status)) {
+                    sample.valid = false;
+                    break;
+                }
+            }
+            if (!sample.valid)
+                break;
+            sum.Add(ticks[0], ticks[1]);
+        }
+        sample.valid = sample.valid && sum.valid;
+    }
+    if (sample.valid)
+        sample.milliseconds = static_cast<double>(sum.ticks) * 1000.0 / static_cast<double>(clock.Frequency);
+    mFoliageResults[sample.frame % FoliageDepth::RingSize] = sample;
+    slot.pending = false;
+    slot.clock.reset();
+    return true;
+}
+
+bool GfxRenderingAPIDX11::ReadFoliageDepthTiming(uint64_t frame, FoliageDepth::Sample& sample) const {
+    const auto& result = mFoliageResults[frame % FoliageDepth::RingSize];
+    if (result.frame == frame) {
+        sample = result;
+        return true;
+    }
+    const auto& slot = mFoliageTiming[frame % FoliageDepth::RingSize];
+    if (slot.pending && slot.sample.frame == frame)
+        return false;
+    // Quadro sem slot, desabilitado ou perdido: nao transformar falta de dado em zero.
+    sample = {};
+    sample.frame = frame;
+    return true;
+}
+
+void GfxRenderingAPIDX11::BeginFoliageDepthFrame() {
+    const auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const bool timing = cvars->GetInteger("gDeveloperTools.PackGpuTimings", 0) != 0;
+    const bool debug = cvars->GetInteger("gDeveloperTools.FoliageDepthDebug", 0) != 0;
+    const unsigned mode = unsigned(timing) | (unsigned(debug) << 1) |
+                          (unsigned(cvars->GetInteger("gDeveloperTools.FoliageDepth", 1) != 0) << 2);
+    if (mode != mFoliageDiagnosticMode) {
+        mFoliageCountBatch.Reset();
+        ++mFoliageCountRun;
+        mFoliageCountBatchId = 0;
+        mFoliageOverflowFrames = mFoliageSkippedFrames = 0;
+    }
+    if (mActiveFoliageTiming >= 0) {
+        auto& unfinished = mFoliageTiming[mActiveFoliageTiming];
+        unfinished.discard = unfinished.pending = true;
+    }
+    mActiveFoliageTiming = -1;
+    if (!timing && (mFoliageDiagnosticMode & 1)) {
+        // Liberar queries e leases e abandonar lotes parciais; nada a consultar com 0 estavel.
+        // O driver preserva os comandos submetidos; nao ha reutilizacao dessas queries.
+        for (auto& slot : mFoliageTiming)
+            slot = {};
+        mFoliageResults = {};
+        mFoliageQueriesReady = mFoliageQueriesFailed = false;
+    }
+    mFoliageDiagnosticMode = mode;
+    mFoliageFrameCounts = {};
+    if (!timing || !InitFoliageDepthTiming())
+        return;
+    auto& slot = mFoliageTiming[mTimingFrame % FoliageDepth::RingSize];
+    if (!CollectFoliageDepthTiming(slot))
+        return;
+    slot.clock = AcquireGpuTimingClock();
+    if (!slot.clock)
+        return;
+    slot.sample = {};
+    slot.sample.frame = mTimingFrame;
+    slot.sample.mode = mode;
+    slot.sample.valid = true;
+    slot.intervals = 0;
+    slot.discard = false;
+    mActiveFoliageTiming = static_cast<int>(mTimingFrame % FoliageDepth::RingSize);
+}
+
+void GfxRenderingAPIDX11::EndFoliageDepthFrame() {
+    if (mActiveFoliageTiming >= 0) {
+        auto& slot = mFoliageTiming[mActiveFoliageTiming];
+        slot.sample.counts = mFoliageFrameCounts;
+        if (slot.sample.overflow)
+            ++mFoliageOverflowFrames;
+        slot.pending = true;
+        mActiveFoliageTiming = -1;
+    } else if (mFoliageDiagnosticMode & 1) {
+        ++mFoliageSkippedFrames;
+    }
+    // Contadores de todos os quadros, mesmo sem pack/Compose ou com GPU indisponivel.
+    // Os contadores do lote valido tambem acompanham foliage_depth no SoH.
+    // Debug sozinha nao cria queries.
+    if (mFoliageDiagnosticMode & 3) {
+        mFoliageCountBatch.Add(mFoliageFrameCounts);
+        if (mFoliageCountBatch.frames == FoliageDepth::BatchSize) {
+            const auto& b = mFoliageCountBatch;
+            SPDLOG_INFO("FoliageDepthCounts v=1 run={} batch={} n={} draws_total={} triangles_total={} "
+                        "draws_max={} triangles_max={} diagnostic_mode={} interval_capacity={} "
+                        "overflow_frames={} timing_skipped_frames={}",
+                        mFoliageCountRun, ++mFoliageCountBatchId, b.frames, b.total.draws, b.total.triangles,
+                        b.maximum.draws, b.maximum.triangles, mFoliageDiagnosticMode, FoliageDepth::MaxIntervals,
+                        mFoliageOverflowFrames, mFoliageSkippedFrames);
+            mFoliageCountBatch.Reset();
+            mFoliageOverflowFrames = mFoliageSkippedFrames = 0;
+        }
+    }
+}
+
+void GfxRenderingAPIDX11::BeginFoliageDepthDraw(const FramebufferDX11& fb) {
+    if (mActiveFoliageTiming < 0)
+        return;
+    auto& slot = mFoliageTiming[mActiveFoliageTiming];
+    if (slot.intervals == FoliageDepth::MaxIntervals) {
+        slot.sample.overflow = true; // Contar/desenhar tudo, descartar o tempo do quadro INTEIRO.
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    ComPtr<ID3D11Resource> resource;
+    ComPtr<ID3D11Texture2D> texture;
+    fb.render_target_view->GetResource(resource.GetAddressOf());
+    if (FAILED(resource.As(&texture)))
+        slot.sample.valid = false;
+    else
+        texture->GetDesc(&desc);
+    auto& s = slot.sample;
+    if (s.width && (s.width != desc.Width || s.height != desc.Height || s.msaa != desc.SampleDesc.Count ||
+                    s.quality != desc.SampleDesc.Quality || s.format != static_cast<uint32_t>(desc.Format)))
+        s.valid = false;
+    s.width = desc.Width;
+    s.height = desc.Height;
+    s.msaa = desc.SampleDesc.Count;
+    s.quality = desc.SampleDesc.Quality;
+    s.format = static_cast<uint32_t>(desc.Format);
+    mContext->End(slot.timestamps[slot.intervals][0].Get());
+}
+
+void GfxRenderingAPIDX11::EndFoliageDepthDraw(std::size_t numTris) {
+    if (mFoliageDiagnosticMode & 3)
+        mFoliageFrameCounts.Draw(numTris);
+    if (mActiveFoliageTiming < 0)
+        return;
+    auto& slot = mFoliageTiming[mActiveFoliageTiming];
+    if (slot.intervals < FoliageDepth::MaxIntervals) {
+        mContext->End(slot.timestamps[slot.intervals][1].Get());
+        ++slot.intervals;
+    }
 }
 
 void GfxRenderingAPIDX11::FinishRender() {
@@ -1022,6 +2104,32 @@ void GfxRenderingAPIDX11::SetGpuFrameTiming(bool enabled, float measuredScale, u
     mFrameTimingScale = measuredScale;
 }
 
+std::shared_ptr<GfxRenderingAPIDX11::GpuTimingClock> GfxRenderingAPIDX11::AcquireGpuTimingClock() {
+    if (mGpuFrameClock || mGpuClockFailed)
+        return mGpuFrameClock;
+    for (auto& clock : mGpuTimingClocks) {
+        if (clock && clock.use_count() != 1)
+            continue; // R069, pack ou nevoa ainda podem estar lendo este quadro.
+        if (!clock) {
+            clock = std::make_shared<GpuTimingClock>();
+            const D3D11_QUERY_DESC desc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+            const auto hr = mDevice->CreateQuery(&desc, clock->disjoint.GetAddressOf());
+            if (FAILED(hr)) {
+                mGpuClockFailed = true;
+                SPDLOG_WARN("DX11: relogio GPU indisponivel ({:x})", static_cast<unsigned>(hr));
+                clock.reset();
+                return nullptr;
+            }
+        }
+        clock->frame = mTimingFrame;
+        clock->ended = false;
+        mGpuFrameClock = clock;
+        mContext->Begin(clock->disjoint.Get());
+        return clock;
+    }
+    return nullptr; // Pool em voo: sem flush, espera ou alocacao extra.
+}
+
 void GfxRenderingAPIDX11::BeginGpuFrameTiming() {
     ++mTimingFrame;
     if (!mFrameTimingEnabled || mFrameTimingFailed || mActiveFrameTiming >= 0)
@@ -1031,12 +2139,9 @@ void GfxRenderingAPIDX11::BeginGpuFrameTiming() {
         auto& timing = mFrameTiming[i];
         if (timing.pending)
             continue;
-        if (!timing.disjoint) {
-            D3D11_QUERY_DESC desc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
-            HRESULT hr = mDevice->CreateQuery(&desc, timing.disjoint.ReleaseAndGetAddressOf());
-            desc.Query = D3D11_QUERY_TIMESTAMP;
-            if (SUCCEEDED(hr))
-                hr = mDevice->CreateQuery(&desc, timing.begin.ReleaseAndGetAddressOf());
+        if (!timing.begin) {
+            const D3D11_QUERY_DESC desc{ D3D11_QUERY_TIMESTAMP, 0 };
+            HRESULT hr = mDevice->CreateQuery(&desc, timing.begin.ReleaseAndGetAddressOf());
             if (SUCCEEDED(hr))
                 hr = mDevice->CreateQuery(&desc, timing.end.ReleaseAndGetAddressOf());
             if (FAILED(hr)) {
@@ -1045,10 +2150,12 @@ void GfxRenderingAPIDX11::BeginGpuFrameTiming() {
                 return;
             }
         }
+        timing.clock = AcquireGpuTimingClock();
+        if (!timing.clock)
+            return;
         timing.frame = mTimingFrame;
         timing.epoch = mTimingEpoch;
         timing.scale = mFrameTimingScale;
-        mContext->Begin(timing.disjoint.Get());
         mContext->End(timing.begin.Get());
         mActiveFrameTiming = static_cast<int>(i);
         return;
@@ -1067,16 +2174,18 @@ bool GfxRenderingAPIDX11::GetGpuFrameTime(double& milliseconds, float& measuredS
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT frequency{};
     UINT64 begin = 0, end = 0;
     const UINT flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
-    const HRESULT a = mContext->GetData(oldest->disjoint.Get(), &frequency, sizeof(frequency), flags);
+    const HRESULT a = mContext->GetData(oldest->clock->disjoint.Get(), &frequency, sizeof(frequency), flags);
     const HRESULT b = mContext->GetData(oldest->begin.Get(), &begin, sizeof(begin), flags);
     const HRESULT c = mContext->GetData(oldest->end.Get(), &end, sizeof(end), flags);
     if (FAILED(a) || FAILED(b) || FAILED(c)) {
         oldest->pending = false;
+        oldest->clock.reset();
         return false;
     }
     if (a != S_OK || b != S_OK || c != S_OK)
         return false;
     oldest->pending = false;
+    oldest->clock.reset();
     // Never reuse timing from a long GPU backlog or a disjoint clock interval.
     if (oldest->epoch != mTimingEpoch || frequency.Disjoint || !frequency.Frequency || end < begin ||
         mTimingFrame > oldest->frame + 30)
@@ -1404,10 +2513,94 @@ struct FogConstants {
     FastFogLight lights[FAST_FOG_LIGHT_COUNT];
     std::array<std::array<float, 4>, 4> sunProjection;
     std::array<float, 4> sunRadiance;
+    float detailBounds[4]; // x min, z min, x max, z max
+    float detailGrid[4];   // width, depth, blend band, enabled
+    float solarStyle[4];  // x: Kokiri upper fog sunlight gain, y: canopy shaft strength
+    float upscaleTuning[4]; // x: upscale tolerance mode, y: heatmap; mirrors upscaleTuning in fog_volume_shader.h
 };
 static_assert(offsetof(FastFogVolume, cells) == sizeof(FogConstants::parameters));
 
+// RFC 0034 (draft): nested fine grid. Kept out of the class so its layout stays as the other TUs know it.
+struct FogDetailState {
+    ID3D11Device* device = nullptr;
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11ShaderResourceView> view;
+    float previous[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4]{};
+    float current[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4]{};
+    float bounds[4]{};
+    UINT width = 0, height = 0;
+    uint64_t stream = 0;
+    uint32_t tick = 0;
+    bool valid = false, logged = false;
+};
+FogDetailState gFogDetail;
+
+// Keeps the previous tick aligned with the current one when the domain follows the player, so the
+// in-between frames interpolate the same world position.
+void StoreFogDetail(const FastFogVolume& volume, const FastFogFlow& flow) {
+    auto& state = gFogDetail;
+    const UINT width = static_cast<UINT>(volume.detailGrid[0]);
+    const UINT height = static_cast<UINT>(volume.detailGrid[1]);
+    const bool sameShape = state.valid && state.stream == flow.stream && state.width == width && state.height == height;
+    if (sameShape && state.tick == flow.tick && std::equal(volume.detailBounds, volume.detailBounds + 4, state.bounds))
+        return;
+    const float stepX = (volume.detailBounds[2] - volume.detailBounds[0]) / float(width - 1);
+    const float stepZ = (volume.detailBounds[3] - volume.detailBounds[1]) / float(height - 1);
+    const int shiftX = sameShape ? int(std::lround((volume.detailBounds[0] - state.bounds[0]) / stepX)) : 0;
+    const int shiftZ = sameShape ? int(std::lround((volume.detailBounds[1] - state.bounds[1]) / stepZ)) : 0;
+    static float shifted[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4];
+    for (UINT z = 0; z < height; ++z) {
+        for (UINT x = 0; x < width; ++x) {
+            const int oldX = int(x) + shiftX, oldZ = int(z) + shiftZ;
+            const float* source = volume.detailCells[z * width + x];
+            if (sameShape && oldX >= 0 && oldZ >= 0 && oldX < int(width) && oldZ < int(height))
+                source = state.current[oldZ * width + oldX];
+            std::copy_n(source, 4, shifted[z * width + x]);
+        }
+    }
+    std::memcpy(state.previous, shifted, sizeof(shifted));
+    std::memcpy(state.current, volume.detailCells, sizeof(state.current));
+    std::copy_n(volume.detailBounds, 4, state.bounds);
+    state.width = width;
+    state.height = height;
+    state.stream = flow.stream;
+    state.tick = flow.tick;
+    state.valid = true;
+}
+
 constexpr unsigned FogReportLimit = 4;
+
+// With gDeveloperTools.PackGpuTimings on, fog timings keep reporting so a change can be measured in one session.
+unsigned FogReportBudget() {
+    const auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    return cvars->GetInteger("gDeveloperTools.PackGpuTimings", 0) != 0 ? ~0u : FogReportLimit;
+}
+
+// Which in-flight fog measurements had the raised column (taller box) active, so each report says how many of its
+// frames were lifted. Kept out of the class so the layout other translation units see does not change.
+struct FogLiftMark {
+    const void* timing;
+    bool lift;
+};
+std::array<FogLiftMark, 16> gFogLiftMarks{};
+unsigned gFogLiftSamples = 0;
+
+void MarkFogLift(const void* timing, bool lift) {
+    for (auto& mark : gFogLiftMarks) {
+        if (mark.timing == timing || !mark.timing) {
+            mark = { timing, lift };
+            return;
+        }
+    }
+}
+
+bool FogLiftMarked(const void* timing) {
+    for (const auto& mark : gFogLiftMarks) {
+        if (mark.timing == timing)
+            return mark.lift;
+    }
+    return false;
+}
 
 bool CreateFogStateTexture(ID3D11Device* device, ID3D11ShaderResourceView** view, ID3D11UnorderedAccessView** target) {
     D3D11_TEXTURE2D_DESC desc{};
@@ -1433,6 +2626,39 @@ bool GfxRenderingAPIDX11::CompileFogShader(const char* entry, const char* profil
                     errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no diagnostics");
     }
     return SUCCEEDED(result);
+}
+
+bool GfxRenderingAPIDX11::PrepareWorldFogLayer() {
+    if (mFogLayerFailed)
+        return false;
+    if (mFogLayerBlend)
+        return true;
+    ComPtr<ID3DBlob> full, upscale;
+    ComPtr<ID3D11PixelShader> fullShader, upscaleShader;
+    ComPtr<ID3D11BlendState> state;
+    D3D11_BLEND_DESC blend{};
+    auto& rt = blend.RenderTarget[0];
+    rt.BlendEnable = TRUE;
+    rt.SrcBlend = rt.SrcBlendAlpha = D3D11_BLEND_ONE;
+    rt.DestBlend = rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    rt.BlendOp = rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    // LOD usa Gather (SM5), como a variante de upscale existente.
+    if (!CompileFogShader("PSLayer", "ps_4_0", full.GetAddressOf()) ||
+        !CompileFogShader("PSLayerUpscale", "ps_5_0", upscale.GetAddressOf()) ||
+        FAILED(mDevice->CreatePixelShader(full->GetBufferPointer(), full->GetBufferSize(), nullptr,
+                                          fullShader.GetAddressOf())) ||
+        FAILED(mDevice->CreatePixelShader(upscale->GetBufferPointer(), upscale->GetBufferSize(), nullptr,
+                                          upscaleShader.GetAddressOf())) ||
+        FAILED(mDevice->CreateBlendState(&blend, state.GetAddressOf()))) {
+        mFogLayerFailed = true;
+        SPDLOG_WARN("Fast3D não criou os recursos da camada linear de névoa");
+        return false;
+    }
+    mFogLayerPs = std::move(fullShader);
+    mFogLayerUpscalePs = std::move(upscaleShader);
+    mFogLayerBlend = std::move(state);
+    return true;
 }
 
 bool GfxRenderingAPIDX11::InitFogVolume() {
@@ -1508,6 +2734,11 @@ bool GfxRenderingAPIDX11::InitFogVolume() {
     }
     if (SUCCEEDED(mDevice->CreateTexture2D(&field, nullptr, mFogLiftTexture.GetAddressOf()))) {
         mDevice->CreateShaderResourceView(mFogLiftTexture.Get(), nullptr, mFogLiftView.GetAddressOf());
+    }
+    gFogDetail = {};
+    gFogDetail.device = mDevice.Get();
+    if (SUCCEEDED(mDevice->CreateTexture2D(&field, nullptr, gFogDetail.texture.GetAddressOf()))) {
+        mDevice->CreateShaderResourceView(gFogDetail.texture.Get(), nullptr, gFogDetail.view.GetAddressOf());
     }
 
     auto noise = field;
@@ -1732,9 +2963,10 @@ bool GfxRenderingAPIDX11::InitFogMsaaCache(UINT width, UINT height) {
 
 void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
                                      const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction,
-                                     bool useSun, ID3D11Query* lowEnd) {
+                                     bool useSun, ID3D11Query* lowEnd, ID3D11RenderTargetView* target,
+                                     ID3D11BlendState* blend, bool multisampled, bool linearLayer) {
     const auto& fb = mFrameBuffers[mCurrentFramebuffer];
-    const auto& shaders = mFogLodShaders[fb.msaa_level > 1];
+    const auto& shaders = mFogLodShaders[multisampled];
     const auto sameViewport = viewport.TopLeftX == mFogLastViewport.TopLeftX &&
                               viewport.TopLeftY == mFogLastViewport.TopLeftY &&
                               viewport.Width == mFogLastViewport.Width && viewport.Height == mFogLastViewport.Height &&
@@ -1756,6 +2988,8 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         reset = "initial";
     else if (mFogLastStream != flow.stream)
         reset = "scene";
+    else if (mFogLastLinearLayer != linearLayer)
+        reset = "layer";
     else if (!sameViewport)
         reset = "resize";
     else if (mFogLastMsaa != fb.msaa_level)
@@ -1808,9 +3042,9 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         mContext->PSSetShader(shaders.low.Get(), nullptr, 0);
         mContext->Draw(3, 0);
-        mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(), nullptr);
+        mContext->OMSetRenderTargets(1, &target, nullptr);
         mContext->RSSetViewports(1, &viewport);
-        mContext->OMSetBlendState(mFogBlend.Get(), nullptr, 0xffffffffu);
+        mContext->OMSetBlendState(blend, nullptr, 0xffffffffu);
     }
     if (lowEnd)
         mContext->End(lowEnd);
@@ -1823,7 +3057,8 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     }
     const auto width = static_cast<UINT>(viewport.Width);
     const auto height = static_cast<UINT>(viewport.Height);
-    const bool cache = fb.msaa_level >= 4 && viewport.Width == float(width) && viewport.Height == float(height) &&
+    const bool cache = multisampled && fb.msaa_level >= 4 && viewport.Width == float(width) &&
+                       viewport.Height == float(height) &&
                        viewport.TopLeftX == std::floor(viewport.TopLeftX) &&
                        viewport.TopLeftY == std::floor(viewport.TopLeftY) && InitFogMsaaCache(width, height);
     if (cache) {
@@ -1835,15 +3070,42 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
         mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         mContext->PSSetShader(mFogUniformPs.Get(), nullptr, 0);
         mContext->Draw(3, 0);
-        mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(), nullptr);
+        mContext->OMSetRenderTargets(1, &target, nullptr);
         mContext->RSSetViewports(1, &viewport);
-        mContext->OMSetBlendState(mFogBlend.Get(), nullptr, 0xffffffffu);
+        mContext->OMSetBlendState(blend, nullptr, 0xffffffffu);
         mContext->PSSetShaderResources(5, 1, mFogUniformCache.view.GetAddressOf());
         mContext->PSSetShader(mFogCachedUpscalePs.Get(), nullptr, 0);
         mContext->Draw(3, 0);
         mContext->PSSetShaderResources(5, 1, oldCache.GetAddressOf());
     } else {
-        mContext->PSSetShader(shaders.upscale.Get(), nullptr, 0);
+        ID3D11PixelShader* upscaleShader = linearLayer ? mFogLayerUpscalePs.Get() : shaders.upscale.Get();
+        if (linearLayer) {
+            // Linear layer: tolerance 2 by default (FogLayerUpscaleTolerance 0 falls back to PSLayerUpscale).
+            const auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+            if (cvars->GetInteger("gDeveloperTools.FogLayerUpscaleTolerance", 2) != 0 ||
+                cvars->GetInteger("gDeveloperTools.FogUpscaleHeatmap", 0) != 0) {
+                static ID3D11Device* tunedDevice = nullptr;
+                static ComPtr<ID3D11PixelShader> tuned;
+                static bool tunedFailed = false;
+                if (tunedDevice != mDevice.Get()) {
+                    tunedDevice = mDevice.Get();
+                    tuned.Reset();
+                    tunedFailed = false;
+                    const D3D_SHADER_MACRO macros[]{ { "FOG_MSAA", "0" }, { "FOG_LAYER_TUNED", "1" }, { nullptr, nullptr } };
+                    ComPtr<ID3DBlob> blob, errors;
+                    tunedFailed = FAILED(mD3dCompile(FogVolumeShader, sizeof(FogVolumeShader) - 1, "FogVolume", macros,
+                                                     nullptr, "PSLayerUpscaleTuned", "ps_5_0",
+                                                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob.GetAddressOf(),
+                                                     errors.GetAddressOf())) ||
+                                  FAILED(mDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                                    nullptr, tuned.GetAddressOf()));
+                    SPDLOG_INFO("Fast3D fog layer upscale tuned variant {}", tunedFailed ? "failed" : "ready");
+                }
+                if (!tunedFailed)
+                    upscaleShader = tuned.Get();
+            }
+        }
+        mContext->PSSetShader(upscaleShader, nullptr, 0);
         mContext->Draw(3, 0);
     }
 
@@ -1854,6 +3116,7 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     mFogLastViewport = viewport;
     mFogLastFramebuffer = mCurrentFramebuffer;
     mFogLastMsaa = fb.msaa_level;
+    mFogLastLinearLayer = linearLayer;
     mFogLastFieldFraction = fieldFraction;
     std::copy_n(volume.eye, 4, mFogLastCamera.previousEye);
     std::copy_n(volume.forward, 4, mFogLastCamera.previousForward);
@@ -2354,7 +3617,8 @@ void GfxRenderingAPIDX11::CollectFogTiming() {
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
         uint64_t first = 0, field = 0, last = 0, particle = 0, lowEnd = 0;
         constexpr UINT flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
-        const HRESULT clockStatus = mContext->GetData(timing.disjoint.Get(), &clock, sizeof(clock), flags);
+        auto* disjoint = timing.frameClock ? timing.frameClock->disjoint.Get() : timing.disjoint.Get();
+        const HRESULT clockStatus = mContext->GetData(disjoint, &clock, sizeof(clock), flags);
         const HRESULT beginStatus = mContext->GetData(timing.begin.Get(), &first, sizeof(first), flags);
         const HRESULT fieldStatus = mContext->GetData(timing.fieldEnd.Get(), &field, sizeof(field), flags);
         const HRESULT particleStatus =
@@ -2366,11 +3630,14 @@ void GfxRenderingAPIDX11::CollectFogTiming() {
             lowStatus == S_FALSE || endStatus == S_FALSE)
             continue;
         timing.pending = false;
+        timing.frameClock.reset();
         if (FAILED(clockStatus) || FAILED(beginStatus) || FAILED(endStatus) || clock.Disjoint || !clock.Frequency ||
-            last < first || mFogTimingReports >= FogReportLimit) {
+            last < first || mFogTimingReports >= FogReportBudget()) {
             continue;
         }
         mFogSamples[mFogSampleCount++] = static_cast<double>(last - first) * 1000.0 / clock.Frequency;
+        if (FogLiftMarked(&timing))
+            ++gFogLiftSamples;
         if (timing.reduced && SUCCEEDED(fieldStatus) && SUCCEEDED(lowStatus) && field >= first && lowEnd >= field &&
             last >= lowEnd) {
             const double milliseconds = 1000.0 / clock.Frequency;
@@ -2390,8 +3657,9 @@ void GfxRenderingAPIDX11::CollectFogTiming() {
             std::sort(mFogSamples.begin(), mFogSamples.end());
             const auto middle = mFogSamples.size() / 2;
             const auto p95 = mFogSamples.size() * 95 / 100 - 1;
-            SPDLOG_INFO("Fast3D fog GPU n={} p50_ms={:.4f} p95_ms={:.4f}", mFogSamples.size(),
-                        (mFogSamples[middle - 1] + mFogSamples[middle]) * 0.5, mFogSamples[p95]);
+            SPDLOG_INFO("Fast3D fog GPU n={} p50_ms={:.4f} p95_ms={:.4f} lift_frames={}", mFogSamples.size(),
+                        (mFogSamples[middle - 1] + mFogSamples[middle]) * 0.5, mFogSamples[p95], gFogLiftSamples);
+            gFogLiftSamples = 0;
             if (mFogLodMode >= 0) {
                 SPDLOG_INFO("Fast3D fog LOD timing mode={} full={}x{} history_frames={} resets={} cached_frames={}",
                             mFogLodMode, mFogLodWidth, mFogLodHeight, mFogHistoryFrames, mFogHistoryResets,
@@ -2436,7 +3704,16 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     const auto& fb = mFrameBuffers[mCurrentFramebuffer];
     if (!fb.depth_stencil_srv || !fb.render_target_view)
         return;
-    const bool multisampled = fb.msaa_level > 1;
+    // O dono permanece vivo durante o draw; nunca reter o pack no estado global.
+    const auto layerOwner = worldFogLayer.owner.lock();
+    const bool linearLayer = layerOwner && worldFogLayer.context == mContext.Get() &&
+                             worldFogLayer.replay == WorldPostProcessReplay() &&
+                             worldFogLayer.scene == fb.render_target_view.Get() &&
+                             worldFogLayer.attachment == fb.depth_stencil_view.Get() &&
+                             worldFogLayer.target && worldFogLayer.depth;
+    auto* fogTarget = linearLayer ? worldFogLayer.target : fb.render_target_view.Get();
+    auto* fogDepth = linearLayer ? worldFogLayer.depth : fb.depth_stencil_srv.Get();
+    const bool multisampled = !linearLayer && fb.msaa_level > 1;
     D3D11_VIEWPORT viewport{};
     UINT count = 1;
     mContext->RSGetViewports(&count, &viewport);
@@ -2444,6 +3721,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         return;
     if (multisampled && !InitFogMsaa())
         return;
+    auto* fogBlend = linearLayer ? mFogLayerBlend.Get() : mFogBlend.Get();
     if (fb.msaa_level != mFogReportedMsaa) {
         mFogReportedMsaa = fb.msaa_level;
         SPDLOG_INFO("Fast3D fog MSAA samples={}", mFogReportedMsaa);
@@ -2451,11 +3729,13 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
 
     CollectFogTiming();
     FogTiming* measurement = nullptr;
-    if (mActiveFrameTiming < 0 && volume.eye[3] == 1.0f && mFogTimingReports < FogReportLimit) {
+    if (mActiveFrameTiming < 0 && volume.eye[3] == 1.0f && mFogTimingReports < FogReportBudget()) {
         for (auto& timing : mFogTiming) {
             if (timing.disjoint && !timing.pending) {
                 measurement = &timing;
-                mContext->Begin(timing.disjoint.Get());
+                timing.frameClock = mGpuFrameClock;
+                if (!timing.frameClock)
+                    mContext->Begin(timing.disjoint.Get());
                 mContext->End(timing.begin.Get());
                 break;
             }
@@ -2515,12 +3795,18 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     constants.parameters[1][3] = extinction;
     const bool useDetail = liveFlow && (flow->flags & FAST_FOG_FLOW_VORTICES);
     if (useDetail) {
-        const float phase = (float(flow->tick % 2048u) + fieldFraction) * (6.2831853f / 2048.0f);
         constants.parameters[7][3] = 1.0f;
         if (mFogNoiseView) {
+            // Flow-map clock in cycles of 36 ticks, wrapped at 64 cycles (the noise period) on a whole tick.
+            // RFC 0034 (draft): with the nested grid the velocities are real scene wind, so the crossfade is the
+            // fastest visible change left; a 72-tick cycle halves how often the pattern re-forms.
+            const bool nested = (flow->flags & FAST_FOG_FLOW_CPU_FIELD) && volume.detailGrid[0] >= 2.0f &&
+                                volume.detailGrid[1] >= 2.0f;
+            const uint32_t cycleTicks = nested ? 72u : 36u;
+            const double ticks = double(flow->tick % (64u * cycleTicks)) + double(fieldFraction);
             constants.visual[1] = 1.0f;
-            constants.visual[2] = 2.25f * std::cos(phase);
-            constants.visual[3] = 2.25f * std::sin(phase);
+            constants.visual[2] = float(std::fmod(ticks / double(cycleTicks), 64.0));
+            constants.visual[3] = float(cycleTicks) * std::max(flow->dt, 0.001f);
         }
     }
     const bool useNoise = constants.visual[1] > 0.0f;
@@ -2546,11 +3832,78 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     constants.support[0] = useSupport ? 1.0f : 0.0f;
     constants.support[2] = fieldFraction;
     constants.support[3] = useUpper ? 1.0f : 0.0f;
+    if (useUpper && (flow->flags & KokiriAirFlowFlag))
+        constants.lighting[2] = KokiriAirHalfHeight;
+    // A/B knobs for the MSAA upscale cost (read every frame so a session can switch without a rebuild).
+    // Tolerance: 0 = current behaviour, 1 = uniformity relative to depth, 2 = 1 + slope-aware bilateral.
+    // The linear layer defaults to 2 (FogLayerUpscaleTolerance; 0 = original PSLayerUpscale): measured 1.76 ->
+    // 1.00 ms in Kokiri with no visible change (logs/fogremaster-001/upscale-custo/ANALISE.md, 21/11).
+    {
+        const auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+        const int toleranceMode =
+            linearLayer ? std::clamp(cvars->GetInteger("gDeveloperTools.FogLayerUpscaleTolerance", 2), 0, 2)
+                        : std::clamp(cvars->GetInteger("gDeveloperTools.FogUpscaleTolerance", 0), 0, 2);
+        const int heatmap = std::clamp(cvars->GetInteger("gDeveloperTools.FogUpscaleHeatmap", 0), 0, 2);
+        constants.upscaleTuning[0] = static_cast<float>(toleranceMode);
+        constants.upscaleTuning[1] = static_cast<float>(heatmap);
+        thread_local int lastToleranceMode = 0, lastHeatmap = 0;
+        if (toleranceMode != lastToleranceMode || heatmap != lastHeatmap) {
+            SPDLOG_INFO("Fast3D fog upscale tolerance={} (0=current, 1=relative uniformity, 2=+slope) heatmap={} layer={}",
+                        toleranceMode, heatmap, linearLayer);
+            lastToleranceMode = toleranceMode;
+            lastHeatmap = heatmap;
+        }
+    }
+    thread_local bool lastAirProfile = false;
+    const bool airProfile = constants.lighting[2] > 0.0f;
+    if (airProfile != lastAirProfile) {
+        SPDLOG_INFO("Fast3D fog upper air={} half_height={:.1f}", airProfile, constants.lighting[2]);
+        lastAirProfile = airProfile;
+    }
+    if (airProfile && useSun) {
+        const auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+        const bool directionalScatter = cvars->GetInteger("gDeveloperTools.FogreKokiriAirPhase", 1) != 0;
+        constants.lighting[3] = directionalScatter ? 0.55f : 0.0f;
+        const int gain = cvars->GetInteger("gDeveloperTools.FogreKokiriBeamGain", 100);
+        constants.solarStyle[0] = std::clamp(gain, 100, 300) * 0.01f;
+        const int shaft = cvars->GetInteger("gDeveloperTools.FogreKokiriShaftStrength", 0);
+        constants.solarStyle[1] = std::clamp(shaft, 0, 300) * 0.01f;
+    }
     constants.visual[0] = gpuLift ? 1.0f : 0.0f;
+    if (measurement)
+        MarkFogLift(measurement, useLift);
     if (useLift) {
         const float liftOffset = 0.65f * volume.grid[2];
+        // RaisedFogProfile in fog_volume_shader.h spreads the raised band over a taller column; the box must
+        // reach its top or the march cuts the rising fog flat.
+        constexpr float kFogRaisedStretch = 2.5f;
         constants.support[1] = liftOffset;
-        constants.parameters[6][1] += liftOffset;
+        constants.parameters[6][1] += liftOffset + (kFogRaisedStretch - 1.0f) * volume.grid[2];
+    }
+    const bool useFine = liveFlow && (flow->flags & FAST_FOG_FLOW_CPU_FIELD) && gFogDetail.view &&
+                         gFogDetail.device == mDevice.Get() && volume.detailGrid[0] >= 2.0f &&
+                         volume.detailGrid[1] >= 2.0f;
+    if (useFine) {
+        StoreFogDetail(volume, *flow);
+        const auto& state = gFogDetail;
+        static float values[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4];
+        for (UINT i = 0; i < state.width * state.height; ++i) {
+            for (int channel = 0; channel < 4; ++channel) {
+                values[i][channel] =
+                    state.previous[i][channel] + (state.current[i][channel] - state.previous[i][channel]) * fieldFraction;
+            }
+        }
+        const D3D11_BOX rect{ 0, 0, 0, state.width, state.height, 1 };
+        mContext->UpdateSubresource(state.texture.Get(), 0, &rect, values, state.width * sizeof(values[0]), 0);
+        std::copy_n(volume.detailBounds, 4, constants.detailBounds);
+        constants.detailGrid[0] = volume.detailGrid[0];
+        constants.detailGrid[1] = volume.detailGrid[1];
+        constants.detailGrid[2] = volume.detailGrid[2];
+        constants.detailGrid[3] = 1.0f;
+        if (!gFogDetail.logged) {
+            gFogDetail.logged = true;
+            SPDLOG_INFO("Fast3D fog detail grid {}x{} blend={:.1f}", state.width, state.height, volume.detailGrid[2]);
+        }
     }
     mContext->UpdateSubresource(mFogCb.Get(), 0, nullptr, &constants, 0, 0);
     if (!fieldView && volume.grid[0] >= 2.0f) {
@@ -2601,6 +3954,7 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     ComPtr<ID3D11ShaderResourceView> oldGpuLift;
     ComPtr<ID3D11ShaderResourceView> oldNoise;
     ComPtr<ID3D11ShaderResourceView> oldSun;
+    ComPtr<ID3D11ShaderResourceView> oldFine;
     ComPtr<ID3D11SamplerState> oldFogSampler, oldNoiseSampler;
     ComPtr<ID3D11RasterizerState> oldRaster;
     ComPtr<ID3D11BlendState> oldBlend;
@@ -2615,6 +3969,8 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSGetShaderResources(1, 1, oldField.GetAddressOf());
     if (useSun)
         mContext->PSGetShaderResources(9, 1, oldSun.GetAddressOf());
+    if (useFine)
+        mContext->PSGetShaderResources(11, 1, oldFine.GetAddressOf());
     if (useSupport)
         mContext->PSGetShaderResources(3, 1, oldSupport.GetAddressOf());
     if (useLift)
@@ -2638,18 +3994,20 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->OMGetBlendState(oldBlend.GetAddressOf(), blendFactor, &sampleMask);
     mContext->OMGetDepthStencilState(oldDepth.GetAddressOf(), &stencilRef);
 
-    mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(), nullptr);
+    mContext->OMSetRenderTargets(1, &fogTarget, nullptr);
     mContext->OMSetDepthStencilState(mFogDepth.Get(), 0);
-    mContext->OMSetBlendState(mFogBlend.Get(), nullptr, 0xffffffffu);
+    mContext->OMSetBlendState(fogBlend, nullptr, 0xffffffffu);
     mContext->RSSetState(mFogRaster.Get());
     mContext->IASetInputLayout(nullptr);
     mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     mContext->VSSetShader(mFogVs.Get(), nullptr, 0);
     mContext->PSSetConstantBuffers(0, 1, mFogCb.GetAddressOf());
-    mContext->PSSetShaderResources(0, 1, fb.depth_stencil_srv.GetAddressOf());
+    mContext->PSSetShaderResources(0, 1, &fogDepth);
     mContext->PSSetShaderResources(1, 1, &fieldView);
     if (useSun)
         mContext->PSSetShaderResources(9, 1, sun.depth.GetAddressOf());
+    if (useFine)
+        mContext->PSSetShaderResources(11, 1, gFogDetail.view.GetAddressOf());
     if (useSupport)
         mContext->PSSetShaderResources(3, 1, mFogSupportView.GetAddressOf());
     if (useLift)
@@ -2665,12 +4023,13 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSSetSamplers(1, 1, mFogGridSampler.GetAddressOf());
     if (lod) {
         DrawFogLod(volume, *flow, action, viewport, lod, fieldFraction, extinction, useSun,
-                   measurement ? measurement->lowEnd.Get() : nullptr);
+                   measurement ? measurement->lowEnd.Get() : nullptr, fogTarget, fogBlend, multisampled, linearLayer);
         mContext->PSSetShaderResources(2, 1, oldReduced.GetAddressOf());
         mContext->PSSetConstantBuffers(1, 1, oldTemporalCb.GetAddressOf());
     } else {
         mFogLastFrame = 0;
-        mContext->PSSetShader(multisampled ? mFogMsaaPs.Get() : mFogPs.Get(), nullptr, 0);
+        mContext->PSSetShader(linearLayer ? mFogLayerPs.Get() : (multisampled ? mFogMsaaPs.Get() : mFogPs.Get()),
+                              nullptr, 0);
         mContext->Draw(3, 0);
     }
 
@@ -2689,6 +4048,8 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     mContext->PSSetShaderResources(1, 1, oldField.GetAddressOf());
     if (useSun)
         mContext->PSSetShaderResources(9, 1, oldSun.GetAddressOf());
+    if (useFine)
+        mContext->PSSetShaderResources(11, 1, oldFine.GetAddressOf());
     if (useSupport)
         mContext->PSSetShaderResources(3, 1, oldSupport.GetAddressOf());
     if (useLift)
@@ -2705,7 +4066,8 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
 
     if (measurement) {
         mContext->End(measurement->end.Get());
-        mContext->End(measurement->disjoint.Get());
+        if (!measurement->frameClock)
+            mContext->End(measurement->disjoint.Get());
         measurement->pending = true;
     }
 }
@@ -3152,8 +4514,8 @@ std::optional<std::string> dx_include_fs(const std::string& path) {
     return *inc;
 }
 
-std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,
-                                             bool include_root_signature, bool three_point_filtering, bool use_srgb) {
+static std::string BuildDirect3DShader(size_t& numFloats, const CCFeatures& cc_features, bool include_root_signature,
+                                       bool three_point_filtering, bool use_srgb, bool labPbr) {
     raw_numFloats = 4;
 
     prism::Processor processor;
@@ -3184,6 +4546,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_prim_depth", cc_features.opt_prim_depth },
         { "o_toon", cc_features.opt_toon },
+        { "o_labpbr", labPbr },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
@@ -3228,6 +4591,11 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
     // SPDLOG_INFO(result);
     // SPDLOG_INFO("====================================");
     return result;
+}
+
+std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,
+                                             bool include_root_signature, bool three_point_filtering, bool use_srgb) {
+    return BuildDirect3DShader(numFloats, cc_features, include_root_signature, three_point_filtering, use_srgb, false);
 }
 } // namespace Fast
 #endif

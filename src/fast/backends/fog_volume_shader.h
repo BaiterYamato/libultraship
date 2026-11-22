@@ -33,6 +33,7 @@ Texture2D<float4> computedLiftField : register(t7);
 Texture2D<float> noiseField : register(t8);
 Texture2D<float> solarDepth : register(t9);
 Texture2D<float> reducedSun : register(t10);
+Texture2D<float4> detailField : register(t11);
 #if FOG_MSAA
 Texture2D<float4> uniformFog : register(t5);
 #endif
@@ -56,12 +57,16 @@ cbuffer FogConstants : register(b0) {
     float4 grid;
     float4 viewport;
     float4 support; // x: support ranges, y: raised offset, z: interpolation, w: upper support
-    float4 lighting; // x: point light count, y: unoccluded solar control
+    float4 lighting; // x: point light count, y: unoccluded solar control, z: air half height, w: air anisotropy
     float4 atmosphere;
     float4 visual; // x: computed lift, y: texture detail, zw: wind offset
     FogLight lights[6];
     float4 sunProjection[4];
     float4 sunRadiance;
+    float4 detailBounds; // x min, z min, x max, z max of the nested fine grid
+    float4 detailGrid;   // width, depth, blend band, enabled
+    float4 solarStyle;   // x: Kokiri upper fog sunlight gain, y: canopy shaft strength
+    float4 upscaleTuning; // x: upscale tolerance mode (gDeveloperTools.FogUpscaleTolerance), y: heatmap (FogUpscaleHeatmap)
 };
 
 cbuffer FogTemporalConstants : register(b1) {
@@ -134,11 +139,24 @@ float GroundFogAverage(float height, float rise, float thickness) {
     return 0.76 * (GroundFogArea(h + 0.5 * span) - GroundFogArea(h - 0.5 * span)) / span;
 }
 
-float WideFogProfile(float height, float rise, float raised, float thickness, float offset) {
+// The raised band is fog thrown up off the ground: it leaves the floor by support.y and spreads over a column
+// RaisedStretch times taller and as many times thinner, so the column keeps its mass while it rises. A copy of the
+// ground profile shifted up read as a floating slab instead of rising fog. Keep in sync with kFogRaisedStretch.
+static const float RaisedStretch = 2.5;
+
+float WideFogProfile(float height, float rise, float raised, float thickness, float offset,
+                     float stretch = RaisedStretch) {
     float ground = GroundFogAverage(height, rise, thickness);
     [branch]
-    if (raised > 0.0 && offset > 0.0) ground = lerp(ground, GroundFogAverage(height - offset, rise, thickness), raised);
+    if (raised > 0.0 && offset > 0.0) {
+        ground = lerp(ground, GroundFogAverage(height - offset, rise, thickness * stretch) / stretch, raised);
+    }
     return ground * (grid.z / thickness);
+}
+
+// Height above the support range the march must still visit: the offset plus the stretched raised column.
+float RaisedReach() {
+    return support.y > 0.0 ? support.y + (RaisedStretch - 1.0) * grid.z : 0.0;
 }
 
 float InterpolateLift(float2 pair) {
@@ -198,6 +216,7 @@ float WideFogDensity(float2 sampleCell, float y, float rise, float density, floa
     [unroll]
     for (int j = 0; j < 4; ++j) {
         float offset = support.y;
+        float stretch = RaisedStretch;
         [branch]
         if (limitLift && raisedCorners[j] > 0.0) {
             int2 corner = int2((j & 1) ? end.x : base.x, (j & 2) ? end.y : base.y);
@@ -205,10 +224,12 @@ float WideFogDensity(float2 sampleCell, float y, float rise, float density, floa
             if (upper.x > 0.0001) {
                 float available = upper.y / upper.x - floors[j] - thickness;
                 offset = clamp(available, 0.0, support.y);
+                // Under a platform the column only grows as far as the gap allows: it must not cross the floor above.
+                stretch = clamp((available + thickness - offset) / thickness, 1.0, RaisedStretch);
             }
         }
         layers[j] = clamp(densities[j], 0.0, 1.5) * WideFogProfile(y - floors[j], rise, raisedCorners[j],
-                                                                 thickness, offset);
+                                                                 thickness, offset, stretch);
     }
     float splitDensity = dot(weights, layers);
     if (splitWeight >= 1.0) return splitDensity;
@@ -249,10 +270,86 @@ float UpperFogDensity(float2 sampleCell, float2 textureUv, float y, float rise, 
     return dot(CornerWeights(sampleCell), layers);
 }
 
+float AirFogArea(float height) {
+    float x = clamp(height, -1.0, 1.0);
+    float x2 = x * x;
+    return x * (1.0 - (2.0 / 3.0) * x2 + 0.2 * x2 * x2);
+}
+
+float AirFogDensity(float2 textureUv, float y, float rise) {
+    float2 cell = InterpolateUpper(upperField.SampleLevel(fogSampler, textureUv, 0.0));
+    if (cell.x <= 0.0001) return 0.0;
+    float center = cell.y / cell.x + 0.5 * grid.z;
+    float halfHeight = lighting.z;
+    float height = (y - center) / halfHeight;
+    float span = abs(rise) / halfHeight;
+    float profile;
+    if (span < 0.01) {
+        float centerWeight = saturate(1.0 - height * height);
+        profile = centerWeight * centerWeight;
+    } else {
+        profile = max(0.0, (AirFogArea(height + 0.5 * span) - AirFogArea(height - 0.5 * span)) / span);
+    }
+    // Match the vertical integral of the former support layer (0.38 * grid.z).
+    return cell.x * profile * ((0.38 * 15.0 / 16.0) * grid.z / halfHeight);
+}
+
 float FogDetail(float2 p) {
     float2 f = frac(p);
     float2 uv = (floor(p) + f * f * (3.0 - 2.0 * f) + 0.5) / 64.0;
     return 2.0 * noiseField.SampleLevel(noiseSampler, uv, 0.0) - 1.0;
+}
+
+// Ambient drift shown by the flow map: the compute transport's face wind (16, 5) u/s, exaggerated so the
+// slow ground current is visible while walking.
+static const float2 FogFlowWind = float2(16.0, 5.0) * 2.2;
+
+// RFC 0034 (draft): a submitter that sends the nested grid also sends full surface velocities, ambient wind
+// included, so the fixed drift above would count the wind twice (and in a fixed direction).
+float2 AmbientFlowWind() { return detailGrid.w > 0.5 ? float2(0.0, 0.0) : FogFlowWind; }
+
+struct FlowPhases {
+    float wA, wB, norm, tA, tB;
+    float2 shiftA, shiftB;
+};
+
+// visual.z: flow-map clock in cycles, modulo 64 (the noise period). visual.w: seconds per cycle.
+// Each phase restarts while its weight is zero and jumps to a new noise offset, so no cycle repeats.
+FlowPhases FogFlowPhases() {
+    FlowPhases f;
+    float s = visual.z;
+    float a = frac(s);
+    float b = frac(s + 0.5);
+    f.wA = 1.0 - abs(2.0 * a - 1.0);
+    f.wB = 1.0 - f.wA;
+    // Two uncorrelated noises crossfaded lose contrast mid-way; restore the original variance.
+    f.norm = rsqrt(max(f.wA * f.wA + f.wB * f.wB, 0.25));
+    f.tA = a * visual.w;
+    f.tB = b * visual.w;
+    float cycleA = floor(s);
+    float cycleB = fmod(floor(s + 0.5), 64.0);
+    f.shiftA = frac(cycleA * float2(0.7548777, 0.5698403)) * 64.0;
+    f.shiftB = frac((cycleB + 0.5) * float2(0.7548777, 0.5698403)) * 64.0;
+    return f;
+}
+
+void FlowDetail(float2 world, float2 velocity, FlowPhases f, float cloudScale, float detailScale, float warpScale,
+                float2 warp, out float cloud, out float detail) {
+    if (detailGrid.w > 0.5) {
+        // Longer cycle with the nested grid: cap the shift per cycle so a slash (100+ u/s) does not smear the
+        // noise across the hole, while the eddy it leaves (15-40 u/s) still turns the detail; the density field
+        // carries the real motion either way.
+        float shift = length(velocity) * visual.w;
+        velocity *= min(1.0, 120.0 / max(shift, 0.001));
+    }
+    float2 pA = world - velocity * f.tA;
+    float2 pB = world - velocity * f.tB;
+    float cloudA = FogDetail(pA * cloudScale + f.shiftA);
+    float cloudB = FogDetail(pB * cloudScale + f.shiftB);
+    float detailA = FogDetail(pA.yx * detailScale + f.shiftA.yx + float2(7.0, 15.0) + warpScale * cloudA + warp);
+    float detailB = FogDetail(pB.yx * detailScale + f.shiftB.yx + float2(7.0, 15.0) + warpScale * cloudB + warp);
+    cloud = (f.wA * cloudA + f.wB * cloudB) * f.norm;
+    detail = (f.wA * detailA + f.wB * detailB) * f.norm;
 }
 
 float WideFogThickness(float2 world) {
@@ -266,6 +363,18 @@ float CompactFogProfile(float height, float thickness, float scale, float topFea
     float top = saturate((thickness - height) / topFeather);
     if (topFeather > 8.0) top = top * top * (3.0 - 2.0 * top);
     return exp(-max(height, 0.0) / scale) * min(saturate(height * 0.125), top);
+}
+
+// Compact counterpart of the stretched raised band in WideFogProfile.
+float RaisedFogProfile(float height, float thickness, float scale, float topFeather) {
+    return CompactFogProfile(height - support.y, thickness * RaisedStretch, scale * RaisedStretch,
+                             topFeather * RaisedStretch) / RaisedStretch;
+}
+
+float FogFloorAt(float2 xz, float2 textureSize) {
+    float2 uv = saturate((xz - boundsMin.xz) / (boundsMax.xz - boundsMin.xz));
+    float4 cell = fogField.SampleLevel(fogSampler, (uv * (grid.xy - 1.0) + 0.5) / textureSize, 0.0);
+    return cell.y / max(cell.x, 0.0001);
 }
 
 )hlsl"
@@ -309,10 +418,12 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
 
     float segment = last - first;
     float rayLength = length(ray);
-    bool wide = grid.x >= 2.0 && max(boundsMax.x - boundsMin.x, boundsMax.z - boundsMin.z) > 1024.0;
+    float extent = max(boundsMax.x - boundsMin.x, boundsMax.z - boundsMin.z);
+    // A draw grid of up to 32 cells may span a whole village and still wants the interpolated floor.
+    bool wide = grid.x >= 2.0 && extent > 2560.0;
     bool compact = !wide && grid.x >= 2.0 && fogColor.w > 0.0;
     if (wide || compact) {
-        steps = wide ? 48 : 24;
+        steps = wide || extent > 1024.0 ? 48 : 32;
         offset = 0.5;
     }
     float minimumStep = segment / steps;
@@ -320,8 +431,26 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
     float integral = 0.0;
     float weightedDepth = 0.0;
     const bool useSun = sunRadiance.w > 0.0;
+    const bool airProfile = lighting.z > 0.0;
     uint2 sunSize = 0;
     if (useSun) solarDepth.GetDimensions(sunSize.x, sunSize.y);
+    float airSunPhase = 1.0;
+    if (useSun && lighting.w > 0.0) {
+        // Henyey-Greenstein, normalized against isotropic scattering. The shadow depth axis points toward the sun.
+        float g = lighting.w;
+        float viewSun = clamp(dot(ray / rayLength, sunProjection[2].xyz), -1.0, 1.0);
+        float phase = 1.0 + g * g - 2.0 * g * viewSun;
+        airSunPhase = min(4.0, (1.0 - g * g) * rsqrt(phase) / phase);
+    }
+    if (airProfile) {
+        const float beamGain = max(solarStyle.x, 1.0);
+        // Keep the shaft legible across the path when the sun is viewed from the side.
+        const float phaseFloor = beamGain > 1.0 ? 0.65 : 0.0;
+        airSunPhase = max(airSunPhase, phaseFloor) * beamGain;
+    }
+    const float3 sunDirection = sunProjection[2].xyz;
+    const float shaftStrength = solarStyle.y * smoothstep(0.18, 0.48, sunDirection.y);
+    const float2 canopySlope = sunDirection.xz / max(sunDirection.y, 0.18);
     float opticalScale = rayLength * cameraForward.w;
     float transmittance = 1.0;
     float travelled = 0.0;
@@ -365,11 +494,14 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                 float4 range = supportRanges.Load(int3(int2(sampleCell), 0));
                 float halfRise = 0.5 * abs(ray.y * width);
                 hasUpper = hasUpper && range.z <= range.w;
-                upperInRange = hasUpper && samplePoint.y + halfRise > range.z &&
-                               samplePoint.y - halfRise < range.w + grid.z + support.y;
+                float reach = grid.z + RaisedReach();
+                float upperBottom = airProfile ? range.z + 0.5 * grid.z - lighting.z : range.z;
+                float upperTop = range.w + (airProfile ? 0.5 * grid.z + lighting.z : reach);
+                upperInRange = hasUpper && samplePoint.y + halfRise > upperBottom &&
+                               samplePoint.y - halfRise < upperTop;
                 upperSplit = range.w - range.z > 0.5 * grid.z;
                 bool baseInRange = range.x <= range.y && samplePoint.y + halfRise > range.x &&
-                                   samplePoint.y - halfRise < range.y + grid.z + support.y;
+                                   samplePoint.y - halfRise < range.y + reach;
                 if (!baseInRange && !upperInRange) continue;
                 split = range.y - range.x > 0.36 * grid.z;
             }
@@ -378,11 +510,39 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
             density = clamp(cell.x, 0.0, 1.5);
             floorY = cell.y / max(cell.x, 0.0001);
             thickness = grid.z;
+            // Nested fine grid: density and velocity only. The floor stays with the main grid, so the two
+            // resolutions never disagree about the terrain.
+            [branch]
+            if (detailGrid.w > 0.5) {
+                float2 inner = min(samplePoint.xz - detailBounds.xy, detailBounds.zw - samplePoint.xz);
+                float fineWeight = saturate(min(inner.x, inner.y) / detailGrid.z);
+                [branch]
+                if (fineWeight > 0.0) {
+                    fineWeight = fineWeight * fineWeight * (3.0 - 2.0 * fineWeight);
+                    float2 fineCell = (samplePoint.xz - detailBounds.xy) / (detailBounds.zw - detailBounds.xy) *
+                                      (detailGrid.xy - 1.0);
+                    float4 fine = detailField.SampleLevel(fogSampler, (fineCell + 0.5) / 32.0, 0.0);
+                    density = lerp(density, clamp(fine.x, 0.0, 1.5), fineWeight);
+                    cell.zw = lerp(cell.zw, fine.yz, fineWeight);
+                }
+            }
             [branch]
             if (support.y > 0.0) raised = SampleBaseLift(textureUv);
+            float wideCloud = 0.0, wideDetail = 0.0, wideWeight = 0.0;
             if (wide) {
-                if (visual.y > 0.0) thickness = WideFogThickness(samplePoint.xz);
-                bool limitLift = hasUpper && raised > 0.0;
+                [branch]
+                if (visual.y > 0.0) {
+                    thickness = WideFogThickness(samplePoint.xz);
+                    // Flow map first, so the top of the layer rolls with the same structure that moves below.
+                    wideWeight = 1.0 - smoothstep(420.0, 980.0, distance);
+                    [branch]
+                    if (wideWeight > 0.0) {
+                        FlowDetail(samplePoint.xz, cell.zw + AmbientFlowWind(), FogFlowPhases(), 0.009, 0.021, 0.4, 0.0,
+                                   wideCloud, wideDetail);
+                        thickness *= 1.0 + wideWeight * (0.26 * wideCloud + 0.12 * wideDetail);
+                    }
+                }
+                bool limitLift = hasUpper && !airProfile && raised > 0.0;
                 [branch]
                 if (split || limitLift) {
                     wideDensity = WideFogDensity(sampleCell, samplePoint.y, ray.y * width, density, floorY, raised,
@@ -392,28 +552,34 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                                                            thickness, support.y);
                 }
             }
+            if (compact) {
+                // Banks stand taller than the thin fog between them, at any distance. A uniform top reads as a
+                // flat sheet with a straight horizon when seen at a grazing angle.
+                // Above 1 (only reachable with the nested grid, RFC 0034) the fog was piled up by an attack: it
+                // stands taller, so the rim of a cut reads from the side even inside an already opaque bank.
+                float bankHeight = lerp(0.5, 1.4, smoothstep(0.12, 1.25, density)) +
+                                   1.2 * smoothstep(1.0, 1.3, density);
+                thickness *= bankHeight;
+                heightScale *= bankHeight;
+            }
             [branch]
             if (visual.y > 0.0) {
-                // Stretch filaments along the velocity field and vary the thickness of the visible layer.
-                float2 p = samplePoint.xz - cell.zw * 0.18;
+                // Flow map: the detail travels with the local velocity plus the ambient wind, so the wind
+                // and the eddies left by attacks read as motion of the fog instead of a fixed offset.
+                float2 flowVelocity = cell.zw + AmbientFlowWind();
                 float compression = saturate((density - 0.60) * 2.5);
                 if (wide) {
                     // Blend near-field structure into the broad layer without changing its mean opacity.
-                    float detailWeight = 1.0 - smoothstep(420.0, 980.0, distance);
-                    [branch]
-                    if (detailWeight > 0.0) {
-                        float cloud = FogDetail(p * 0.009 + visual.zw);
-                        float detail = FogDetail(p.yx * 0.021 - visual.wz + float2(7.0, 15.0) + 0.4 * cloud);
-                        wideDensity *= 1.0 + detailWeight * (0.12 * cloud + 0.08 * detail + 0.48 * compression);
-                    }
+                    wideDensity *= max(0.0, 1.0 + wideWeight * (0.45 * wideCloud + 0.32 * wideDetail +
+                                                                 0.48 * compression));
                 } else {
+                    FlowPhases phases = FogFlowPhases();
                     float detailWeight = 1.0 - smoothstep(160.0, 490.0, distance);
                     float cloud = 0.0, detail = 0.0;
                     [branch]
                     if (detailWeight > 0.0) {
-                        cloud = FogDetail(p * 0.023 + 1.5 * visual.zw);
-                        detail = FogDetail(p.yx * 0.053 - visual.wz + float2(7.0, 15.0) + 0.5 * cloud +
-                                           float2(0.042, -0.027) * (samplePoint.y - floorY));
+                        FlowDetail(samplePoint.xz, flowVelocity, phases, 0.023, 0.053, 0.5,
+                                   float2(0.042, -0.027) * heightScale, cloud, detail);
                     }
                     float ribbon = saturate(0.5 + detailWeight * (0.44 * cloud + 0.31 * detail));
                     // Vary the top across the floor and feather it over more than one sample.
@@ -427,20 +593,49 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
             }
             [branch]
             if (upperInRange) {
-                upperDensity = UpperFogDensity(sampleCell, textureUv, samplePoint.y, ray.y * width, thickness,
-                                               upperSplit);
+                if (airProfile)
+                    upperDensity = AirFogDensity(textureUv, samplePoint.y, ray.y * width);
+                else
+                    upperDensity = UpperFogDensity(sampleCell, textureUv, samplePoint.y, ray.y * width, thickness,
+                                                   upperSplit);
             }
         }
         float opticalDensity = wideDensity;
         [branch]
         if (!wide) {
+            // Average the vertical profile over the height this step crosses, as the wide path does. A single
+            // sample per step turns a thin, dense layer into bands that slide when the camera turns.
             float height = samplePoint.y - floorY;
-            float vertical = CompactFogProfile(height, thickness, heightScale, topFeather);
-            [branch]
-            if (raised > 0.0) {
-                vertical = lerp(vertical, CompactFogProfile(height - support.y, thickness, heightScale, topFeather),
-                                raised);
+            float rise = ray.y * width;
+            float heightA = height - 0.5 * rise;
+            float heightB = height + 0.5 * rise;
+            // The floor is read at both ends of the step. With one floor per step, consecutive steps over a
+            // slope leave gaps or overlaps in height above the ground: stripes at the step spacing that slide
+            // with the camera.
+            if (grid.x >= 2.0) {
+                float3 pointA = cameraEye.xyz + ray * (t - offset * width);
+                float3 pointB = pointA + ray * width;
+                float2 textureSize = float2(textureWidth, textureHeight);
+                heightA = pointA.y - FogFloorAt(pointA.xz, textureSize);
+                heightB = pointB.y - FogFloorAt(pointB.xz, textureSize);
             }
+            // Fade the last units before the scene surface. Terrain the floor grid cannot resolve (a mound,
+            // a ramp, a rock) otherwise cuts the layer with a hard straight line.
+            float sceneGap = (zView - (t - offset * width)) * rayLength;
+            float tapLength = width * rayLength;
+            float vertical = 0.0;
+            [unroll]
+            for (int tap = 0; tap < 6; ++tap) {
+                float tapHeight = lerp(heightA, heightB, (tap + 0.5) / 6.0);
+                float tapProfile = CompactFogProfile(tapHeight, thickness, heightScale, topFeather);
+                [flatten]
+                if (raised > 0.0) {
+                    tapProfile = lerp(tapProfile, RaisedFogProfile(tapHeight, thickness, heightScale, topFeather),
+                                      raised);
+                }
+                vertical += tapProfile * saturate((sceneGap - tapLength * (tap + 0.5) / 6.0) / 10.0);
+            }
+            vertical *= 1.0 / 6.0;
             opticalDensity = density * vertical;
         }
         float sampleDensity = (opticalDensity + upperDensity) * edge * width;
@@ -449,7 +644,26 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
         [branch]
         if (useSun && sampleDensity > 0.0) {
             float stepTransmittance = exp(-sampleDensity * opticalScale);
-            sunlight += transmittance * (1.0 - stepTransmittance) * SolarVisibility(samplePoint, sunSize);
+            float solarWeight = 1.0;
+            const float visibility = SolarVisibility(samplePoint, sunSize);
+            if (airProfile && upperDensity > 0.0) {
+                float upperPhase = airSunPhase;
+                [branch]
+                if (shaftStrength > 0.0 && visibility > 0.0) {
+                    // Trace toward the sun through an opening above Kokiri's pond. The existing
+                    // solar shadow map still clips it against the scene geometry.
+                    const float canopyHeight = 285.0;
+                    const float2 opening = float2(1100.0, 405.0);
+                    const float2 radius = float2(56.0, 34.0);
+                    const float2 aperture = (samplePoint.xz + (canopyHeight - samplePoint.y) * canopySlope - opening)
+                                            / radius;
+                    const float edge = 1.0 - smoothstep(0.06, 1.0, dot(aperture, aperture));
+                    const float belowCanopy = 1.0 - smoothstep(canopyHeight - 28.0, canopyHeight, samplePoint.y);
+                    upperPhase *= 1.0 + shaftStrength * edge * belowCanopy;
+                }
+                solarWeight = lerp(1.0, upperPhase, upperDensity / (opticalDensity + upperDensity));
+            }
+            sunlight += transmittance * (1.0 - stepTransmittance) * visibility * solarWeight;
             transmittance *= stepTransmittance;
         }
     }
@@ -491,7 +705,10 @@ float4 FogColor(float2 uv, float alpha, float anchor, float sunlight) {
     float3 premultiplied = color * alpha;
     if (sunRadiance.w > 0.0) {
         float3 tint = lerp(float3(1.0, 0.86, 0.67), sunRadiance.rgb, 0.45);
-        premultiplied += tint * min(sunlight, alpha) * (1.0 - color) * sunRadiance.w;
+        // Include the upper-beam gain in the HDR bound so the boost survives composition.
+        const float solarLimit = alpha * (lighting.w > 0.0 ? 4.0 : 1.0) * max(solarStyle.x, 1.0)
+                                 * (1.0 + solarStyle.y);
+        premultiplied += tint * min(sunlight, solarLimit) * (1.0 - color) * sunRadiance.w;
     }
     return float4(premultiplied, alpha);
 }
@@ -569,9 +786,55 @@ ReducedFogOutput PSLow(float4 position : SV_Position) {
     return result;
 }
 
+#if FOG_MSAA || FOG_LAYER_TUNED
+// A/B in one session, no recompile (cbuffer upscaleTuning). Only the MSAA passes read it; the legacy
+// passes below keep their bytecode.
+static const float kToleranceRelativeUniform = 1.0;  // FogUpscaleTolerance >= 1: uniformity scales with depth
+static const float kToleranceSlopeBilateral = 2.0;   // FogUpscaleTolerance >= 2: bilateral allows for the plane's slope
+static const float kUniformDepthFraction = 0.01;     // below the upscale tolerance (0.018 z) so uniform pixels stay valid
+static const float kUniformDepthFloor = 0.12;
+static const float kSlopeReachPixels = 3.0;          // depth change between a pixel and the reduced corners it gathers
+static const float kSlopeAllowanceCap = 0.03;        // a real silhouette step still exceeds tolerance plus this
+static const float kHeatAlpha = 0.6;
+
+// Depth change per pixel. Derivatives are undefined after a divergent return, so callers take this
+// before any early-out (or carry it through the uniform cache).
+float DepthSlope(float zView) {
+    return max(abs(ddx(zView)), abs(ddy(zView)));
+}
+
+float UniformDepthTolerance(float nearView) {
+    return upscaleTuning.x >= kToleranceRelativeUniform ? max(kUniformDepthFloor, kUniformDepthFraction * nearView)
+                                                          : clamp(0.002 * nearView, 0.12, 1.2);
+}
+
+float4 HeatColor(float3 color) {
+    return float4(color * kHeatAlpha, kHeatAlpha);
+}
+
+#if FOG_LAYER_TUNED && !FOG_MSAA
+// The linear layer's diff mode evaluates two tolerance modes in the same pixel and frame.
+static float layerToleranceMode = 0.0;
+#define FOG_TOLERANCE_MODE layerToleranceMode
+#define FOG_HEAT_SKIPS_MARCH (upscaleTuning.y > 0.5 && upscaleTuning.y < 1.5)
+#else
+#define FOG_TOLERANCE_MODE upscaleTuning.x
+#define FOG_HEAT_SKIPS_MARCH (upscaleTuning.y > 0.5)
+#endif
+// route: 0 = all four reduced corners matched, 1 = bilateral estimate, 2 = exact March fallback
+// (with the heatmap on the march is skipped).
+float4 UpscaleFog(float2 position, float zView, float slope, out float route) {
+#else
 float4 UpscaleFog(float2 position, float zView) {
+#endif
     float2 uv = (position - viewport.xy) / viewport.zw;
     float tolerance = max(5.0, 0.018 * zView);
+#if FOG_MSAA || FOG_LAYER_TUNED
+    route = 0.0;
+    tolerance += FOG_TOLERANCE_MODE >= kToleranceSlopeBilateral
+                     ? min(kSlopeReachPixels * slope, kSlopeAllowanceCap * zView)
+                     : 0.0;
+#endif
     float4 depths = reducedFog.GatherBlue(fogSampler, uv);
     float4 depthErrors = abs(depths - zView);
     bool useSun = sunRadiance.w > 0.0;
@@ -604,16 +867,31 @@ float4 UpscaleFog(float2 position, float zView) {
         float solar = useSun ? dot(reducedSun.GatherRed(fogSampler, uv), weights) : 0.0;
         estimate = float3(dot(reducedFog.GatherRed(fogSampler, uv), weights), dot(anchors, weights), solar) /
                    max(weightSum, 0.0001);
+#if FOG_MSAA || FOG_LAYER_TUNED
+        route = 1.0;
+#endif
         [branch]
         if (confidence >= 0.6) return FogColor(uv, estimate.x, estimate.y, estimate.z);
     }
     // Resolve thin foreground features against their actual depth. Fade the reduced estimate out
     // as its footprint becomes unreliable so edges remain continuous during camera motion.
+#if FOG_MSAA || FOG_LAYER_TUNED
+    route = 2.0;
+    [branch]
+    if (FOG_HEAT_SKIPS_MARCH) return 0.0;
+#endif
     float exactSun;
-    float2 exact = March(WorldRay(uv), zView, 0.5, 4, exactSun).xy;
-    float3 fog = lerp(float3(exact, exactSun), estimate, smoothstep(0.0, 0.6, confidence));
+    float2 exactFog = March(WorldRay(uv), zView, 0.5, 4, exactSun).xy;
+    float3 fog = lerp(float3(exactFog, exactSun), estimate, smoothstep(0.0, 0.6, confidence));
     return FogColor(uv, fog.x, fog.y, fog.z);
 }
+
+#if FOG_LAYER_TUNED && !FOG_MSAA
+float4 UpscaleFog(float2 position, float zView) {
+    float route;
+    return UpscaleFog(position, zView, 0.0, route);
+}
+#endif
 
 #if FOG_MSAA
 float4 PSUniformFog(float4 position : SV_Position) : SV_Target {
@@ -629,27 +907,86 @@ float4 PSUniformFog(float4 position : SV_Position) : SV_Target {
         farDepth = max(farDepth, depth);
     }
     float nearView = DecodeDepth(nearDepth);
-    float tolerance = clamp(0.002 * nearView, 0.12, 1.2);
-    if (DecodeDepth(farDepth) - nearView > tolerance) return float4(0.0, 0.0, 0.0, -1.0);
-    return UpscaleFog(screen, nearView);
+    // Before the early-out: a derivative after a divergent return is undefined.
+    float slope = DepthSlope(nearView);
+    float tolerance = UniformDepthTolerance(nearView);
+    // Non-uniform pixels hand their slope to PSUpscaleCached through the unused rgb of the cache.
+    if (DecodeDepth(farDepth) - nearView > tolerance)
+        return float4(upscaleTuning.x >= kToleranceSlopeBilateral ? min(slope, 60000.0) : 0.0, 0.0, 0.0, -1.0);
+    float route;
+    float4 fog = UpscaleFog(screen, nearView, slope, route);
+    // Heatmap: red = exact March fallback, green = served by the uniform cache.
+    return upscaleTuning.y > 0.5 ? HeatColor(route > 1.5 ? float3(1.0, 0.0, 0.0) : float3(0.0, 1.0, 0.0)) : fog;
 }
 
 float4 PSUpscaleCached(float4 position : SV_Position, uint sampleIndex : SV_SampleIndex) : SV_Target {
     float4 cached = uniformFog.Load(int3(int2(position.xy - viewport.xy), 0));
     [branch]
     if (cached.a >= 0.0) return cached;
-    return UpscaleFog(SamplePosition(position.xy, sampleIndex),
-                      DecodeDepth(worldDepth.Load(int2(position.xy), sampleIndex)));
+    float route;
+    float4 fog = UpscaleFog(SamplePosition(position.xy, sampleIndex),
+                            DecodeDepth(worldDepth.Load(int2(position.xy), sampleIndex)), cached.r, route);
+    // Heatmap: red = exact March fallback, blue = per-sample bilateral without fallback.
+    return upscaleTuning.y > 0.5 ? HeatColor(route > 1.5 ? float3(1.0, 0.0, 0.0) : float3(0.0, 0.0, 1.0)) : fog;
 }
 
 float4 PSUpscale(float4 position : SV_Position, uint sampleIndex : SV_SampleIndex) : SV_Target {
-    return UpscaleFog(SamplePosition(position.xy, sampleIndex),
-                      DecodeDepth(worldDepth.Load(int2(position.xy), sampleIndex)));
+    float zView = DecodeDepth(worldDepth.Load(int2(position.xy), sampleIndex));
+    float slope = DepthSlope(zView);
+    float route;
+    float4 fog = UpscaleFog(SamplePosition(position.xy, sampleIndex), zView, slope, route);
+    return upscaleTuning.y > 0.5 ? HeatColor(route > 1.5 ? float3(1.0, 0.0, 0.0) : float3(0.0, 0.0, 1.0)) : fog;
 }
 #else
 float4 PSUpscale(float4 position : SV_Position) : SV_Target {
     return UpscaleFog(position.xy, DecodeDepth(NearestDepth(int2(position.xy))));
 }
+#endif
+
+// A saida legada e premultiplicada em valores codificados sRGB. Converter
+// a cor reta antes do blend preserva a energia de volumes sobrepostos.
+// Entradas separadas deixam o bytecode dos passes legados inalterado.
+#if !FOG_MSAA
+float4 LinearFog(float4 fog) {
+    if (fog.a <= 0.0) return 0.0;
+    float3 color = max(fog.rgb / fog.a, 0.0);
+    float3 low = color / 12.92;
+    float3 high = pow((color + 0.055) / 1.055, 2.4);
+    float3 decoded = float3(color.r <= 0.04045 ? low.r : high.r,
+                           color.g <= 0.04045 ? low.g : high.g,
+                           color.b <= 0.04045 ? low.b : high.b);
+    return float4(decoded * fog.a, fog.a);
+}
+float4 PSLayer(float4 position : SV_Position) : SV_Target {
+    return LinearFog(FullFog(position.xy, DecodeDepth(NearestDepth(int2(position.xy)))));
+}
+float4 PSLayerUpscale(float4 position : SV_Position) : SV_Target {
+    return LinearFog(UpscaleFog(position.xy, DecodeDepth(NearestDepth(int2(position.xy)))));
+}
+#if FOG_LAYER_TUNED
+// Linear-layer upscale with the A/B knobs; compiled apart so PSLayerUpscale keeps its bytecode.
+// Heatmap: green = four corners matched, blue = bilateral estimate, red = exact March fallback.
+float4 PSLayerUpscaleTuned(float4 position : SV_Position) : SV_Target {
+    float zView = DecodeDepth(NearestDepth(int2(position.xy)));
+    float slope = DepthSlope(zView);
+    float route;
+    [branch]
+    if (upscaleTuning.y > 1.5) {
+        // Diff mode (FogUpscaleHeatmap 2): |tolerance 2 - tolerance 0| x8, opaque, same pixel and frame.
+        layerToleranceMode = 0.0;
+        float4 reference = LinearFog(UpscaleFog(position.xy, zView, slope, route));
+        layerToleranceMode = 2.0;
+        float4 candidate = LinearFog(UpscaleFog(position.xy, zView, slope, route));
+        return float4(saturate(8.0 * abs(candidate.rgb - reference.rgb)), 1.0);
+    }
+    layerToleranceMode = upscaleTuning.x;
+    float4 fog = UpscaleFog(position.xy, zView, slope, route);
+    [branch]
+    if (upscaleTuning.y > 0.5)
+        return HeatColor(route > 1.5 ? float3(1.0, 0.0, 0.0) : route > 0.5 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0));
+    return LinearFog(fog);
+}
+#endif
 #endif
 )hlsl";
 } // namespace Fast

@@ -5,8 +5,11 @@
 #ifdef __cplusplus
 #include "../interpreter.h"
 #include "../fog_volume.h"
+#include "../alpha_cutout.h"
+#include "../foliage_depth_diagnostics.h"
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include "gfx_rendering_api.h"
 #include "d3d11.h"
@@ -65,6 +68,7 @@ struct TextureData {
     uint32_t cms = 0, cmt = 0;
     bool linear_filtering = false;
     bool is_framebuffer = false;
+    AlphaCutout::Statistics alphaCoverage{};
 };
 
 struct FramebufferDX11 {
@@ -88,6 +92,12 @@ struct ShaderProgramD3D11 {
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool opt_toon = false; // SOH [Enhancement] toon lighting variant
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> foliage_shadow;
+    bool foliage_shadow_attempted = false;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> foliage_depth_msaa;
+    bool foliage_depth_msaa_attempted = false;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> foliage_depth_debug[2];
+    bool foliage_depth_debug_attempted[2]{};
 };
 
 class GfxWindowBackendDXGI;
@@ -106,6 +116,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     struct ShaderProgram* LookupShader(uint64_t shaderId0, uint64_t shaderId1) override;
     void ShaderGetInfo(struct ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) override;
     void ClearShaderCache() override;
+    bool IsCutoutTexture(unsigned tile) const;
+    // Borrowed, cached per shader program; never binds it to the main draw.
+    ID3D11PixelShader* GetFoliageShadowShader();
+    ID3D11PixelShader* GetFoliageDepthShader(bool multisampled, bool debug = false);
+    // Not virtual on purpose: a new GfxRenderingAPI slot would shift the vtable for every prebuilt caller.
+    void DrawFoliageDepth(size_t numTris, int worldFramebuffer);
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
@@ -146,12 +162,27 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
         return true;
     }
     void DrawFogVolume(const FastFogVolume& volume, const FastFogFlow* flow) override;
+    // Recursos da variante linear: uma vez por dispositivo, antes de ativar o pack.
+    bool PrepareWorldFogLayer();
     void SelectTextureFb(int fbId) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+
+    // Lease compartilhado: queries nao sao reutilizadas enquanto algum consumidor as le.
+    // R069 e WorldPass usam UM disjoint por StartFrame/EndFrame, inclusive sem Compose.
+    struct GpuTimingClock {
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+        uint64_t frame = 0;
+        bool ended = false;
+    };
+    std::shared_ptr<GpuTimingClock> AcquireGpuTimingClock();
+    uint64_t GpuTimingFrame() const { return mTimingFrame; }
+    // Nao virtuais. Resultado do quadro inteiro, publicado no giro de oito frames.
+    bool ReadFoliageDepthTiming(uint64_t frame, FoliageDepth::Sample& sample) const;
+    unsigned FoliageDepthDiagnosticMode() const { return mFoliageDiagnosticMode; }
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -160,13 +191,43 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     D3D_FEATURE_LEVEL mFeatureLevel;
 
   private:
+    using FoliageQuery = Microsoft::WRL::ComPtr<ID3D11Query>;
+    struct FoliageTimingSlot {
+        std::array<std::array<FoliageQuery, 2>, FoliageDepth::MaxIntervals> timestamps{};
+        std::shared_ptr<GpuTimingClock> clock;
+        FoliageDepth::Sample sample{};
+        std::size_t intervals = 0;
+        bool pending = false, discard = false;
+    };
+    std::array<FoliageTimingSlot, FoliageDepth::RingSize> mFoliageTiming{};
+    std::array<FoliageDepth::Sample, FoliageDepth::RingSize> mFoliageResults{};
+    FoliageDepth::Counts mFoliageFrameCounts{};
+    FoliageDepth::CountBatch mFoliageCountBatch{};
+    uint64_t mFoliageCountRun = 0, mFoliageCountBatchId = 0;
+    uint64_t mFoliageOverflowFrames = 0, mFoliageSkippedFrames = 0;
+    unsigned mFoliageDiagnosticMode = 0;
+    int mActiveFoliageTiming = -1;
+    bool mFoliageQueriesReady = false, mFoliageQueriesFailed = false;
+    bool InitFoliageDepthTiming();
+    bool CollectFoliageDepthTiming(FoliageTimingSlot& slot);
+    void BeginFoliageDepthFrame();
+    void EndFoliageDepthFrame();
+    void BeginFoliageDepthDraw(const FramebufferDX11& fb);
+    void EndFoliageDepthDraw(std::size_t numTris);
+
     struct FrameTiming {
-        Microsoft::WRL::ComPtr<ID3D11Query> disjoint, begin, end;
+        std::shared_ptr<GpuTimingClock> clock;
+        Microsoft::WRL::ComPtr<ID3D11Query> begin, end;
         uint64_t frame = 0;
         uint64_t epoch = 0;
         float scale = 1.0f;
         bool pending = false;
     };
+    // O pack colhe em Prepare, depois do StartFrame do R069. Uma reserva separada
+    // evita que os oito leases do pack impeçam o R069 de comecar o quadro seguinte.
+    std::array<std::shared_ptr<GpuTimingClock>, 16> mGpuTimingClocks{};
+    std::shared_ptr<GpuTimingClock> mGpuFrameClock;
+    bool mGpuClockFailed = false;
     std::array<FrameTiming, 8> mFrameTiming{};
     int mActiveFrameTiming = -1;
     uint64_t mTimingFrame = 0;
@@ -199,7 +260,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool InitFogMsaaCache(UINT width, UINT height);
     void DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
                     const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction, bool useSun,
-                    ID3D11Query* lowEnd);
+                    ID3D11Query* lowEnd, ID3D11RenderTargetView* target, ID3D11BlendState* blend,
+                    bool multisampled, bool linearLayer);
     bool InitFogFlow();
     bool InitFogVertical();
     bool InitFogParticles();
@@ -211,6 +273,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
                       ID3D11ShaderResourceView* source);
     void CollectFogTiming();
     struct FogTiming {
+        // Quando o pack ja abriu um relogio de quadro, evitar disjoint aninhado.
+        std::shared_ptr<GpuTimingClock> frameClock;
         Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
         Microsoft::WRL::ComPtr<ID3D11Query> begin;
         Microsoft::WRL::ComPtr<ID3D11Query> fieldEnd;
@@ -224,6 +288,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     };
     Microsoft::WRL::ComPtr<ID3D11VertexShader> mFogVs;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogPs, mFogMsaaPs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogLayerPs, mFogLayerUpscalePs;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFogLayerBlend;
+    bool mFogLayerFailed = false;
+    bool mFogLastLinearLayer = false;
     struct FogLodShaders {
         Microsoft::WRL::ComPtr<ID3D11PixelShader> low, upscale;
         bool failed = false;
@@ -344,6 +412,13 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // CreateDepthStencilState). Key: depthTest | depthMask<<1 | zmodeDecal<<2 | stencilMode<<3 — same
     // scheme as the Metal backend's cache.
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilStates[64];
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFoliageDepthBlend;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFoliageDepthDebugBlend;
+    bool mFoliageDepthDebugBlendFailed = false;
+    // Index is the actual bound comparison function (1..8), including the legacy decal cache behavior.
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mFoliageDepthStates[9];
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mFoliageDepthRasterSource, mFoliageDepthRaster;
+    bool mFoliageDepthStateFailed = false;
     int mLastStencilMode = -1; // SOH [Enhancement] world light casting: cache tracker for mStencilMode
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;

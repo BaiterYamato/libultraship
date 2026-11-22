@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <mutex>
 #include <any>
 #include <map>
@@ -33,6 +34,7 @@
 
 #include "fast/interpreter.h"
 #include "fast/fog_volume.h"
+#include "fast/labpbr_kokiri.h"
 #include "fast/world_postprocess.h"
 #include <atomic>
 #include "fast/lus_gbi.h"
@@ -200,6 +202,9 @@ static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 namespace {
 struct WorldGeometryCapture {
     bool armed = false;
+    bool cutoutOnly = false;
+    bool foliageEnabled = false;
+    bool foliageDepthEnabled = false;
     bool overflow = false;
     std::vector<std::array<float, 3>> vertices;
     bool transmissionArmed = false;
@@ -210,12 +215,78 @@ struct WorldGeometryCapture {
 #if defined(_WIN32) && defined(ENABLE_DX11)
     std::vector<float> cutoutVertices;
     std::vector<WorldCutoutBatch> cutoutBatches;
+    bool cutoutOverflowReported = false;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> pendingPixel;
+    bool pendingFoliageDepth = false;
     unsigned pendingOffset = 0;
     unsigned stride = 0;
     std::array<bool, 2> linear{};
 #endif
 };
 thread_local WorldGeometryCapture worldGeometry;
+
+#if defined(_WIN32) && defined(ENABLE_DX11)
+struct KokiriLabPbrReplay {
+    GfxRenderingAPIDX11* renderer = nullptr;
+    bool armed = false;
+    KokiriLabPbrMaterial batchMaterial = KokiriLabPbrMaterial::None;
+    std::array<bool, MAX_VERTICES> vertices{};
+    KokiriLabPbrLighting lighting{};
+    std::array<float, 3> sun{};
+};
+
+thread_local KokiriLabPbrReplay kokiriLabPbr;
+thread_local std::array<bool, KokiriLabPbrSurfaces.size()> kokiriLabPbrReported{};
+// LabPBR variants the backend refused. The backend answers "refused" and "not built yet" with the same nullptr, so
+// without this memo every eligible triangle would Flush() and retry the build. Dropped with the shader cache.
+thread_local std::set<std::pair<uint64_t, uint64_t>> kokiriLabPbrRefused;
+
+bool ReadKokiriLabPbrLighting(const float (&projection)[4][4], KokiriLabPbrLighting& lighting) {
+    using Vector = std::array<float, 3>;
+    const auto column = [&](unsigned i) -> Vector { return {projection[0][i], projection[1][i], projection[2][i]}; };
+    const auto cross = [](const Vector& a, const Vector& b) -> Vector {
+        return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    };
+    const auto dot = [](const Vector& a, const Vector& b) {
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    };
+    // The eye is the intersection of the replay's clip X=0, Y=0, W=0 planes.
+    // A perspective projection has an intersection; an orthographic one does not.
+    const Vector x = column(0), y = column(1), w = column(3);
+    const Vector yw = cross(y, w), wx = cross(w, x), xy = cross(x, y);
+    const float denominator = dot(x, yw);
+    if (!std::isfinite(denominator) || std::abs(denominator) < 1e-5f)
+        return false;
+    const float sunLength = std::sqrt(dot(kokiriLabPbr.sun, kokiriLabPbr.sun));
+    if (sunLength <= 0.0f)
+        return false;
+    for (unsigned i = 0; i < 3; ++i) {
+        lighting.eye[i] = -(projection[3][0] * yw[i] + projection[3][1] * wx[i] +
+                            projection[3][3] * xy[i]) / denominator;
+        if (!std::isfinite(lighting.eye[i]))
+            return false;
+        lighting.sun[i] = kokiriLabPbr.sun[i] / sunLength;
+    }
+    return true;
+}
+
+KokiriLabPbrMaterial FindKokiriLabPbrSurface(const RawTexMetadata& meta, uint32_t width, uint32_t height,
+                                           uint32_t tileWidth, uint32_t tileHeight, bool clampT, bool textureEdge) {
+    if (!meta.resource || meta.type != TextureType::RGBA16bpp || meta.h_byte_scale != 1.0f ||
+        meta.v_pixel_scale != 1.0f || (meta.resource->Flags & (TEX_FLAG_LOAD_AS_RAW | TEX_FLAG_LOAD_AS_IMG)) ||
+        meta.width != width || meta.height != height || width != tileWidth || height != tileHeight)
+        return KokiriLabPbrMaterial::None;
+
+    const auto& path = meta.resource->GetInitData()->Path;
+    for (size_t i = 0; i < KokiriLabPbrSurfaces.size(); ++i) {
+        const auto& surface = KokiriLabPbrSurfaces[i];
+        if (surface.width == width && surface.height == height && path == surface.texture &&
+            surface.clampT == clampT && surface.textureEdge == textureEdge)
+            return static_cast<KokiriLabPbrMaterial>(i);
+    }
+    return KokiriLabPbrMaterial::None;
+}
+#endif
 std::atomic<WorldMaterialMatcher> worldMaterialMatcher = nullptr;
 
 #if defined(_WIN32) && defined(ENABLE_DX11)
@@ -240,7 +311,16 @@ void CaptureCutoutBatch(GfxRenderingAPI* renderer) {
     capture.pendingOffset = end;
     auto& ctx = *dx11->mContext.Get();
     ctx.VSGetShader(batch.vertex.GetAddressOf(), nullptr, nullptr);
-    ctx.PSGetShader(batch.pixel.GetAddressOf(), nullptr, nullptr);
+    if (capture.pendingPixel) {
+        batch.foliage = true;
+        batch.pixel = capture.pendingPixel;
+        std::array<ID3D11SamplerState*, 2> points{};
+        ctx.PSGetSamplers(8, 2, points.data());
+        for (unsigned i = 0; i < points.size(); ++i)
+            batch.pointSamplers[i].Attach(points[i]);
+    } else {
+        ctx.PSGetShader(batch.pixel.GetAddressOf(), nullptr, nullptr);
+    }
     ctx.IAGetInputLayout(batch.layout.GetAddressOf());
     std::array<ID3D11ShaderResourceView*, WorldCutoutTextureSlots> views{};
     std::array<ID3D11SamplerState*, WorldCutoutTextureSlots> samplers{};
@@ -273,8 +353,16 @@ void Interpreter::Flush() {
         // Push the dominant toon light for this batch. The backend only consumes it
         // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
         mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        if (kokiriLabPbr.batchMaterial != KokiriLabPbrMaterial::None)
+            SetKokiriLabPbrDraw(kokiriLabPbr.batchMaterial, kokiriLabPbr.lighting);
+#endif
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
 #if defined(_WIN32) && defined(ENABLE_DX11)
+        // Reuse the VBO interval just uploaded by DrawTriangles, before any state/target change.
+        // Only set when the filter already found the DX11 backend.
+        if (worldGeometry.pendingFoliageDepth)
+            static_cast<GfxRenderingAPIDX11*>(mRapi)->DrawFoliageDepth(mBufVboNumTris, MainDrawFramebuffer());
         CaptureCutoutBatch(mRapi);
 #endif
         mBufVboLen = 0;
@@ -628,6 +716,9 @@ void Interpreter::TextureCacheClear() {
 }
 
 void Interpreter::ShaderCacheClear() {
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    kokiriLabPbrRefused.clear();
+#endif
     mRapi->ClearShaderCache();
 }
 
@@ -1791,7 +1882,12 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 std::span<const std::array<float, 3>> ReadWorldGeometry() {
-    return worldGeometry.overflow ? std::span<const std::array<float, 3>>{} : worldGeometry.vertices;
+    // Ao encher, mantém o que já entrou: descartar tudo apagava a sombra do cenário e do Link inteiros.
+    return worldGeometry.vertices;
+}
+
+bool WorldGeometryOverflowed() {
+    return worldGeometry.overflow;
 }
 
 void SetWorldMaterialMatcher(WorldMaterialMatcher matcher) {
@@ -1812,6 +1908,19 @@ WorldCutoutGeometry ReadWorldCutouts() {
 #endif
 }
 #endif
+
+// M12: contexto do replay, fora do layout de qualquer classe. Reader atomico,
+// frame copiado no BEGIN e descartado no END/Run; nunca consulta gPlayState aqui.
+static std::atomic<WorldWaterReader> worldWaterReader{ nullptr };
+static thread_local WaterDisplace::Frame waterFrame;
+static thread_local bool waterArmed = false;
+static thread_local std::array<bool, MAX_VERTICES> waterVertices{};
+static thread_local unsigned waterSourceTriangles = 0, waterOutputTriangles = 0;
+// Diagnostico (gDeveloperTools.WaterDisplaceStats, lido no BEGIN): 1 = log; 2 = log e cores
+// (deslocado vermelho, recusado perto do plano azul) para achar costuras com vizinho plano.
+static thread_local int waterDebug = 0;
+static thread_local unsigned waterNearRejected = 0;
+void SetWorldWaterReader(WorldWaterReader callback) { worldWaterReader.store(callback); }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
@@ -1844,7 +1953,16 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         if (dest_index < MAX_VERTICES)
             worldGeometry.transmissionVertices[dest_index] = worldGeometry.transmissionArmed;
-        if (worldGeometry.armed || worldGeometry.transmissionArmed ||
+        if (dest_index < MAX_VERTICES)
+            waterVertices[dest_index] = waterArmed;
+        bool labPbrVertex = false;
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        // Disarmed: no write. vertices[] is only read while armed (triangle path) and is cleared on every arm
+        // (FAST_WORLD_KOKIRI_LABPBR_BEGIN), so a stale entry left from an earlier armed span is never observed.
+        if (kokiriLabPbr.armed && dest_index < MAX_VERTICES)
+            labPbrVertex = kokiriLabPbr.vertices[dest_index] = true;
+#endif
+        if (waterArmed || worldGeometry.armed || worldGeometry.transmissionArmed || labPbrVertex ||
             ((mRsp->geometry_mode & G_LIGHTING) && (mRdp->toon || mRdp->toon_shadow))) {
             const auto& mv = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
@@ -2056,16 +2174,97 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
 
+    // M12: classifica o TRIANGULO, nao vertices isolados. Nunca atores/HUD,
+    // retangulos, FBOs, primitivas de profundidade ou vertices de outro escopo.
+    if (waterArmed && !mFbActive && !is_rect && vtx1_idx < MAX_VERTICES &&
+        vtx2_idx < MAX_VERTICES && vtx3_idx < MAX_VERTICES &&
+        waterVertices[vtx1_idx] && waterVertices[vtx2_idx] && waterVertices[vtx3_idx] &&
+        (mRsp->geometry_mode & G_ZBUFFER) &&
+        (mRdp->other_mode_l & (Z_CMP | Z_UPD | FORCE_BL | G_ZS_PRIM)) == (Z_CMP | FORCE_BL)) {
+        const WaterDisplace::Point a{v1->wx,v1->wy,v1->wz}, b{v2->wx,v2->wy,v2->wz}, c{v3->wx,v3->wy,v3->wz};
+        if (WaterDisplace::Eligible(waterFrame,a,b,c)) {
+            ++waterSourceTriangles;
+            const std::array<LoadedVertex,3> source{*v1,*v2,*v3};
+            const std::array<LoadedVertex,3> scratch{
+                mRsp->loaded_vertices[MAX_VERTICES], mRsp->loaded_vertices[MAX_VERTICES+1],
+                mRsp->loaded_vertices[MAX_VERTICES+2]};
+            auto build = [&](const WaterDisplace::Vertex& q) {
+                LoadedVertex d{};
+                for (unsigned k=0;k<3;++k) {
+                    const float t=q.weight[k]; const auto& v=source[k];
+                    d.u+=t*v.u; d.v+=t*v.v;
+                    if ((mRsp->geometry_mode & G_LIGHTING) && mRdp->toon) {
+                        d.nx+=t*v.nx; d.ny+=t*v.ny; d.nz+=t*v.nz;
+                    }
+                }
+                auto channel=[&](auto member) {
+                    float value=0;
+                    for(unsigned k=0;k<3;++k) value+=q.weight[k]*(source[k].color.*member);
+                    return static_cast<uint8_t>(std::clamp(value,0.0f,255.0f));
+                };
+                d.color={channel(&RGBA::r),channel(&RGBA::g),channel(&RGBA::b),channel(&RGBA::a)};
+                if (waterDebug >= 2) { d.color.r = 255; d.color.g = 40; d.color.b = 40; }
+                d.wx=q.p.x; d.wz=q.p.z;
+                d.wy=q.p.y+WaterDisplace::Displacement(waterFrame,q.p.x,q.p.z,q.p.y);
+                // Neste host a camera esta em P_matrix; wx/wy/wz sao mundo.
+                const auto& p=mRsp->P_matrix;
+                d.x=AdjXForAspectRatio(d.wx*p[0][0]+d.wy*p[1][0]+d.wz*p[2][0]+p[3][0]);
+                d.y=d.wx*p[0][1]+d.wy*p[1][1]+d.wz*p[2][1]+p[3][1];
+                d.z=d.wx*p[0][2]+d.wy*p[1][2]+d.wz*p[2][2]+p[3][2];
+                d.w=d.wx*p[0][3]+d.wy*p[1][3]+d.wz*p[2][3]+p[3][3];
+                d.clip_rej=(d.x < -d.w ? 1:0)|(d.x > d.w ? 2:0)|
+                           (d.y < -d.w ? 4:0)|(d.y > d.w ? 8:0)|(d.z > d.w ? 32:0);
+                if(mRsp->geometry_mode & G_FOG) {
+                    float w=std::abs(d.w)<0.001f?0.001f:d.w;
+                    float inv=w<0?float(std::numeric_limits<int16_t>::max()):1.0f/w;
+                    d.color.a=static_cast<uint8_t>(std::clamp(d.z*inv*mRsp->fog_mul+mRsp->fog_offset,0.0f,255.0f));
+                }
+                return d;
+            };
+            // Agua reconhecida nao deve virar cutout/folhagem ao reentrar.
+            const bool captureArmed = worldGeometry.armed;
+            worldGeometry.armed = false;
+            WaterDisplace::Tessellate(a,b,c,waterFrame,[&](const auto& x,const auto& y,const auto& z) {
+                mRsp->loaded_vertices[MAX_VERTICES]=build(x);
+                mRsp->loaded_vertices[MAX_VERTICES+1]=build(y);
+                mRsp->loaded_vertices[MAX_VERTICES+2]=build(z);
+                ++waterOutputTriangles;
+                // Indices scratch impedem recursao e captura como sombra opaca.
+                GfxSpTri1(MAX_VERTICES,MAX_VERTICES+1,MAX_VERTICES+2,false);
+            });
+            worldGeometry.armed = captureArmed;
+            for(unsigned k=0;k<3;++k) mRsp->loaded_vertices[MAX_VERTICES+k]=scratch[k];
+            return;
+        }
+        if (waterDebug) {
+            // Recusado mas encostado numa caixa (Y a menos de 4 u e AABB XZ sobreposta): candidato a
+            // costura com a agua deslocada ao lado. So diagnostico; nao muda a classificacao.
+            for (std::size_t i = 0; i < std::min(waterFrame.count, waterFrame.boxes.size()); ++i) {
+                const auto& box = waterFrame.boxes[i];
+                if (std::abs(a.y - box.y) > 4.0f || std::abs(b.y - box.y) > 4.0f || std::abs(c.y - box.y) > 4.0f)
+                    continue;
+                if (std::max({ a.x, b.x, c.x }) < box.x0 || std::min({ a.x, b.x, c.x }) > box.x1 ||
+                    std::max({ a.z, b.z, c.z }) < box.z0 || std::min({ a.z, b.z, c.z }) > box.z1)
+                    continue;
+                ++waterNearRejected;
+                if (waterDebug >= 2)
+                    for (auto* v : v_arr) { v->color.r = 40; v->color.g = 80; v->color.b = 255; }
+                break;
+            }
+        }
+    }
+
     // Capture before camera triangle clipping and backface culling. Depth-writing opaque triangles have a
     // usable silhouette without replaying the N64 combiner. Alpha-tested materials need a separate path.
-    const bool shadowCandidate =
-        worldGeometry.armed && !mFbActive && !is_rect && vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES &&
+    const bool depthWritingWorldTriangle =
+        !mFbActive && !is_rect && vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES &&
         vtx3_idx < MAX_VERTICES && (mRsp->geometry_mode & G_ZBUFFER) &&
         (mRdp->other_mode_l & (Z_CMP | Z_UPD)) == (Z_CMP | Z_UPD) &&
         (mRdp->other_mode_l & (G_ZS_PRIM | FORCE_BL)) == 0 && (mRdp->other_mode_l & ZMODE_DEC) != ZMODE_DEC;
+    const bool shadowCandidate = worldGeometry.armed && !worldGeometry.cutoutOnly && depthWritingWorldTriangle;
     if (shadowCandidate && !worldGeometry.overflow &&
         (mRdp->other_mode_l & (CVG_X_ALPHA | (3U << G_MDSFT_ALPHACOMPARE))) == 0) {
-        if (worldGeometry.vertices.size() == MaxWorldGeometryVertices) {
+        if (worldGeometry.vertices.size() + 3 > MaxWorldGeometryVertices) {
             worldGeometry.overflow = true;
         } else {
             for (const auto* v : v_arr)
@@ -2261,11 +2460,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         cc_options |= SHADER_OPT(PRIM_DEPTH);
     }
 
-    if (!mShaderStack.empty()) {
-        cc_options |= (mShaderStack.top() << SHADER_ID_SHIFT);
-    } else {
-        cc_options |= -1 << SHADER_ID_SHIFT;
-    }
+    // Keep the custom shader id within its reserved 16-bit field.
+    const uint16_t customShader = mShaderStack.empty() ? 0xFFFFu : static_cast<uint16_t>(mShaderStack.top());
+    cc_options |= uint64_t{customShader} << SHADER_ID_SHIFT;
     if (use_toon) {
         cc_options |= SHADER_OPT(TOON);
     }
@@ -2414,10 +2611,53 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
-    struct ShaderProgram* prg = comb->prg[tm];
+    const uint64_t shaderOptions = comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S);
+    struct ShaderProgram* prg = nullptr;
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    KokiriLabPbrLighting labPbrLighting{};
+    auto labPbrMaterial = KokiriLabPbrMaterial::None;
+    // A native texture-edge combiner discards holes and sets the alpha of surviving samples to 1.
+    // Depth-writing LabPBR draws can preserve that path for a catalogued cutout without adding blended surfaces.
+    if (kokiriLabPbr.armed && depthWritingWorldTriangle && (!use_alpha || texture_edge) && !alpha_threshold &&
+        !use_noise && !invisible &&
+        !use_grayscale && !use_toon && mShaderStack.empty() && comb->usedTextures[0] &&
+        kokiriLabPbr.vertices[vtx1_idx] && kokiriLabPbr.vertices[vtx2_idx] && kokiriLabPbr.vertices[vtx3_idx] &&
+        (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_OPA && mRenderingState.mTextures[0] &&
+        (cc_options & (SHADER_OPT(TEXEL0_MASK) | SHADER_OPT(TEXEL1_MASK) |
+                       SHADER_OPT(TEXEL0_BLEND) | SHADER_OPT(TEXEL1_BLEND))) == 0) {
+        const auto& tile = mRdp->texture_tile[effective_tile[0]];
+        if (tile.cms == G_TX_WRAP && (tile.cmt == G_TX_WRAP || tile.cmt == G_TX_CLAMP) &&
+            tile.uls == 0 && tile.ult == 0) {
+            labPbrMaterial = FindKokiriLabPbrSurface(mRdp->loaded_texture[tile.tmem_index].raw_tex_metadata,
+                                                     tex_width[0], tex_height[0], tex_width2[0], tex_height2[0],
+                                                     tile.cmt == G_TX_CLAMP, texture_edge);
+        }
+        if (labPbrMaterial != KokiriLabPbrMaterial::None &&
+            ReadKokiriLabPbrLighting(mRsp->P_matrix, labPbrLighting) &&
+            PrepareKokiriLabPbr(*kokiriLabPbr.renderer, labPbrMaterial)) {
+            const uint64_t id = shaderOptions | KokiriLabPbrShaderBit;
+            const auto key = std::make_pair(comb->shader_id0, id);
+            if (!kokiriLabPbrRefused.contains(key)) {
+                prg = mRapi->LookupShader(comb->shader_id0, id);
+                if (!prg) {
+                    Flush();
+                    prg = LookupOrCreateShaderProgram(comb->shader_id0, id);
+                    if (!prg)
+                        kokiriLabPbrRefused.insert(key);
+                }
+            }
+        }
+    }
+    const bool useLabPbr = prg != nullptr;
+    if (!useLabPbr)
+        labPbrMaterial = KokiriLabPbrMaterial::None;
+#endif
     if (prg == NULL) {
-        comb->prg[tm] = prg =
-            LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
+        prg = comb->prg[tm];
+        if (prg == nullptr) {
+            Flush();
+            comb->prg[tm] = prg = LookupOrCreateShaderProgram(comb->shader_id0, shaderOptions);
+        }
     }
     if (prg != mRenderingState.mShaderProgram) {
         Flush();
@@ -2430,6 +2670,24 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
     }
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    if (labPbrMaterial != KokiriLabPbrMaterial::None) {
+        if (kokiriLabPbr.batchMaterial != labPbrMaterial ||
+            std::memcmp(&kokiriLabPbr.lighting, &labPbrLighting, sizeof(labPbrLighting)) != 0) {
+            Flush();
+            kokiriLabPbr.lighting = labPbrLighting;
+        }
+
+        const auto index = static_cast<size_t>(labPbrMaterial);
+        if (!kokiriLabPbrReported[index]) {
+            SPDLOG_INFO("Fast3D LabPBR: material nativo em {}, eye=({}, {}, {})",
+                        KokiriLabPbrSurfaces[index].texture, labPbrLighting.eye[0],
+                        labPbrLighting.eye[1], labPbrLighting.eye[2]);
+            kokiriLabPbrReported[index] = true;
+        }
+    }
+    kokiriLabPbr.batchMaterial = labPbrMaterial;
+#endif
     uint8_t numInputs;
     bool usedTextures[2];
 
@@ -2438,6 +2696,82 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
 #if defined(_WIN32) && defined(ENABLE_DX11)
+    const bool legacyCutout = shadowCandidate && use_alpha && (texture_edge || alpha_threshold) &&
+                              !use_noise && !invisible && (usedTextures[0] || usedTextures[1]);
+    ID3D11PixelShader* foliagePixel = nullptr;
+    bool foliageMaterial = false;
+    // XLU ranges are explicitly cutout-only. Never admit ordinary XLU as solid casters.
+    const bool xluCandidate = worldGeometry.armed && worldGeometry.cutoutOnly &&
+                              (worldGeometry.foliageEnabled || worldGeometry.foliageDepthEnabled) &&
+                              !mFbActive && !is_rect && zbuffer_enabled && depth_test && !depth_mask &&
+                              !prim_depth_enabled && !use_noise && !invisible && use_alpha && !use_blend_color &&
+                              (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU &&
+                              (mRdp->other_mode_l & FORCE_BL) != 0 && mShaderStack.empty() &&
+                              !mRdp->loaded_texture[0].masked && !mRdp->loaded_texture[1].masked &&
+                              !mRdp->loaded_texture[0].blended && !mRdp->loaded_texture[1].blended;
+    const uint32_t blendMask = use_2cyc ? 0x33330000u : 0xCCCC0000u;
+    const uint32_t surfaceBlend = use_2cyc ? GBL_c2(G_BL_CLR_IN, G_BL_A_IN, G_BL_CLR_MEM, G_BL_1MA)
+                                         : GBL_c1(G_BL_CLR_IN, G_BL_A_IN, G_BL_CLR_MEM, G_BL_1MA);
+    if (xluCandidate && (mRdp->other_mode_l & blendMask) == surfaceBlend) {
+        using Source = AlphaCutout::Source;
+        CCFeatures features{};
+        gfx_cc_get_features(comb->shader_id0, comb->shader_id1, &features);
+        auto combined = Source::Unknown;
+        for (unsigned cycle = 0; cycle < (use_2cyc ? 2u : 1u); ++cycle) {
+            const auto resolve = [&](int selector) {
+                if (selector == SHADER_0)
+                    return Source::Zero;
+                if (selector == SHADER_1)
+                    return Source::One;
+                if (selector == SHADER_COMBINED)
+                    return combined;
+                if (selector == SHADER_TEXEL0 || selector == SHADER_TEXEL0A)
+                    return cycle == 0 ? Source::Texture0 : Source::Texture1;
+                if (selector == SHADER_TEXEL1 || selector == SHADER_TEXEL1A)
+                    return cycle == 0 ? Source::Texture1 : Source::Texture0;
+                if (selector < SHADER_INPUT_1 || selector > SHADER_INPUT_7)
+                    return Source::Unknown;
+                const auto mapping = comb->shader_input_mapping[1][selector - SHADER_INPUT_1];
+                unsigned alpha = 256;
+                if (mapping == G_ACMUX_PRIMITIVE)
+                    alpha = mRdp->prim_color.a;
+                else if (mapping == G_ACMUX_ENVIRONMENT)
+                    alpha = mRdp->env_color.a;
+                else if (mapping == G_ACMUX_SHADE) {
+                    // Matches the alpha actually packed below, including the fog override.
+                    if (use_fog && !use_blend_color)
+                        alpha = 255;
+                    else if (v1->color.a == v2->color.a && v2->color.a == v3->color.a)
+                        alpha = v1->color.a;
+                }
+                return alpha == 255 ? Source::One : alpha == 0 ? Source::Zero : Source::Unknown;
+            };
+            const auto* c = features.c[cycle][1];
+            combined = AlphaCutout::Formula(resolve(c[0]), resolve(c[1]), resolve(c[2]), resolve(c[3]));
+        }
+        const int alphaTexture = combined == Source::Texture0 ? 0 : combined == Source::Texture1 ? 1 : -1;
+        auto* dx11 = dynamic_cast<GfxRenderingAPIDX11*>(mRapi);
+        // A failed import can leave a stale GPU slot. Require the interpreter cache node too.
+        if (alphaTexture >= 0 && usedTextures[alphaTexture] && mRenderingState.mTextures[alphaTexture] && dx11 &&
+            dx11->IsCutoutTexture(static_cast<unsigned>(alphaTexture))) {
+            foliageMaterial = true;
+            if (worldGeometry.foliageEnabled)
+                foliagePixel = dx11->GetFoliageShadowShader();
+        }
+    }
+    // Eligibility can change with per-vertex alpha even when the GPU state did not change.
+    // Split on BOTH transitions before packing, so an ineligible triangle never reaches the extra draw.
+    const bool foliageDepth = foliageMaterial && worldGeometry.foliageDepthEnabled;
+    if (worldGeometry.pendingFoliageDepth != foliageDepth)
+        Flush();
+    worldGeometry.pendingFoliageDepth = foliageDepth;
+    const bool captureCutout = legacyCutout || foliagePixel;
+    if (captureCutout) {
+        // A normal draw may batch OPA/XLU cutouts. Split before packing when the shadow PS changes.
+        if (worldGeometry.pendingPixel.Get() != foliagePixel)
+            Flush();
+        worldGeometry.pendingPixel = foliagePixel;
+    }
     const size_t cutoutStart = mBufVboLen;
 #endif
     for (int i = 0; i < 3; i++) {
@@ -2621,6 +2955,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
 
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        if (useLabPbr) {
+            mBufVbo[mBufVboLen++] = v_arr[i]->wx;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wy;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wz;
+        }
+#endif
+
         // struct RGBA *color = &v_arr[i]->color;
         // mBufVbo[mBufVboLen++] = color->r / 255.0f;
         // mBufVbo[mBufVboLen++] = color->g / 255.0f;
@@ -2630,8 +2972,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
 #if defined(_WIN32) && defined(ENABLE_DX11)
     // Keep the original packed attributes. Only the first four floats will be projected from the light.
-    if (shadowCandidate && use_alpha && (texture_edge || alpha_threshold) && !use_noise && !invisible &&
-        (usedTextures[0] || usedTextures[1]) && worldGeometry.cutoutBatches.size() < MaxWorldCutoutBatches) {
+    if (captureCutout && worldGeometry.foliageEnabled && !worldGeometry.cutoutOverflowReported &&
+        (worldGeometry.cutoutBatches.size() >= MaxWorldCutoutBatches ||
+         worldGeometry.cutoutVertices.size() + mBufVboLen - cutoutStart > MaxWorldCutoutFloats)) {
+        worldGeometry.cutoutOverflowReported = true;
+        // Once per interpreter replay, including interpolated replays. Never discard earlier casters.
+        SPDLOG_WARN("World cutout capture full: {} floats, {} batches (limits {}, {})",
+                    worldGeometry.cutoutVertices.size(), worldGeometry.cutoutBatches.size(),
+                    MaxWorldCutoutFloats, MaxWorldCutoutBatches);
+    }
+    if (captureCutout && worldGeometry.cutoutBatches.size() < MaxWorldCutoutBatches) {
         auto& capture = worldGeometry;
         const size_t size = mBufVboLen - cutoutStart;
         if (capture.cutoutVertices.size() + size <= MaxWorldCutoutFloats) {
@@ -4526,6 +4876,11 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
 }
 
 static WorldPostProcess worldPostProcess = nullptr;
+static uint64_t worldPostProcessReplay = 0;
+
+uint64_t WorldPostProcessReplay() {
+    return worldPostProcessReplay;
+}
 
 void SetWorldPostProcess(WorldPostProcess callback) {
     worldPostProcess = callback;
@@ -4534,14 +4889,63 @@ void SetWorldPostProcess(WorldPostProcess callback) {
 static bool gfx_world_postprocess(F3DGfx** command) {
     auto gfx = mInstance.lock();
     switch ((*command)->words.w0 & 0xFFu) {
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        case FAST_WORLD_KOKIRI_LABPBR_BEGIN: {
+            if (kokiriLabPbr.armed)
+                gfx->Flush();
+            kokiriLabPbr.armed = kokiriLabPbr.renderer && !gfx->mFbActive;
+            if (kokiriLabPbr.armed) {
+                kokiriLabPbr.vertices.fill(false);
+                const auto packed = static_cast<uint32_t>((*command)->words.w1);
+                for (unsigned i = 0; i < 3; ++i) {
+                    const int component = (packed >> (i * 10)) & 0x3FFu;
+                    kokiriLabPbr.sun[i] = static_cast<float>(component < 512 ? component : component - 1024);
+                }
+            }
+            return false;
+        }
+        case FAST_WORLD_KOKIRI_LABPBR_END:
+            if (kokiriLabPbr.armed)
+                gfx->Flush();
+            kokiriLabPbr.armed = false;
+            kokiriLabPbr.batchMaterial = KokiriLabPbrMaterial::None;
+            return false;
+#endif
+        case FAST_WORLD_WATER_BEGIN: {
+            waterArmed = false;
+            waterFrame = {};
+            waterVertices.fill(false);
+            const auto read = worldWaterReader.load();
+            if (!gfx->mFbActive && read)
+                waterArmed = read(*gfx, static_cast<uint32_t>((*command)->words.w1), waterFrame);
+            waterDebug = waterArmed ? Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                                          "gDeveloperTools.WaterDisplaceStats", 0)
+                                    : 0;
+            return false;
+        }
+        case FAST_WORLD_WATER_END:
+            waterArmed = false;
+            waterVertices.fill(false);
+            if (waterDebug)
+                SPDLOG_INFO("M12 agua: replay={} fontes={} saida={} recusados_perto={}", WorldPostProcessReplay(),
+                            waterSourceTriangles, waterOutputTriangles, waterNearRejected);
+            waterDebug = 0;
+            return false;
         case Interpreter::WorldPresentCommand:
             gfx->PresentWorldBeforeHud();
             return false;
         case FAST_WORLD_GEOMETRY_BEGIN:
+            // End the old scope while its target and depth eligibility are still current.
+            if (worldGeometry.foliageDepthEnabled)
+                gfx->Flush();
             worldGeometry.armed = !gfx->mFbActive;
+            worldGeometry.cutoutOnly = ((*command)->words.w1 & FAST_WORLD_GEOMETRY_CUTOUT_ONLY) != 0;
             return false;
         case FAST_WORLD_GEOMETRY_END:
+            if (worldGeometry.foliageDepthEnabled)
+                gfx->Flush();
             worldGeometry.armed = false;
+            worldGeometry.cutoutOnly = false;
             return false;
         case FAST_WORLD_TRANSMISSION_BEGIN:
             worldGeometry.transmissionArmed = !gfx->mFbActive;
@@ -4550,13 +4954,21 @@ static bool gfx_world_postprocess(F3DGfx** command) {
         case FAST_WORLD_TRANSMISSION_END:
             worldGeometry.transmissionArmed = false;
             return false;
+        case FAST_WORLD_DRAW:
+        case FAST_WORLD_PREPARE:
+        case FAST_WORLD_COMPOSE:
+            break;
+        default:
+            return false;
     }
     worldGeometry.armed = false;
+    worldGeometry.cutoutOnly = false;
     worldGeometry.transmissionArmed = false;
     if (worldPostProcess && !gfx->mFbActive) {
         gfx->FlushToonShadow();
         gfx->Flush();
-        worldPostProcess(*gfx, static_cast<uint32_t>((*command)->words.w1));
+        const auto phase = static_cast<WorldPostProcessPhase>((*command)->words.w0 & 0xFFu);
+        worldPostProcess(*gfx, static_cast<uint32_t>((*command)->words.w1), phase);
     }
     return false;
 }
@@ -6455,19 +6867,41 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+    if (++worldPostProcessReplay == 0)
+        ++worldPostProcessReplay;
 #ifdef _WIN32
     worldFogSun = {};
 #endif
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    kokiriLabPbr = {};
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(FAST_KOKIRI_LABPBR_CVAR, 0) != 0)
+        kokiriLabPbr.renderer = dynamic_cast<GfxRenderingAPIDX11*>(mRapi);
+    else
+        kokiriLabPbrReported.fill(false);
+#endif
+    waterArmed = false;
+    waterFrame = {};
+    waterVertices.fill(false);
+    waterSourceTriangles = waterOutputTriangles = waterNearRejected = 0;
+    waterDebug = 0;
     SpReset();
     worldGeometry.armed = worldGeometry.overflow = false;
+    worldGeometry.cutoutOnly = false;
+    worldGeometry.foliageEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gDeveloperTools.FoliageShadows", 1) != 0;
+    worldGeometry.foliageDepthEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gDeveloperTools.FoliageDepth", 1) != 0;
     worldGeometry.vertices.clear();
     worldGeometry.transmissionArmed = worldGeometry.transmissionOverflow = false;
     worldGeometry.transmissionVertices.fill(false);
     worldGeometry.transmission.clear();
 #if defined(_WIN32) && defined(ENABLE_DX11)
     worldGeometry.cutoutBatches.clear();
+    worldGeometry.cutoutOverflowReported = false;
     worldGeometry.cutoutVertices.clear();
     worldGeometry.pendingOffset = 0;
+    worldGeometry.pendingPixel.Reset();
+    worldGeometry.pendingFoliageDepth = false;
 #endif
 
     mGetPixelDepthPending.clear();
@@ -6841,7 +7275,7 @@ extern "C" void gfx_shader_cache_clear() {
     instance->mColorCombinerPool.clear();
     instance->mPrevCombiner = Fast::mInstance.lock().get()->mColorCombinerPool.end();
     instance->mRenderingState.mShaderProgram = nullptr;
-    instance->mRapi->ClearShaderCache();
+    instance->ShaderCacheClear();
 }
 
 extern "C" void gfx_register_fb_texture(const void* cpuAddr, int fbId) {

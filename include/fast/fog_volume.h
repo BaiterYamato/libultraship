@@ -11,6 +11,7 @@
 #define FAST_FOG_FLOW_LIFT 8u
 #define FAST_FOG_FLOW_VERTICAL_COMPUTE 256u
 #define FAST_FOG_FLOW_CPU_FIELD 512u
+#define FAST_FOG_FLOW_DETAIL_GRID 1024u
 #define FAST_FOG_VORTEX_REST_DENSITY 0.60f
 #define FAST_FOG_PARTICLE_COUNT 96
 #define FAST_FOG_LIGHT_COUNT 6
@@ -39,6 +40,10 @@ typedef struct FastFogVolume {
     uint32_t upperCount;
     float upperCells[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][2];
     float atmosphere[4]; /* scene fog RGB and distant blend strength */
+    /* Finer grid nested inside the main one (density and velocity only). Width zero means absent. */
+    float detailBounds[4]; /* x min, z min, x max, z max */
+    float detailGrid[4];   /* width, depth, blend band in units, unused */
+    float detailCells[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4]; /* density, velocity X, velocity Z, unused */
 } FastFogVolume;
 
 typedef struct FastFogImpulse {
