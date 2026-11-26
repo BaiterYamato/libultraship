@@ -34,6 +34,7 @@
 
 #include "fast/interpreter.h"
 #include "fast/fog_volume.h"
+#include "fast/fog_detail.h"
 #include "fast/labpbr_kokiri.h"
 #include "fast/world_postprocess.h"
 #include <atomic>
@@ -91,6 +92,9 @@ struct FogSnapshot {
     Mtx* projection = nullptr;
     bool hasFlow = false;
     FastFogFlow flow{};
+    // Células finas do ticket (width*height*4 floats); vazio quando o ticket não tem detalhe.
+    uint32_t detailWidth = 0, detailHeight = 0;
+    std::vector<float> detailCells;
 };
 
 // Retain enough recent frames for replay and interpolation. Display lists
@@ -113,6 +117,9 @@ bool ReadFogSnapshot(uint32_t ticket, FastFogVolume& volume, FastFogFlow& flow, 
     hasFlow = entry.hasFlow;
     if (hasFlow)
         flow = entry.flow;
+    gFastFogDetailReplay.width = entry.detailWidth;
+    gFastFogDetailReplay.height = entry.detailHeight;
+    std::copy(entry.detailCells.begin(), entry.detailCells.end(), &gFastFogDetailReplay.cells[0][0]);
     return true;
 }
 } // namespace
@@ -132,6 +139,16 @@ extern "C" uint32_t FastQueueFogVolume(const FastFogVolume* volume, const FastFo
     entry.hasFlow = flow != nullptr;
     if (flow)
         entry.flow = *flow;
+    // Só o detalhe que o host acabou de publicar para este volume (mesmas dimensões) entra no snapshot.
+    const auto& published = gFastFogDetailCells;
+    const bool hasDetail = flow && volume->detailGrid[0] >= 2.0f && volume->detailGrid[1] >= 2.0f &&
+                           published.width == static_cast<uint32_t>(volume->detailGrid[0]) &&
+                           published.height == static_cast<uint32_t>(volume->detailGrid[1]) &&
+                           published.width <= FAST_FOG_DETAIL_SIDE && published.height <= FAST_FOG_DETAIL_SIDE;
+    entry.detailWidth = hasDetail ? published.width : 0;
+    entry.detailHeight = hasDetail ? published.height : 0;
+    entry.detailCells.assign(&published.cells[0][0],
+                             &published.cells[0][0] + (hasDetail ? 4u * published.width * published.height : 0u));
     return gFogTicket;
 }
 

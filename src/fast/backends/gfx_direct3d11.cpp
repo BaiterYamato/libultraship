@@ -53,6 +53,7 @@
 
 #include <utility>
 #include "fast/fog_volume.h"
+#include "fast/fog_detail.h"
 #include "fast/world_postprocess.h"
 #include "fog_field_blend_shader.h"
 #include "fog_volume_shader.h"
@@ -2525,8 +2526,8 @@ struct FogDetailState {
     ID3D11Device* device = nullptr;
     ComPtr<ID3D11Texture2D> texture;
     ComPtr<ID3D11ShaderResourceView> view;
-    float previous[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4]{};
-    float current[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4]{};
+    float previous[FAST_FOG_DETAIL_SIDE * FAST_FOG_DETAIL_SIDE][4]{};
+    float current[FAST_FOG_DETAIL_SIDE * FAST_FOG_DETAIL_SIDE][4]{};
     float bounds[4]{};
     UINT width = 0, height = 0;
     uint64_t stream = 0;
@@ -2546,20 +2547,31 @@ void StoreFogDetail(const FastFogVolume& volume, const FastFogFlow& flow) {
         return;
     const float stepX = (volume.detailBounds[2] - volume.detailBounds[0]) / float(width - 1);
     const float stepZ = (volume.detailBounds[3] - volume.detailBounds[1]) / float(height - 1);
-    const int shiftX = sameShape ? int(std::lround((volume.detailBounds[0] - state.bounds[0]) / stepX)) : 0;
-    const int shiftZ = sameShape ? int(std::lround((volume.detailBounds[1] - state.bounds[1]) / stepZ)) : 0;
-    static float shifted[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4];
+    // O histórico só vira translação inteira de células quando o espaçamento físico é o mesmo e o deslocamento
+    // cai (dentro da tolerância) numa fronteira de célula; senão o quadro anterior é reiniciado com o atual.
+    constexpr float kSpacingTolerance = 1e-3f, kShiftTolerance = 0.02f;
+    const float oldStepX = (state.bounds[2] - state.bounds[0]) / float(width - 1);
+    const float oldStepZ = (state.bounds[3] - state.bounds[1]) / float(height - 1);
+    const float rawShiftX = (volume.detailBounds[0] - state.bounds[0]) / stepX;
+    const float rawShiftZ = (volume.detailBounds[1] - state.bounds[1]) / stepZ;
+    const bool translates = sameShape && std::abs(stepX - oldStepX) <= kSpacingTolerance * stepX &&
+                            std::abs(stepZ - oldStepZ) <= kSpacingTolerance * stepZ &&
+                            std::abs(rawShiftX - std::round(rawShiftX)) <= kShiftTolerance &&
+                            std::abs(rawShiftZ - std::round(rawShiftZ)) <= kShiftTolerance;
+    const int shiftX = translates ? int(std::lround(rawShiftX)) : 0;
+    const int shiftZ = translates ? int(std::lround(rawShiftZ)) : 0;
+    static float shifted[FAST_FOG_DETAIL_SIDE * FAST_FOG_DETAIL_SIDE][4];
     for (UINT z = 0; z < height; ++z) {
         for (UINT x = 0; x < width; ++x) {
             const int oldX = int(x) + shiftX, oldZ = int(z) + shiftZ;
-            const float* source = volume.detailCells[z * width + x];
-            if (sameShape && oldX >= 0 && oldZ >= 0 && oldX < int(width) && oldZ < int(height))
+            const float* source = gFastFogDetailReplay.cells[z * width + x];
+            if (translates && oldX >= 0 && oldZ >= 0 && oldX < int(width) && oldZ < int(height))
                 source = state.current[oldZ * width + oldX];
             std::copy_n(source, 4, shifted[z * width + x]);
         }
     }
-    std::memcpy(state.previous, shifted, sizeof(shifted));
-    std::memcpy(state.current, volume.detailCells, sizeof(state.current));
+    std::memcpy(state.previous, shifted, sizeof(float) * 4 * width * height);
+    std::memcpy(state.current, gFastFogDetailReplay.cells, sizeof(float) * 4 * width * height);
     std::copy_n(volume.detailBounds, 4, state.bounds);
     state.width = width;
     state.height = height;
@@ -2737,7 +2749,9 @@ bool GfxRenderingAPIDX11::InitFogVolume() {
     }
     gFogDetail = {};
     gFogDetail.device = mDevice.Get();
-    if (SUCCEEDED(mDevice->CreateTexture2D(&field, nullptr, gFogDetail.texture.GetAddressOf()))) {
+    auto detailField = field;
+    detailField.Width = detailField.Height = FAST_FOG_DETAIL_SIDE;
+    if (SUCCEEDED(mDevice->CreateTexture2D(&detailField, nullptr, gFogDetail.texture.GetAddressOf()))) {
         mDevice->CreateShaderResourceView(gFogDetail.texture.Get(), nullptr, gFogDetail.view.GetAddressOf());
     }
 
@@ -3882,11 +3896,13 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     }
     const bool useFine = liveFlow && (flow->flags & FAST_FOG_FLOW_CPU_FIELD) && gFogDetail.view &&
                          gFogDetail.device == mDevice.Get() && volume.detailGrid[0] >= 2.0f &&
-                         volume.detailGrid[1] >= 2.0f;
+                         volume.detailGrid[1] >= 2.0f &&
+                         gFastFogDetailReplay.width == static_cast<uint32_t>(volume.detailGrid[0]) &&
+                         gFastFogDetailReplay.height == static_cast<uint32_t>(volume.detailGrid[1]);
     if (useFine) {
         StoreFogDetail(volume, *flow);
         const auto& state = gFogDetail;
-        static float values[FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE][4];
+        static float values[FAST_FOG_DETAIL_SIDE * FAST_FOG_DETAIL_SIDE][4];
         for (UINT i = 0; i < state.width * state.height; ++i) {
             for (int channel = 0; channel < 4; ++channel) {
                 values[i][channel] =

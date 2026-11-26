@@ -308,6 +308,30 @@ static const float2 FogFlowWind = float2(16.0, 5.0) * 2.2;
 // included, so the fixed drift above would count the wind twice (and in a fixed direction).
 float2 AmbientFlowWind() { return detailGrid.w > 0.5 ? float2(0.0, 0.0) : FogFlowWind; }
 
+// Limitar os nos antes da bilinear evita dobras que o limite do vetor interpolado nao impede.
+static const float FogFlowMaxCellShift = 0.25;
+
+float2 FineFlowVelocity(float2 fineCell) {
+    float2 cellSize = (detailBounds.zw - detailBounds.xy) / (detailGrid.xy - 1.0);
+    float maxSpeed = FogFlowMaxCellShift * min(cellSize.x, cellSize.y) / visual.w;
+    int2 base = int2(floor(fineCell));
+    float2 fraction = frac(fineCell);
+    float2 result = 0.0;
+    [unroll]
+    for (int z = 0; z < 2; ++z) {
+        [unroll]
+        for (int x = 0; x < 2; ++x) {
+            int2 coord = min(base + int2(x, z), int2(detailGrid.xy) - 1);
+            float2 velocity = detailField.Load(int3(coord, 0)).yz;
+            float speed = length(velocity);
+            float scale = maxSpeed / max(speed, maxSpeed);
+            float2 weight = 1.0 - abs(float2(x, z) - fraction);
+            result += velocity * scale * weight.x * weight.y;
+        }
+    }
+    return result;
+}
+
 struct FlowPhases {
     float wA, wB, norm, tA, tB;
     float2 shiftA, shiftB;
@@ -507,6 +531,7 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
             }
             float2 textureUv = (sampleCell + 0.5) / float2(textureWidth, textureHeight);
             float4 cell = fogField.SampleLevel(fogSampler, textureUv, 0.0);
+            float2 flowVelocity = cell.zw + AmbientFlowWind();
             density = clamp(cell.x, 0.0, 1.5);
             floorY = cell.y / max(cell.x, 0.0001);
             thickness = grid.z;
@@ -521,9 +546,11 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                     fineWeight = fineWeight * fineWeight * (3.0 - 2.0 * fineWeight);
                     float2 fineCell = (samplePoint.xz - detailBounds.xy) / (detailBounds.zw - detailBounds.xy) *
                                       (detailGrid.xy - 1.0);
-                    float4 fine = detailField.SampleLevel(fogSampler, (fineCell + 0.5) / 32.0, 0.0);
+                    float4 fine = detailField.SampleLevel(fogSampler, (fineCell + 0.5) / 128.0, 0.0); // FAST_FOG_DETAIL_SIDE
                     density = lerp(density, clamp(fine.x, 0.0, 1.5), fineWeight);
                     cell.zw = lerp(cell.zw, fine.yz, fineWeight);
+                    if (visual.y > 0.0)
+                        flowVelocity = lerp(flowVelocity, FineFlowVelocity(fineCell), fineWeight);
                 }
             }
             [branch]
@@ -537,7 +564,7 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                     wideWeight = 1.0 - smoothstep(420.0, 980.0, distance);
                     [branch]
                     if (wideWeight > 0.0) {
-                        FlowDetail(samplePoint.xz, cell.zw + AmbientFlowWind(), FogFlowPhases(), 0.009, 0.021, 0.4, 0.0,
+                        FlowDetail(samplePoint.xz, flowVelocity, FogFlowPhases(), 0.009, 0.021, 0.4, 0.0,
                                    wideCloud, wideDetail);
                         thickness *= 1.0 + wideWeight * (0.26 * wideCloud + 0.12 * wideDetail);
                     }
@@ -566,7 +593,6 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
             if (visual.y > 0.0) {
                 // Flow map: the detail travels with the local velocity plus the ambient wind, so the wind
                 // and the eddies left by attacks read as motion of the fog instead of a fixed offset.
-                float2 flowVelocity = cell.zw + AmbientFlowWind();
                 float compression = saturate((density - 0.60) * 2.5);
                 if (wide) {
                     // Blend near-field structure into the broad layer without changing its mean opacity.
