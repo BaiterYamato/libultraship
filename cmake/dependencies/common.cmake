@@ -52,7 +52,12 @@ endif()
 
 #=================== STB ===================
 set(STB_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
-file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h" "${STB_DIR}/stb_image.h")
+set(LUS_STB_IMAGE_FILE "" CACHE FILEPATH "Local pinned stb_image.h for offline builds")
+if(LUS_STB_IMAGE_FILE)
+    configure_file("${LUS_STB_IMAGE_FILE}" "${STB_DIR}/stb_image.h" COPYONLY)
+else()
+    file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h" "${STB_DIR}/stb_image.h")
+endif()
 file(WRITE "${STB_DIR}/stb_impl.c" "#define STB_IMAGE_IMPLEMENTATION\n#include \"stb_image.h\"")
 
 add_library(stb STATIC)
