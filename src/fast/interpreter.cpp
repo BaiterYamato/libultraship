@@ -36,6 +36,7 @@
 #include "fast/fog_volume.h"
 #include "fast/fog_detail.h"
 #include "fast/labpbr_kokiri.h"
+#include "fast/screen_projection.h"
 #include "fast/world_postprocess.h"
 #include <atomic>
 #include "fast/lus_gbi.h"
@@ -5870,6 +5871,7 @@ bool gfx_draw_fog_volume(F3DGfx** cmd0) {
                 volume.depth[2] = m[3][2];
             }
         }
+        volume.right[3] = Fast::MapFogRayScaleX(volume.right[3], gfx->AdjXForAspectRatio(1.0f));
         volume.interpolation = gfx->mInterpolationT;
         gfx->Flush();
         gfx->mRapi->DrawFogVolume(volume, hasFlow ? &flow : nullptr);

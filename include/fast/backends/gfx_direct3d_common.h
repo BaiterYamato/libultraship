@@ -340,7 +340,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool mFogAtmosphereLogged = false;
     uint64_t mFogFrame = 0, mFogLastFrame = 0, mFogLastStream = 0;
     int mFogLastFramebuffer = -1, mFogLodMode = -1;
-    unsigned mFogHistoryIndex = 0, mFogHistoryFrames = 0, mFogHistoryResets = 0, mFogReducedReuses = 0;
+    unsigned mFogHistoryIndex = 0, mFogHistoryFrames = 0, mFogHistoryResets = 0;
     bool mFogLodFailed = false;
     std::array<FogMsaaJob, static_cast<size_t>(FogMsaaShader::Count)> mFogMsaaJobs{};
     std::chrono::steady_clock::time_point mFogPathStart;

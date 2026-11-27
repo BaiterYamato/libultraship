@@ -3151,8 +3151,6 @@ bool GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
                             std::equal(volume.up, volume.up + 4, old.previousUp);
     const bool sameField = action == FogFlowAction::Reuse && fieldFraction == mFogLastFieldFraction &&
                            extinction == old.previousForward[3];
-    // The depth map can change with moving casters even when the view and density stay fixed.
-    const bool reuseReduced = mode == 2 && !useSun && !reset && sameCamera && sameField;
     constants.previousForward[3] = sameCamera ? 0.0f : 1.0f;
     constants.low[0] = static_cast<float>(mFogHistoryWidth);
     constants.low[1] = static_cast<float>(mFogHistoryHeight);
@@ -3163,7 +3161,7 @@ bool GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
             ++mFogHistoryResets;
             if (mFogHistoryResets <= 24)
                 SPDLOG_INFO("Fast3D fog history reset reason={}", reset);
-        } else if (!reuseReduced) {
+        } else {
             constexpr float offsets[]{ 0.28f, 0.72f, 0.43f, 0.57f };
             constants.low[2] = sameField ? 0.78f : 0.38f;
             if (!useSun)
@@ -3173,24 +3171,21 @@ bool GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     }
     mContext->UpdateSubresource(mFogTemporalCb.Get(), 0, nullptr, &constants, 0, 0);
     mContext->PSSetConstantBuffers(1, 1, mFogTemporalCb.GetAddressOf());
-    if (reuseReduced) {
-        ++mFogReducedReuses;
-    } else {
-        ID3D11ShaderResourceView* previous =
-            constants.low[2] > 0.0f ? mFogHistory[mFogHistoryIndex].view.Get() : nullptr;
-        mContext->PSSetShaderResources(2, 1, &previous);
-        mFogHistoryIndex ^= 1u;
-        const D3D11_VIEWPORT reduced{ 0.0f, 0.0f, constants.low[0], constants.low[1], 0.0f, 1.0f };
-        mContext->RSSetViewports(1, &reduced);
-        ID3D11RenderTargetView* targets[]{ mFogHistory[mFogHistoryIndex].target.Get(), mFogReducedSun.target.Get() };
-        mContext->OMSetRenderTargets(useSun ? 2 : 1, targets, nullptr);
-        mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
-        mContext->PSSetShader(shaders.low.Get(), nullptr, 0);
-        mContext->Draw(3, 0);
-        mContext->OMSetRenderTargets(1, &target, nullptr);
-        mContext->RSSetViewports(1, &viewport);
-        mContext->OMSetBlendState(blend, nullptr, 0xffffffffu);
-    }
+    // Scene depth is rendered every frame, even when the fog simulation reuses its tick.
+    ID3D11ShaderResourceView* previous =
+        constants.low[2] > 0.0f ? mFogHistory[mFogHistoryIndex].view.Get() : nullptr;
+    mContext->PSSetShaderResources(2, 1, &previous);
+    mFogHistoryIndex ^= 1u;
+    const D3D11_VIEWPORT reduced{ 0.0f, 0.0f, constants.low[0], constants.low[1], 0.0f, 1.0f };
+    mContext->RSSetViewports(1, &reduced);
+    ID3D11RenderTargetView* targets[]{ mFogHistory[mFogHistoryIndex].target.Get(), mFogReducedSun.target.Get() };
+    mContext->OMSetRenderTargets(useSun ? 2 : 1, targets, nullptr);
+    mContext->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    mContext->PSSetShader(shaders.low.Get(), nullptr, 0);
+    mContext->Draw(3, 0);
+    mContext->OMSetRenderTargets(1, &target, nullptr);
+    mContext->RSSetViewports(1, &viewport);
+    mContext->OMSetBlendState(blend, nullptr, 0xffffffffu);
     if (lowEnd)
         mContext->End(lowEnd);
 
@@ -3804,9 +3799,8 @@ void GfxRenderingAPIDX11::CollectFogTiming() {
                         (mFogSamples[middle - 1] + mFogSamples[middle]) * 0.5, mFogSamples[p95], gFogLiftSamples);
             gFogLiftSamples = 0;
             if (mFogLodMode >= 0) {
-                SPDLOG_INFO("Fast3D fog LOD timing mode={} full={}x{} history_frames={} resets={} cached_frames={}",
-                            mFogLodMode, mFogLodWidth, mFogLodHeight, mFogHistoryFrames, mFogHistoryResets,
-                            mFogReducedReuses);
+                SPDLOG_INFO("Fast3D fog LOD timing mode={} full={}x{} history_frames={} resets={}",
+                            mFogLodMode, mFogLodWidth, mFogLodHeight, mFogHistoryFrames, mFogHistoryResets);
             }
             if (mFogLodSampleCount) {
                 const auto count = mFogLodSampleCount;

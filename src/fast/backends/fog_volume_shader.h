@@ -785,7 +785,9 @@ float HistoryOpacity(int2 pixel, float3 ray, float4 current) {
             if (abs(old.y - z) <= max(10.0, 0.065 * z) && old.z >= z &&
                 abs(old.w - oldEnd) <= max(12.0, 0.045 * oldEnd) &&
                 abs(old.x - current.x) <= max(0.035, 0.13 * current.x)) {
-                opacity = lerp(current.x, clamp(old.x, current.x - 0.035, current.x + 0.035), low.z);
+                // Bound the correction relative to thin fog, where a small absolute error is visible as a trail.
+                float limit = min(0.035, 0.13 * current.x);
+                opacity = lerp(current.x, clamp(old.x, current.x - limit, current.x + limit), low.z);
             }
         }
     }
@@ -800,9 +802,11 @@ struct ReducedFogOutput {
 ReducedFogOutput PSLow(float4 position : SV_Position) {
     float2 uv = position.xy / low.xy;
     float2 footprint = viewport.zw / low.xy;
-    int2 base = int2(viewport.xy + (position.xy - 0.5) * footprint);
-    int2 last = int2(ceil(viewport.xy + viewport.zw)) - 1;
-    int2 end = min(base + 1, last);
+    // Split full-resolution pixel centers at the low-resolution footprint boundaries.
+    // With an odd extent, each axis has one footprint of one pixel and the others of two.
+    float2 pixel = floor(position.xy);
+    int2 base = int2(ceil(viewport.xy + pixel * footprint - 0.5));
+    int2 end = int2(ceil(viewport.xy + (pixel + 1.0) * footprint - 0.5)) - 1;
     float depth = min(min(NearestDepth(base), NearestDepth(int2(end.x, base.y))),
                       min(NearestDepth(int2(base.x, end.y)), NearestDepth(end)));
     float3 ray = WorldRay(uv);
