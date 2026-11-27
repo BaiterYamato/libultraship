@@ -3976,12 +3976,11 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     if (useDetail) {
         constants.parameters[7][3] = 1.0f;
         if (mFogNoiseView) {
-            // Flow-map clock in cycles of 36 ticks, wrapped at 64 cycles (the noise period) on a whole tick.
-            // RFC 0034 (draft): with the nested grid the velocities are real scene wind, so the crossfade is the
-            // fastest visible change left; a 72-tick cycle halves how often the pattern re-forms.
+            // Flow-map clock in cycles of 120/240 ticks, wrapped at 64 cycles (the noise period) on a whole tick.
+            // Long cycles avoid rapid crossfade churn while keeping smooth motion when wind is non-zero.
             const bool nested = (flow->flags & FAST_FOG_FLOW_CPU_FIELD) && volume.detailGrid[0] >= 2.0f &&
                                 volume.detailGrid[1] >= 2.0f;
-            const uint32_t cycleTicks = nested ? 72u : 36u;
+            const uint32_t cycleTicks = nested ? 240u : 120u;
             const double ticks = double(flow->tick % (64u * cycleTicks)) + double(fieldFraction);
             constants.visual[1] = 1.0f;
             constants.visual[2] = float(std::fmod(ticks / double(cycleTicks), 64.0));

@@ -185,6 +185,35 @@ float4 CornerWeights(float2 sampleCell) {
     return float4(inv.x * inv.y, f.x * inv.y, inv.x * f.y, f.x * f.y);
 }
 
+// One layer per corner is for cliffs. Measured against the layer thickness alone, any ramp the floor grid resolves
+// also split, and each corner left a flat sheet at its own height: stacked floating plates down the slope. The gate
+// measures the same weighted spread against the cell spacing: a uniform slope s peaks at s*s/4, so the split starts
+// around 19 degrees and is full from about 31, while a 100 u step in an 80 u cell saturates a few units from its corner.
+float CliffSplitGate(float4 weights, float4 densities, float4 floors, float floorY, float density) {
+    float2 spacing = (boundsMax.xz - boundsMin.xz) / max(grid.xy - 1.0, 1.0);
+    float4 slope = (floors - floorY) / max(min(spacing.x, spacing.y), 1.0);
+    float slopeVariance = dot(weights * densities, slope * slope) / max(density, 0.0001);
+    return smoothstep(0.03, 0.09, slopeVariance);
+}
+
+// Floor of each corner's layer once the cell splits. A cell against a wall splits because of the corner on top of
+// it, and the corners down on the ramp beside it used to keep one flat sheet each: a saw of teeth along the foot of
+// the wall. Corners within half a cell of height of each other are one level and share the floor interpolated
+// between them, so only the real jump separates layers.
+float4 LevelFloors(float4 weights, float4 densities, float4 floors) {
+    float2 spacing = (boundsMax.xz - boundsMin.xz) / max(grid.xy - 1.0, 1.0);
+    float level = 0.5 * max(min(spacing.x, spacing.y), 1.0);
+    float4 mass = weights * max(densities, 0.0);
+    float4 result;
+    [unroll]
+    for (int j = 0; j < 4; ++j) {
+        float4 member = mass * step(abs(floors - floors[j]), level);
+        float sum = dot(member, 1.0);
+        result[j] = sum > 0.0001 ? dot(member, floors) / sum : floors[j];
+    }
+    return result;
+}
+
 float WideFogDensity(float2 sampleCell, float y, float rise, float density, float floorY, float raised,
                      float thickness, bool limitLift) {
     int2 base = int2(sampleCell);
@@ -199,7 +228,9 @@ float WideFogDensity(float2 sampleCell, float y, float rise, float density, floa
     float4 delta = (floors - floorY) / grid.z;
     float variance = dot(weights * densities, delta * delta) / max(density, 0.0001);
     // A distant corner gradually gains influence as the ray crosses a cell boundary.
-    float splitWeight = limitLift ? 1.0 : smoothstep(0.18 * 0.18, 0.33 * 0.33, variance);
+    float splitWeight = limitLift ? 1.0
+                                  : smoothstep(0.18 * 0.18, 0.33 * 0.33, variance) *
+                                        CliffSplitGate(weights, densities, floors, floorY, density);
     if (splitWeight <= 0.0) {
         return density * WideFogProfile(y - floorY, rise, raised, thickness, support.y);
     }
@@ -212,6 +243,7 @@ float WideFogDensity(float2 sampleCell, float y, float rise, float density, floa
         raisedCorners = float4(LoadBaseLift(base), LoadBaseLift(int2(end.x, base.y)),
                                LoadBaseLift(int2(base.x, end.y)), LoadBaseLift(end));
     }
+    floors = LevelFloors(weights, densities, floors);
     float4 layers;
     [unroll]
     for (int j = 0; j < 4; ++j) {
@@ -296,8 +328,17 @@ float AirFogDensity(float2 textureUv, float y, float rise) {
 
 float FogDetail(float2 p) {
     float2 f = frac(p);
-    float2 uv = (floor(p) + f * f * (3.0 - 2.0 * f) + 0.5) / 64.0;
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float2 uv = (floor(p) + u + 0.5) / 64.0;
     return 2.0 * noiseField.SampleLevel(noiseSampler, uv, 0.0) - 1.0;
+}
+
+float2 RotCloud(float2 p) {
+    return float2(0.857 * p.x - 0.515 * p.y, 0.515 * p.x + 0.857 * p.y);
+}
+
+float2 RotDetail(float2 p) {
+    return float2(0.545 * p.x + 0.839 * p.y, -0.839 * p.x + 0.545 * p.y);
 }
 
 // Ambient drift shown by the flow map: the compute transport's face wind (16, 5) u/s, exaggerated so the
@@ -308,26 +349,36 @@ static const float2 FogFlowWind = float2(16.0, 5.0) * 2.2;
 // included, so the fixed drift above would count the wind twice (and in a fixed direction).
 float2 AmbientFlowWind() { return detailGrid.w > 0.5 ? float2(0.0, 0.0) : FogFlowWind; }
 
-// Limitar os nos antes da bilinear evita dobras que o limite do vetor interpolado nao impede.
-static const float FogFlowMaxCellShift = 0.25;
+// Limitar a variacao local entre nos vizinhos evita dobras na bilinear sem frear o vento uniforme da cena.
+static const float FogFlowMaxCellShift = 1.5;
 
 float2 FineFlowVelocity(float2 fineCell) {
     float2 cellSize = (detailBounds.zw - detailBounds.xy) / (detailGrid.xy - 1.0);
-    float maxSpeed = FogFlowMaxCellShift * min(cellSize.x, cellSize.y) / visual.w;
+    float maxDiffSpeed = FogFlowMaxCellShift * min(cellSize.x, cellSize.y) / visual.w;
     int2 base = int2(floor(fineCell));
     float2 fraction = frac(fineCell);
-    float2 result = 0.0;
+    float2 v[4];
+    float2 weights[4];
+    float2 meanVel = 0.0;
     [unroll]
     for (int z = 0; z < 2; ++z) {
         [unroll]
         for (int x = 0; x < 2; ++x) {
             int2 coord = min(base + int2(x, z), int2(detailGrid.xy) - 1);
-            float2 velocity = detailField.Load(int3(coord, 0)).yz;
-            float speed = length(velocity);
-            float scale = maxSpeed / max(speed, maxSpeed);
-            float2 weight = 1.0 - abs(float2(x, z) - fraction);
-            result += velocity * scale * weight.x * weight.y;
+            int idx = z * 2 + x;
+            v[idx] = detailField.Load(int3(coord, 0)).yz;
+            weights[idx] = 1.0 - abs(float2(x, z) - fraction);
+            meanVel += v[idx];
         }
+    }
+    meanVel *= 0.25;
+    float2 result = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        float2 diff = v[i] - meanVel;
+        float diffSpeed = length(diff);
+        float scale = maxDiffSpeed / max(diffSpeed, maxDiffSpeed);
+        result += (meanVel + diff * scale) * weights[i].x * weights[i].y;
     }
     return result;
 }
@@ -339,12 +390,14 @@ struct FlowPhases {
 
 // visual.z: flow-map clock in cycles, modulo 64 (the noise period). visual.w: seconds per cycle.
 // Each phase restarts while its weight is zero and jumps to a new noise offset, so no cycle repeats.
+)hlsl"
+R"hlsl(
 FlowPhases FogFlowPhases() {
     FlowPhases f;
     float s = visual.z;
     float a = frac(s);
     float b = frac(s + 0.5);
-    f.wA = 1.0 - abs(2.0 * a - 1.0);
+    f.wA = 0.5 - 0.5 * cos(6.2831853 * a);
     f.wB = 1.0 - f.wA;
     // Two uncorrelated noises crossfaded lose contrast mid-way; restore the original variance.
     f.norm = rsqrt(max(f.wA * f.wA + f.wB * f.wB, 0.25));
@@ -366,14 +419,30 @@ void FlowDetail(float2 world, float2 velocity, FlowPhases f, float cloudScale, f
         float shift = length(velocity) * visual.w;
         velocity *= min(1.0, 120.0 / max(shift, 0.001));
     }
-    float2 pA = world - velocity * f.tA;
-    float2 pB = world - velocity * f.tB;
-    float cloudA = FogDetail(pA * cloudScale + f.shiftA);
-    float cloudB = FogDetail(pB * cloudScale + f.shiftB);
-    float detailA = FogDetail(pA.yx * detailScale + f.shiftA.yx + float2(7.0, 15.0) + warpScale * cloudA + warp);
-    float detailB = FogDetail(pB.yx * detailScale + f.shiftB.yx + float2(7.0, 15.0) + warpScale * cloudB + warp);
-    cloud = (f.wA * cloudA + f.wB * cloudB) * f.norm;
-    detail = (f.wA * detailA + f.wB * detailB) * f.norm;
+    float flowBlend = smoothstep(0.05, 0.4, length(velocity));
+    float flowCloud = 0.0, flowDetail = 0.0;
+    [branch]
+    if (flowBlend > 0.0) {
+        float2 pA = world - velocity * f.tA;
+        float2 pB = world - velocity * f.tB;
+        float cloudA = FogDetail(RotCloud(pA * cloudScale) + f.shiftA);
+        float cloudB = FogDetail(RotCloud(pB * cloudScale) + f.shiftB);
+        float detailA = FogDetail(RotDetail(pA * detailScale) + f.shiftA.yx + float2(7.0, 15.0) +
+                                  warpScale * float2(cloudA, -0.7 * cloudA) + warp);
+        float detailB = FogDetail(RotDetail(pB * detailScale) + f.shiftB.yx + float2(7.0, 15.0) +
+                                  warpScale * float2(cloudB, -0.7 * cloudB) + warp);
+        flowCloud = (f.wA * cloudA + f.wB * cloudB) * f.norm;
+        flowDetail = (f.wA * detailA + f.wB * detailB) * f.norm;
+    }
+    float staticCloud = 0.0, staticDetail = 0.0;
+    [branch]
+    if (flowBlend < 1.0) {
+        staticCloud = FogDetail(RotCloud(world * cloudScale));
+        staticDetail = FogDetail(RotDetail(world * detailScale) + float2(7.0, 15.0) +
+                                 warpScale * float2(staticCloud, -0.7 * staticCloud) + warp);
+    }
+    cloud = lerp(staticCloud, flowCloud, flowBlend);
+    detail = lerp(staticDetail, flowDetail, flowBlend);
 }
 
 float WideFogThickness(float2 world) {
@@ -428,6 +497,23 @@ float SolarVisibility(float3 samplePosition, uint2 size) {
     return visibility * coverage;
 }
 
+float CompactVerticalIntegral(float heightA, float heightB, float thickness, float heightScale, float topFeather,
+                              float raised, float sceneGap, float tapLength) {
+    float vertical = 0.0;
+    [unroll]
+    for (int tap = 0; tap < 6; ++tap) {
+        float u = (tap + 0.5) / 6.0;
+        float tapHeight = lerp(heightA, heightB, u);
+        float tapProfile = CompactFogProfile(tapHeight, thickness, heightScale, topFeather);
+        [flatten]
+        if (raised > 0.0) {
+            tapProfile = lerp(tapProfile, RaisedFogProfile(tapHeight, thickness, heightScale, topFeather), raised);
+        }
+        vertical += tapProfile * saturate((sceneGap - tapLength * u) / 10.0);
+    }
+    return vertical * (1.0 / 6.0);
+}
+
 // Opacity, density-weighted depth, scene depth, and the segment end.
 float4 March(float3 ray, float zView, float offset, int steps, out float sunlight) {
     sunlight = 0.0;
@@ -447,7 +533,7 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
     bool wide = grid.x >= 2.0 && extent > 2560.0;
     bool compact = !wide && grid.x >= 2.0 && fogColor.w > 0.0;
     if (wide || compact) {
-        steps = wide || extent > 1024.0 ? 48 : 32;
+        steps = wide ? 48 : (extent > 1024.0 ? 80 : 32);
         offset = 0.5;
     }
     float minimumStep = segment / steps;
@@ -488,7 +574,7 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
             float depth = (first + travelled) * rayLength;
             float stepLength = wide
                 ? lerp(26.0, 48.0, fogColor.w > 0.0 ? smoothstep(420.0, 980.0, depth) : 0.0)
-                : lerp(14.0, 32.0, smoothstep(150.0, 510.0, depth));
+                : lerp(10.0, 26.0, smoothstep(160.0, 620.0, depth));
             stepSize = max(stepLength / rayLength, minimumStep);
         }
         float width = max(0.0, min(stepSize, segment - travelled));
@@ -507,24 +593,25 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
         float wideDensity = 0.0;
         float upperDensity = 0.0;
         float raised = 0.0;
+        bool split = wide;
         if (grid.x >= 2.0) {
             float2 fieldUv = saturate((samplePoint.xz - boundsMin.xz) / (boundsMax.xz - boundsMin.xz));
             float2 sampleCell = fieldUv * (grid.xy - 1.0);
-            bool split = wide;
             bool hasUpper = support.w > 0.0;
             bool upperInRange = hasUpper;
             bool upperSplit = true;
-            if (wide && support.x > 0.0) {
+            if ((wide || compact) && support.x > 0.0) {
                 float4 range = supportRanges.Load(int3(int2(sampleCell), 0));
                 float halfRise = 0.5 * abs(ray.y * width);
                 hasUpper = hasUpper && range.z <= range.w;
-                float reach = grid.z + RaisedReach();
+                float raisedExtra = compact ? 1.37 * RaisedReach() : RaisedReach();
+                float reach = (compact ? 1.40 * grid.z : grid.z) + raisedExtra;
                 float upperBottom = airProfile ? range.z + 0.5 * grid.z - lighting.z : range.z;
                 float upperTop = range.w + (airProfile ? 0.5 * grid.z + lighting.z : reach);
                 upperInRange = hasUpper && samplePoint.y + halfRise > upperBottom &&
                                samplePoint.y - halfRise < upperTop;
                 upperSplit = range.w - range.z > 0.5 * grid.z;
-                bool baseInRange = range.x <= range.y && samplePoint.y + halfRise > range.x &&
+                bool baseInRange = range.x <= range.y && samplePoint.y + halfRise > range.x - 2.0 &&
                                    samplePoint.y - halfRise < range.y + reach;
                 if (!baseInRange && !upperInRange) continue;
                 split = range.y - range.x > 0.36 * grid.z;
@@ -580,12 +667,10 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                 }
             }
             if (compact) {
-                // Banks stand taller than the thin fog between them, at any distance. A uniform top reads as a
-                // flat sheet with a straight horizon when seen at a grazing angle.
-                // Above 1 (only reachable with the nested grid, RFC 0034) the fog was piled up by an attack: it
-                // stands taller, so the rim of a cut reads from the side even inside an already opaque bank.
-                float bankHeight = lerp(0.5, 1.4, smoothstep(0.12, 1.25, density)) +
-                                   1.2 * smoothstep(1.0, 1.3, density);
+                // Keep resting banks within 0.65..1.15x so high density does not sprout vertical spikes,
+                // while still raising active cut/spin rims pushed into velocity > 0.
+                float bankHeight = lerp(0.65, 1.15, smoothstep(0.15, 1.10, density)) +
+                                   0.22 * smoothstep(1.05, 1.45, density) * saturate(length(cell.zw) / 45.0);
                 thickness *= bankHeight;
                 heightScale *= bankHeight;
             }
@@ -604,17 +689,17 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                     float cloud = 0.0, detail = 0.0;
                     [branch]
                     if (detailWeight > 0.0) {
-                        FlowDetail(samplePoint.xz, flowVelocity, phases, 0.023, 0.053, 0.5,
-                                   float2(0.042, -0.027) * heightScale, cloud, detail);
+                        FlowDetail(samplePoint.xz, flowVelocity, phases, 0.015, 0.032, 0.45,
+                                   float2(0.032, -0.021) * heightScale, cloud, detail);
                     }
-                    float ribbon = saturate(0.5 + detailWeight * (0.44 * cloud + 0.31 * detail));
+                    float ribbon = saturate(0.5 + detailWeight * (0.30 * cloud + 0.16 * detail));
                     // Vary the top across the floor and feather it over more than one sample.
                     float bank = 0.5 + 0.5 * detailWeight * cloud;
-                    thickness *= lerp(0.69, 1.0, bank);
+                    thickness *= lerp(0.80, 1.0, bank);
                     topFeather = max(8.0, thickness * 0.48);
                     float motion = saturate((abs(cell.z) + abs(cell.w)) / 190.0);
-                    density *= lerp(0.46, 1.34, ribbon) * (1.0 + 0.60 * compression);
-                    heightScale *= lerp(0.65, 1.36, ribbon) + (0.25 * motion + 0.45 * compression) * ribbon;
+                    density *= lerp(0.68, 1.20, ribbon) * (1.0 + 0.25 * compression);
+                    heightScale *= lerp(0.82, 1.16, ribbon) + (0.18 * motion + 0.12 * compression) * ribbon;
                 }
             }
             [branch]
@@ -626,6 +711,8 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                                                    upperSplit);
             }
         }
+)hlsl"
+R"hlsl(
         float opticalDensity = wideDensity;
         [branch]
         if (!wide) {
@@ -649,19 +736,49 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
             // a ramp, a rock) otherwise cuts the layer with a hard straight line.
             float sceneGap = (zView - (t - offset * width)) * rayLength;
             float tapLength = width * rayLength;
-            float vertical = 0.0;
-            [unroll]
-            for (int tap = 0; tap < 6; ++tap) {
-                float tapHeight = lerp(heightA, heightB, (tap + 0.5) / 6.0);
-                float tapProfile = CompactFogProfile(tapHeight, thickness, heightScale, topFeather);
-                [flatten]
-                if (raised > 0.0) {
-                    tapProfile = lerp(tapProfile, RaisedFogProfile(tapHeight, thickness, heightScale, topFeather),
-                                      raised);
+            float vertical = CompactVerticalIntegral(heightA, heightB, thickness, heightScale, topFeather, raised,
+                                                     sceneGap, tapLength);
+            [branch]
+            if (grid.x >= 2.0 && split) {
+                float2 cliffCell = saturate((samplePoint.xz - boundsMin.xz) / (boundsMax.xz - boundsMin.xz)) *
+                                   (grid.xy - 1.0);
+                int2 base = int2(cliffCell);
+                int2 end = min(base + 1, int2(grid.xy) - 1);
+                float2 a = fogField.Load(int3(base, 0)).xy;
+                float2 b = fogField.Load(int3(end.x, base.y, 0)).xy;
+                float2 c = fogField.Load(int3(base.x, end.y, 0)).xy;
+                float2 d = fogField.Load(int3(end, 0)).xy;
+                float4 densities = float4(a.x, b.x, c.x, d.x);
+                float4 floors = float4(a.y, b.y, c.y, d.y) / max(densities, 0.0001);
+                float4 weights = CornerWeights(cliffCell);
+                float coarseDensity = dot(weights, densities);
+                float4 delta = (floors - floorY) / grid.z;
+                float variance = dot(weights * densities, delta * delta) / max(coarseDensity, 0.0001);
+                float splitWeight = smoothstep(0.18 * 0.18, 0.33 * 0.33, variance) *
+                                    CliffSplitGate(weights, densities, floors, floorY, coarseDensity);
+                [branch]
+                if (splitWeight > 0.0) {
+                    float4 cornerMass = weights * clamp(densities, 0.0, 1.5);
+                    float massSum = dot(cornerMass, 1.0);
+                    float splitVertical = 0.0;
+                    if (massSum > 0.0001) {
+                        float baseY = samplePoint.y - 0.5 * rise;
+                        float4 levels = LevelFloors(weights, densities, floors);
+                        float4 cornerVerticals = 0.0;
+                        [unroll]
+                        for (int j = 0; j < 4; ++j) {
+                            if (cornerMass[j] > 0.0) {
+                                float cornerA = baseY - levels[j];
+                                cornerVerticals[j] = CompactVerticalIntegral(cornerA, cornerA + rise, thickness,
+                                                                             heightScale, topFeather, raised,
+                                                                             sceneGap, tapLength);
+                            }
+                        }
+                        splitVertical = dot(cornerMass, cornerVerticals) / massSum;
+                    }
+                    vertical = lerp(vertical, splitVertical, splitWeight);
                 }
-                vertical += tapProfile * saturate((sceneGap - tapLength * (tap + 0.5) / 6.0) / 10.0);
             }
-            vertical *= 1.0 / 6.0;
             opticalDensity = density * vertical;
         }
         float sampleDensity = (opticalDensity + upperDensity) * edge * width;
