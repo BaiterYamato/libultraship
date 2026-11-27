@@ -9,6 +9,9 @@
 #include <vector>
 #include <utility>
 #include <cmath>
+#include <exception>
+#include <iterator>
+#include <system_error>
 
 #include <map>
 #include <unordered_map>
@@ -381,6 +384,7 @@ bool CreateKokiriLabPbrResources(ID3D11Device* device, KokiriLabPbrDevice& state
 pD3DCompile gRawD3DCompile = nullptr;
 decltype(&D3DCreateBlob) gCreateBlob = nullptr;
 std::once_flag gShaderCacheOnce;
+std::mutex gShaderCacheMutex;
 std::filesystem::path gShaderCacheDirectory;
 constexpr char ShaderCacheMagic[8] = { 'L', 'U', 'S', 'C', 'S', 'O', '0', '1' };
 constexpr size_t ShaderCacheMaxBytes = 16u * 1024u * 1024u;
@@ -428,7 +432,8 @@ void PrepareShaderCache() {
     } catch (...) { gShaderCacheDirectory.clear(); }
 }
 
-bool LoadCachedShader(const std::filesystem::path& path, const ShaderCacheKey& key, ID3DBlob** code) {
+bool LoadCachedShader(const std::filesystem::path& path, const ShaderCacheKey& key,
+                      decltype(&D3DCreateBlob) createBlob, ID3DBlob** code) {
     std::ifstream file(path, std::ios::binary);
     char magic[sizeof(ShaderCacheMagic)];
     uint64_t stored[2]{};
@@ -438,7 +443,7 @@ bool LoadCachedShader(const std::filesystem::path& path, const ShaderCacheKey& k
         !file.read(reinterpret_cast<char*>(&size), sizeof(size)) || size == 0 || size > ShaderCacheMaxBytes)
         return false;
     ComPtr<ID3DBlob> blob;
-    if (FAILED(gCreateBlob(size, blob.GetAddressOf())) ||
+    if (FAILED(createBlob(size, blob.GetAddressOf())) ||
         !file.read(static_cast<char*>(blob->GetBufferPointer()), size) || file.peek() != EOF)
         return false;
     *code = blob.Detach();
@@ -451,7 +456,7 @@ void StoreCachedShader(const std::filesystem::path& path, const ShaderCacheKey& 
     if (error || code.GetBufferSize() == 0 || code.GetBufferSize() > ShaderCacheMaxBytes)
         return;
     auto temporary = path;
-    temporary += ".tmp" + std::to_string(GetCurrentThreadId());
+    temporary += ".tmp-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetCurrentThreadId());
     {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         const uint64_t stored[2] = { key.a, key.b };
@@ -460,23 +465,25 @@ void StoreCachedShader(const std::filesystem::path& path, const ShaderCacheKey& 
         file.write(reinterpret_cast<const char*>(stored), sizeof(stored));
         file.write(reinterpret_cast<const char*>(&size), sizeof(size));
         file.write(static_cast<const char*>(code.GetBufferPointer()), size);
-        if (!file.good()) {
-            file.close();
+        file.close();
+        if (!file) {
             std::filesystem::remove(temporary, error);
             return;
         }
     }
-    std::filesystem::rename(temporary, path, error);
-    if (error)
+    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
         std::filesystem::remove(temporary, error);
 }
 
-HRESULT WINAPI CachedD3DCompile(LPCVOID data, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO* macros,
-                                ID3DInclude* include, LPCSTR entry, LPCSTR target, UINT flags, UINT effectFlags,
-                                ID3DBlob** code, ID3DBlob** errors) {
-    std::call_once(gShaderCacheOnce, PrepareShaderCache);
-    if (include || !data || !code || !gCreateBlob || gShaderCacheDirectory.empty())
-        return gRawD3DCompile(data, size, name, macros, include, entry, target, flags, effectFlags, code, errors);
+HRESULT CompileWithDiskCache(pD3DCompile compiler, decltype(&D3DCreateBlob) createBlob,
+                             const std::filesystem::path& directory, LPCVOID data, SIZE_T size, LPCSTR name,
+                             const D3D_SHADER_MACRO* macros, ID3DInclude* include, LPCSTR entry, LPCSTR target,
+                             UINT flags, UINT effectFlags, ID3DBlob** code, ID3DBlob** errors,
+                             bool* diskHit = nullptr) {
+    if (diskHit)
+        *diskHit = false;
+    if (include || !data || !code || !createBlob || directory.empty())
+        return compiler(data, size, name, macros, include, entry, target, flags, effectFlags, code, errors);
     ShaderCacheKey key;
     key.Add("d3dcompiler_47");
     key.Add(data, size);
@@ -492,13 +499,29 @@ HRESULT WINAPI CachedD3DCompile(LPCVOID data, SIZE_T size, LPCSTR name, const D3
     char hex[33];
     std::snprintf(hex, sizeof(hex), "%016llx%016llx", static_cast<unsigned long long>(key.a),
                   static_cast<unsigned long long>(key.b));
-    const auto path = gShaderCacheDirectory / (std::string(hex) + ".cso");
-    if (LoadCachedShader(path, key, code))
-        return S_OK;
-    const auto result = gRawD3DCompile(data, size, name, macros, include, entry, target, flags, effectFlags, code, errors);
-    if (SUCCEEDED(result) && *code)
+    const auto path = directory / (std::string(hex) + ".cso");
+    {
+        const std::lock_guard lock(gShaderCacheMutex);
+        if (LoadCachedShader(path, key, createBlob, code)) {
+            if (diskHit)
+                *diskHit = true;
+            return S_OK;
+        }
+    }
+    const auto result = compiler(data, size, name, macros, include, entry, target, flags, effectFlags, code, errors);
+    if (SUCCEEDED(result) && *code) {
+        const std::lock_guard lock(gShaderCacheMutex);
         StoreCachedShader(path, key, **code);
+    }
     return result;
+}
+
+HRESULT WINAPI CachedD3DCompile(LPCVOID data, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO* macros,
+                                ID3DInclude* include, LPCSTR entry, LPCSTR target, UINT flags, UINT effectFlags,
+                                ID3DBlob** code, ID3DBlob** errors) {
+    std::call_once(gShaderCacheOnce, PrepareShaderCache);
+    return CompileWithDiskCache(gRawD3DCompile, gCreateBlob, gShaderCacheDirectory, data, size, name, macros, include,
+                                entry, target, flags, effectFlags, code, errors);
 }
 
 } // namespace
@@ -568,6 +591,11 @@ static_assert(sizeof(PerDrawCB::Texture) == 16, "R018 HLSL texture constants mus
 static_assert(offsetof(PerDrawCB::Texture, mipmaps) == 12, "R018 mipmaps flag must replace the old padding");
 
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
+    // Workers own only compiler inputs and blobs. Finish before tearing down the backend.
+    for (auto& job : mFogMsaaJobs) {
+        if (job.future.valid())
+            job.future.wait();
+    }
     if (kokiriLabPbrDevices) {
         kokiriLabPbrDevices->erase(this);
         if (kokiriLabPbrDevices->empty()) {
@@ -2854,20 +2882,121 @@ void GfxRenderingAPIDX11::UpdateFogLift(const FastFogFlow& flow, FogFlowAction a
     mContext->UpdateSubresource(mFogLiftTexture.Get(), 0, &rect, lift, width * sizeof(lift[0]), 0);
 }
 
-bool GfxRenderingAPIDX11::InitFogMsaa() {
-    if (mFogMsaaFailed)
-        return false;
-    if (mFogMsaaPs)
+namespace {
+struct FogMsaaShaderSpec {
+    const char* entry;
+    const char* profile;
+};
+constexpr FogMsaaShaderSpec fogMsaaShaderSpecs[] = {
+    { "PSMain", "ps_4_1" },
+    { "PSLow", "ps_4_1" },
+    { "PSUpscale", "ps_5_0" },
+    { "PSUniformFog", "ps_5_0" },
+    { "PSUpscaleCached", "ps_5_0" },
+};
+
+bool CanUseFogMsaaCache(const D3D11_VIEWPORT& viewport, UINT samples) {
+    return samples >= 4 && viewport.Width == std::floor(viewport.Width) &&
+           viewport.Height == std::floor(viewport.Height) && viewport.TopLeftX == std::floor(viewport.TopLeftX) &&
+           viewport.TopLeftY == std::floor(viewport.TopLeftY);
+}
+
+double FogElapsedMs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+} // namespace
+
+GfxRenderingAPIDX11::FogMsaaBytecode GfxRenderingAPIDX11::CompileFogMsaaBytecode(
+    pD3DCompile compiler, decltype(&D3DCreateBlob) createBlob, const std::filesystem::path& cacheDirectory,
+    FogMsaaShader kind) {
+    static_assert(std::size(fogMsaaShaderSpecs) == static_cast<size_t>(FogMsaaShader::Count));
+    const auto& spec = fogMsaaShaderSpecs[static_cast<size_t>(kind)];
+    constexpr D3D_SHADER_MACRO macros[]{ { "FOG_MSAA", "1" }, { nullptr, nullptr } };
+    FogMsaaBytecode bytecode;
+    if (compiler) {
+        const auto start = std::chrono::steady_clock::now();
+        bytecode.status = CompileWithDiskCache(compiler, createBlob, cacheDirectory, FogVolumeShader,
+                                               sizeof(FogVolumeShader) - 1, "FogVolume", macros, nullptr, spec.entry,
+                                               spec.profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                               bytecode.code.GetAddressOf(), bytecode.diagnostic.GetAddressOf(),
+                                               &bytecode.diskHit);
+        bytecode.milliseconds = FogElapsedMs(start);
+    }
+    return bytecode;
+}
+
+void GfxRenderingAPIDX11::StartFogMsaaShader(FogMsaaShader kind) {
+    const auto index = static_cast<size_t>(kind);
+    auto& job = mFogMsaaJobs[index];
+    if (job.started)
+        return;
+    job.started = true;
+    std::call_once(gShaderCacheOnce, PrepareShaderCache);
+    const auto compiler = reinterpret_cast<pD3DCompile>(GetProcAddress(mCompilerModule, "D3DCompile"));
+    const auto createBlob = reinterpret_cast<decltype(&D3DCreateBlob)>(GetProcAddress(mCompilerModule, "D3DCreateBlob"));
+    try {
+        // Pass stable values; the task never reads the renderer, shared compiler aliases or the immediate context.
+        job.future = std::async(std::launch::async, CompileFogMsaaBytecode, compiler, createBlob,
+                                gShaderCacheDirectory, kind);
+        SPDLOG_INFO("Fast3D fog MSAA shader queued {} frame={}", fogMsaaShaderSpecs[index].entry, mFogFrame);
+    } catch (const std::system_error& error) {
+        SPDLOG_WARN("Fast3D fog MSAA worker unavailable for {}: {}", fogMsaaShaderSpecs[index].entry, error.what());
+    }
+}
+
+bool GfxRenderingAPIDX11::PrepareFogMsaaShader(FogMsaaShader kind, ComPtr<ID3D11PixelShader>& shader) {
+    if (shader)
         return true;
-    ComPtr<ID3DBlob> bytecode;
-    if (!CompileFogShader("PSMain", "ps_4_1", bytecode.GetAddressOf(), true) ||
-        FAILED(mDevice->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr,
-                                          mFogMsaaPs.GetAddressOf()))) {
-        mFogMsaaFailed = true;
-        SPDLOG_WARN("Fast3D fog could not initialize the multisampled pass");
+    const auto index = static_cast<size_t>(kind);
+    auto& job = mFogMsaaJobs[index];
+    if (job.failed)
+        return false;
+    StartFogMsaaShader(kind);
+    const auto& spec = fogMsaaShaderSpecs[index];
+    const bool background = job.future.valid();
+    if (background && job.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return false;
+
+    FogMsaaBytecode bytecode;
+    try {
+        if (background) {
+            bytecode = job.future.get();
+        } else {
+            const auto compiler = reinterpret_cast<pD3DCompile>(GetProcAddress(mCompilerModule, "D3DCompile"));
+            const auto createBlob =
+                reinterpret_cast<decltype(&D3DCreateBlob)>(GetProcAddress(mCompilerModule, "D3DCreateBlob"));
+            bytecode = CompileFogMsaaBytecode(compiler, createBlob, gShaderCacheDirectory, kind);
+        }
+    } catch (const std::exception& error) {
+        job.failed = true;
+        SPDLOG_WARN("Fast3D fog MSAA shader {} worker failed: {}", spec.entry, error.what());
+        return false;
+    } catch (...) {
+        job.failed = true;
+        SPDLOG_WARN("Fast3D fog MSAA shader {} worker failed", spec.entry);
         return false;
     }
-    return true;
+    const auto start = std::chrono::steady_clock::now();
+    const HRESULT created = SUCCEEDED(bytecode.status) && bytecode.code
+                                ? mDevice->CreatePixelShader(bytecode.code->GetBufferPointer(),
+                                                             bytecode.code->GetBufferSize(), nullptr,
+                                                             shader.ReleaseAndGetAddressOf())
+                                : E_FAIL;
+    SPDLOG_INFO("Fast3D fog MSAA shader {} frame={} worker={} disk_hit={} bytecode_ms={:.2f} create_ms={:.2f} "
+                "compile_hr={:#x} create_hr={:#x}",
+                spec.entry, mFogFrame, background, bytecode.diskHit, bytecode.milliseconds, FogElapsedMs(start),
+                static_cast<unsigned>(bytecode.status), static_cast<unsigned>(created));
+    if (FAILED(created) || !shader) {
+        job.failed = true;
+        shader.Reset();
+        SPDLOG_WARN("Fast3D fog MSAA shader {} unavailable: {}", spec.entry,
+                    bytecode.diagnostic ? static_cast<const char*>(bytecode.diagnostic->GetBufferPointer()) : "");
+    }
+    return !job.failed;
+}
+
+bool GfxRenderingAPIDX11::InitFogMsaa() {
+    return PrepareFogMsaaShader(FogMsaaShader::Full, mFogMsaaPs);
 }
 
 static bool CreateFogColorTarget(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT format,
@@ -2889,14 +3018,21 @@ bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled,
     auto& shaders = mFogLodShaders[multisampled];
     if (mFogLodFailed || shaders.failed)
         return false;
-    if (!shaders.upscale) {
+    if (multisampled) {
+        if (mFeatureLevel < D3D_FEATURE_LEVEL_11_0)
+            return false;
+        const bool low = PrepareFogMsaaShader(FogMsaaShader::Low, shaders.low);
+        const bool upscale = PrepareFogMsaaShader(FogMsaaShader::Upscale, shaders.upscale);
+        if (!low || !upscale)
+            return false;
+    } else if (!shaders.upscale) {
         const auto compile = [&](const char* entry, const char* profile, ID3D11PixelShader** shader) {
             ComPtr<ID3DBlob> bytecode;
-            return CompileFogShader(entry, profile, bytecode.GetAddressOf(), multisampled) &&
+            return CompileFogShader(entry, profile, bytecode.GetAddressOf()) &&
                    SUCCEEDED(mDevice->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
                                                         nullptr, shader));
         };
-        if (!compile("PSLow", multisampled ? "ps_4_1" : "ps_4_0", shaders.low.GetAddressOf()) ||
+        if (!compile("PSLow", "ps_4_0", shaders.low.GetAddressOf()) ||
             !compile("PSUpscale", "ps_5_0", shaders.upscale.GetAddressOf())) {
             shaders.failed = true;
             return false;
@@ -2945,37 +3081,32 @@ bool GfxRenderingAPIDX11::InitFogLod(UINT width, UINT height, bool multisampled,
 }
 
 bool GfxRenderingAPIDX11::InitFogMsaaCache(UINT width, UINT height) {
-    if (mFogMsaaCacheFailed)
+    if (mFogMsaaCacheFailed || mFeatureLevel < D3D_FEATURE_LEVEL_11_0)
         return false;
-    if (!mFogUniformPs) {
-        const auto compile = [&](const char* entry, ID3D11PixelShader** shader) {
-            ComPtr<ID3DBlob> bytecode;
-            return CompileFogShader(entry, "ps_5_0", bytecode.GetAddressOf(), true) &&
-                   SUCCEEDED(mDevice->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
-                                                        nullptr, shader));
-        };
-        if (!compile("PSUniformFog", mFogUniformPs.GetAddressOf()) ||
-            !compile("PSUpscaleCached", mFogCachedUpscalePs.GetAddressOf())) {
-            mFogMsaaCacheFailed = true;
-            return false;
-        }
-    }
+    const bool uniform = PrepareFogMsaaShader(FogMsaaShader::Uniform, mFogUniformPs);
+    const bool upscale = PrepareFogMsaaShader(FogMsaaShader::CachedUpscale, mFogCachedUpscalePs);
+    if (!uniform || !upscale)
+        return false;
     if (mFogCacheWidth == width && mFogCacheHeight == height)
         return true;
+    const auto start = std::chrono::steady_clock::now();
     FogHistoryTarget target;
     if (!CreateFogColorTarget(mDevice.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT,
                               target.target.GetAddressOf(), target.view.GetAddressOf())) {
         mFogMsaaCacheFailed = true;
+        SPDLOG_WARN("Fast3D fog MSAA cache allocation failed {}x{} frame={} allocation_ms={:.2f}",
+                    width, height, mFogFrame, FogElapsedMs(start));
         return false;
     }
     mFogUniformCache = std::move(target);
     mFogCacheWidth = width;
     mFogCacheHeight = height;
-    SPDLOG_INFO("Fast3D fog MSAA cache {}x{}", width, height);
+    SPDLOG_INFO("Fast3D fog MSAA cache {}x{} frame={} allocation_ms={:.2f}", width, height, mFogFrame,
+                FogElapsedMs(start));
     return true;
 }
 
-void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
+bool GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
                                      const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction,
                                      bool useSun, ID3D11Query* lowEnd, ID3D11RenderTargetView* target,
                                      ID3D11BlendState* blend, bool multisampled, bool linearLayer) {
@@ -3071,10 +3202,7 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     }
     const auto width = static_cast<UINT>(viewport.Width);
     const auto height = static_cast<UINT>(viewport.Height);
-    const bool cache = multisampled && fb.msaa_level >= 4 && viewport.Width == float(width) &&
-                       viewport.Height == float(height) &&
-                       viewport.TopLeftX == std::floor(viewport.TopLeftX) &&
-                       viewport.TopLeftY == std::floor(viewport.TopLeftY) && InitFogMsaaCache(width, height);
+    const bool cache = multisampled && CanUseFogMsaaCache(viewport, fb.msaa_level) && InitFogMsaaCache(width, height);
     if (cache) {
         ComPtr<ID3D11ShaderResourceView> oldCache;
         mContext->PSGetShaderResources(5, 1, oldCache.GetAddressOf());
@@ -3138,6 +3266,7 @@ void GfxRenderingAPIDX11::DrawFogLod(const FastFogVolume& volume, const FastFogF
     std::copy_n(volume.right, 4, mFogLastCamera.previousRight);
     std::copy_n(volume.up, 4, mFogLastCamera.previousUp);
     std::copy_n(volume.depth, 4, mFogLastDepth.begin());
+    return cache;
 }
 
 bool GfxRenderingAPIDX11::InitFogFlow() {
@@ -3731,10 +3860,52 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
     D3D11_VIEWPORT viewport{};
     UINT count = 1;
     mContext->RSGetViewports(&count, &viewport);
-    if (!count || viewport.Width <= 0.0f || viewport.Height <= 0.0f || !InitFogVolume())
+    if (!count || viewport.Width <= 0.0f || viewport.Height <= 0.0f)
         return;
-    if (multisampled && !InitFogMsaa())
+    const UINT width = static_cast<UINT>(std::ceil(viewport.Width));
+    const UINT height = static_cast<UINT>(std::ceil(viewport.Height));
+    const bool worldVolume = volume.eye[3] == 1.0f;
+    const bool wantsLod = flow && worldVolume && (volume.grid[3] == 1.0f || volume.grid[3] == 2.0f) &&
+                          width >= 320 && height >= 240;
+    if (worldVolume && (mFogPathSamples != fb.msaa_level || mFogPathLinear != linearLayer)) {
+        SPDLOG_INFO("Fast3D fog path begin frame={} fb={} layer={}->{} samples={}->{} extent={}x{}",
+                    mFogFrame, mCurrentFramebuffer, mFogPathLinear, linearLayer, mFogPathSamples, fb.msaa_level,
+                    width, height);
+        mFogPathSamples = fb.msaa_level;
+        mFogPathLinear = linearLayer;
+        mFogPathStart = std::chrono::steady_clock::now();
+        mFogPathFirstDraw = true;
+    }
+    if (fb.msaa_level > 1) {
+        // A live linear layer can warm the native fog path before a pack is switched off.
+        StartFogMsaaShader(FogMsaaShader::Full);
+        const bool warmLod = wantsLod && mFeatureLevel >= D3D_FEATURE_LEVEL_11_0;
+        const bool warmCache = warmLod && CanUseFogMsaaCache(viewport, fb.msaa_level);
+        if (warmLod) {
+            StartFogMsaaShader(FogMsaaShader::Low);
+            StartFogMsaaShader(FogMsaaShader::Upscale);
+        }
+        if (warmCache) {
+            StartFogMsaaShader(FogMsaaShader::Uniform);
+            StartFogMsaaShader(FogMsaaShader::CachedUpscale);
+        }
+        if (linearLayer) {
+            InitFogMsaa();
+            if (warmLod) {
+                auto& nativeLod = mFogLodShaders[true];
+                PrepareFogMsaaShader(FogMsaaShader::Low, nativeLod.low);
+                PrepareFogMsaaShader(FogMsaaShader::Upscale, nativeLod.upscale);
+            }
+            if (warmCache && !mFogUniformCache.view)
+                InitFogMsaaCache(width, height);
+        }
+    }
+    if (!InitFogVolume())
         return;
+    if (multisampled && !InitFogMsaa()) {
+        mFogLastFrame = 0;
+        return;
+    }
     auto* fogBlend = linearLayer ? mFogLayerBlend.Get() : mFogBlend.Get();
     if (fb.msaa_level != mFogReportedMsaa) {
         mFogReportedMsaa = fb.msaa_level;
@@ -3933,11 +4104,8 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
             mFogGridLogged = true;
         }
     }
-    const UINT width = static_cast<UINT>(std::ceil(viewport.Width));
-    const UINT height = static_cast<UINT>(std::ceil(viewport.Height));
     int lod = 0;
-    if (flow && action != FogFlowAction::Stale && volume.eye[3] == 1.0f &&
-        (volume.grid[3] == 1.0f || volume.grid[3] == 2.0f) && width >= 320 && height >= 240 &&
+    if (wantsLod && action != FogFlowAction::Stale &&
         InitFogLod((width + 1) / 2, (height + 1) / 2, multisampled, useSun)) {
         lod = static_cast<int>(volume.grid[3]);
     }
@@ -4037,9 +4205,11 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         mContext->PSSetSamplers(2, 1, mFogNoiseSampler.GetAddressOf());
     }
     mContext->PSSetSamplers(1, 1, mFogGridSampler.GetAddressOf());
+    bool usedMsaaCache = false;
     if (lod) {
-        DrawFogLod(volume, *flow, action, viewport, lod, fieldFraction, extinction, useSun,
-                   measurement ? measurement->lowEnd.Get() : nullptr, fogTarget, fogBlend, multisampled, linearLayer);
+        usedMsaaCache = DrawFogLod(volume, *flow, action, viewport, lod, fieldFraction, extinction, useSun,
+                                  measurement ? measurement->lowEnd.Get() : nullptr, fogTarget, fogBlend,
+                                  multisampled, linearLayer);
         mContext->PSSetShaderResources(2, 1, oldReduced.GetAddressOf());
         mContext->PSSetConstantBuffers(1, 1, oldTemporalCb.GetAddressOf());
     } else {
@@ -4085,6 +4255,18 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         if (!measurement->frameClock)
             mContext->End(measurement->disjoint.Get());
         measurement->pending = true;
+    }
+    if (worldVolume && mFogPathFirstDraw) {
+        mFogPathFirstDraw = false;
+        mFogPathUsedMsaaCache = usedMsaaCache;
+        SPDLOG_INFO("Fast3D fog path first draw frame={} fb={} layer={} samples={} lod={} msaa_cache={} "
+                    "transition_ms={:.2f}",
+                    mFogFrame, mCurrentFramebuffer, linearLayer, fb.msaa_level, lod, usedMsaaCache,
+                    FogElapsedMs(mFogPathStart));
+    } else if (worldVolume && mFogPathUsedMsaaCache != usedMsaaCache) {
+        mFogPathUsedMsaaCache = usedMsaaCache;
+        SPDLOG_INFO("Fast3D fog path MSAA cache in use={} frame={} fb={}", usedMsaaCache, mFogFrame,
+                    mCurrentFramebuffer);
     }
 }
 

@@ -9,6 +9,9 @@
 #include "../foliage_depth_diagnostics.h"
 #include <array>
 #include <cstdint>
+#include <chrono>
+#include <filesystem>
+#include <future>
 #include <memory>
 #include <string>
 #include "gfx_rendering_api.h"
@@ -255,10 +258,26 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void UpdateFogSupportRanges(const FastFogVolume& volume, const FastFogFlow& flow, UINT width, UINT height);
     void UpdateFogLift(const FastFogFlow& flow, FogFlowAction action, UINT width, UINT height);
     void UpdateFogUpper(const FastFogVolume& volume, FogFlowAction action, UINT width, UINT height);
+    enum class FogMsaaShader { Full, Low, Upscale, Uniform, CachedUpscale, Count };
+    struct FogMsaaBytecode {
+        Microsoft::WRL::ComPtr<ID3DBlob> code, diagnostic;
+        HRESULT status = E_FAIL;
+        bool diskHit = false;
+        double milliseconds = 0.0;
+    };
+    struct FogMsaaJob {
+        std::future<FogMsaaBytecode> future;
+        bool started = false;
+        bool failed = false;
+    };
+    static FogMsaaBytecode CompileFogMsaaBytecode(pD3DCompile compiler, decltype(&D3DCreateBlob) createBlob,
+                                                  const std::filesystem::path& cacheDirectory, FogMsaaShader kind);
+    void StartFogMsaaShader(FogMsaaShader kind);
+    bool PrepareFogMsaaShader(FogMsaaShader kind, Microsoft::WRL::ComPtr<ID3D11PixelShader>& shader);
     bool InitFogMsaa();
     bool InitFogLod(UINT width, UINT height, bool multisampled, bool useSun);
     bool InitFogMsaaCache(UINT width, UINT height);
-    void DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
+    bool DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
                     const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction, bool useSun,
                     ID3D11Query* lowEnd, ID3D11RenderTargetView* target, ID3D11BlendState* blend,
                     bool multisampled, bool linearLayer);
@@ -323,7 +342,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     int mFogLastFramebuffer = -1, mFogLodMode = -1;
     unsigned mFogHistoryIndex = 0, mFogHistoryFrames = 0, mFogHistoryResets = 0, mFogReducedReuses = 0;
     bool mFogLodFailed = false;
-    bool mFogMsaaFailed = false;
+    std::array<FogMsaaJob, static_cast<size_t>(FogMsaaShader::Count)> mFogMsaaJobs{};
+    std::chrono::steady_clock::time_point mFogPathStart;
+    UINT mFogPathSamples = 0;
+    bool mFogPathLinear = false;
+    bool mFogPathFirstDraw = false;
+    bool mFogPathUsedMsaaCache = false;
     Microsoft::WRL::ComPtr<ID3D11BlendState> mFogBlend;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mFogRaster;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mFogDepth;
