@@ -12,6 +12,9 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <mutex>
 #include <any>
 #include <map>
 #include <set>
@@ -30,6 +33,12 @@
 #include <string>
 
 #include "fast/interpreter.h"
+#include "fast/fog_volume.h"
+#include "fast/fog_detail.h"
+#include "fast/labpbr_kokiri.h"
+#include "fast/screen_projection.h"
+#include "fast/world_postprocess.h"
+#include <atomic>
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -46,6 +55,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifdef ENABLE_DX11
+#include "fast/backends/gfx_direct3d_common.h"
+#endif
 #endif
 
 std::stack<std::string> currentDir;
@@ -72,6 +84,74 @@ std::stack<std::string> currentDir;
     ((mFbActive ? activeFb->second.applied_height : dims.height) / (2.0f * HALF_SCREEN_HEIGHT(activeFb)))
 
 #define TEXTURE_CACHE_MAX_SIZE 8192 // SOH [Unbound] was 1024
+
+namespace {
+struct FogSnapshot {
+    uint32_t ticket = 0;
+    FastFogVolume volume{};
+    Mtx* viewing = nullptr;
+    Mtx* projection = nullptr;
+    bool hasFlow = false;
+    FastFogFlow flow{};
+    // Células finas do ticket (width*height*4 floats); vazio quando o ticket não tem detalhe.
+    uint32_t detailWidth = 0, detailHeight = 0;
+    std::vector<float> detailCells;
+};
+
+// Retain enough recent frames for replay and interpolation. Display lists
+// carry a ticket, never a raw address supplied by an archive.
+std::mutex gFogSnapshotMutex;
+std::array<FogSnapshot, 32> gFogSnapshots{};
+uint32_t gFogTicket = 0;
+
+bool ReadFogSnapshot(uint32_t ticket, FastFogVolume& volume, FastFogFlow& flow, bool& hasFlow, Mtx*& viewing,
+                     Mtx*& projection) {
+    if (ticket == 0)
+        return false;
+    const std::lock_guard lock(gFogSnapshotMutex);
+    const auto& entry = gFogSnapshots[ticket % gFogSnapshots.size()];
+    if (entry.ticket != ticket)
+        return false;
+    volume = entry.volume;
+    viewing = entry.viewing;
+    projection = entry.projection;
+    hasFlow = entry.hasFlow;
+    if (hasFlow)
+        flow = entry.flow;
+    gFastFogDetailReplay.width = entry.detailWidth;
+    gFastFogDetailReplay.height = entry.detailHeight;
+    std::copy(entry.detailCells.begin(), entry.detailCells.end(), &gFastFogDetailReplay.cells[0][0]);
+    return true;
+}
+} // namespace
+
+extern "C" uint32_t FastQueueFogVolume(const FastFogVolume* volume, const FastFogFlow* flow, const void* viewing,
+                                       const void* projection) {
+    if (!volume)
+        return 0;
+    const std::lock_guard lock(gFogSnapshotMutex);
+    if (++gFogTicket == 0)
+        ++gFogTicket;
+    auto& entry = gFogSnapshots[gFogTicket % gFogSnapshots.size()];
+    entry.ticket = gFogTicket;
+    entry.volume = *volume;
+    entry.viewing = const_cast<Mtx*>(static_cast<const Mtx*>(viewing));
+    entry.projection = const_cast<Mtx*>(static_cast<const Mtx*>(projection));
+    entry.hasFlow = flow != nullptr;
+    if (flow)
+        entry.flow = *flow;
+    // Só o detalhe que o host acabou de publicar para este volume (mesmas dimensões) entra no snapshot.
+    const auto& published = gFastFogDetailCells;
+    const bool hasDetail = flow && volume->detailGrid[0] >= 2.0f && volume->detailGrid[1] >= 2.0f &&
+                           published.width == static_cast<uint32_t>(volume->detailGrid[0]) &&
+                           published.height == static_cast<uint32_t>(volume->detailGrid[1]) &&
+                           published.width <= FAST_FOG_DETAIL_SIDE && published.height <= FAST_FOG_DETAIL_SIDE;
+    entry.detailWidth = hasDetail ? published.width : 0;
+    entry.detailHeight = hasDetail ? published.height : 0;
+    entry.detailCells.assign(&published.cells[0][0],
+                             &published.cells[0][0] + (hasDetail ? 4u * published.width * published.height : 0u));
+    return gFogTicket;
+}
 
 namespace Fast {
 
@@ -137,13 +217,172 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
+namespace {
+struct WorldGeometryCapture {
+    bool armed = false;
+    bool cutoutOnly = false;
+    bool foliageEnabled = false;
+    bool foliageDepthEnabled = false;
+    bool overflow = false;
+    std::vector<std::array<float, 3>> vertices;
+    bool transmissionArmed = false;
+    bool transmissionOverflow = false;
+    uint16_t transmissionScene = 0;
+    std::array<bool, MAX_VERTICES> transmissionVertices{};
+    std::vector<WorldTransmissionTriangle> transmission;
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    std::vector<float> cutoutVertices;
+    std::vector<WorldCutoutBatch> cutoutBatches;
+    bool cutoutOverflowReported = false;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> pendingPixel;
+    bool pendingFoliageDepth = false;
+    unsigned pendingOffset = 0;
+    unsigned stride = 0;
+    std::array<bool, 2> linear{};
+#endif
+};
+thread_local WorldGeometryCapture worldGeometry;
+
+#if defined(_WIN32) && defined(ENABLE_DX11)
+struct KokiriLabPbrReplay {
+    GfxRenderingAPIDX11* renderer = nullptr;
+    bool armed = false;
+    KokiriLabPbrMaterial batchMaterial = KokiriLabPbrMaterial::None;
+    std::array<bool, MAX_VERTICES> vertices{};
+    KokiriLabPbrLighting lighting{};
+    std::array<float, 3> sun{};
+};
+
+thread_local KokiriLabPbrReplay kokiriLabPbr;
+thread_local std::array<bool, KokiriLabPbrSurfaces.size()> kokiriLabPbrReported{};
+// LabPBR variants the backend refused. The backend answers "refused" and "not built yet" with the same nullptr, so
+// without this memo every eligible triangle would Flush() and retry the build. Dropped with the shader cache.
+thread_local std::set<std::pair<uint64_t, uint64_t>> kokiriLabPbrRefused;
+
+bool ReadKokiriLabPbrLighting(const float (&projection)[4][4], KokiriLabPbrLighting& lighting) {
+    using Vector = std::array<float, 3>;
+    const auto column = [&](unsigned i) -> Vector { return {projection[0][i], projection[1][i], projection[2][i]}; };
+    const auto cross = [](const Vector& a, const Vector& b) -> Vector {
+        return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    };
+    const auto dot = [](const Vector& a, const Vector& b) {
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    };
+    // The eye is the intersection of the replay's clip X=0, Y=0, W=0 planes.
+    // A perspective projection has an intersection; an orthographic one does not.
+    const Vector x = column(0), y = column(1), w = column(3);
+    const Vector yw = cross(y, w), wx = cross(w, x), xy = cross(x, y);
+    const float denominator = dot(x, yw);
+    if (!std::isfinite(denominator) || std::abs(denominator) < 1e-5f)
+        return false;
+    const float sunLength = std::sqrt(dot(kokiriLabPbr.sun, kokiriLabPbr.sun));
+    if (sunLength <= 0.0f)
+        return false;
+    for (unsigned i = 0; i < 3; ++i) {
+        lighting.eye[i] = -(projection[3][0] * yw[i] + projection[3][1] * wx[i] +
+                            projection[3][3] * xy[i]) / denominator;
+        if (!std::isfinite(lighting.eye[i]))
+            return false;
+        lighting.sun[i] = kokiriLabPbr.sun[i] / sunLength;
+    }
+    return true;
+}
+
+KokiriLabPbrMaterial FindKokiriLabPbrSurface(const RawTexMetadata& meta, uint32_t width, uint32_t height,
+                                           uint32_t tileWidth, uint32_t tileHeight, bool clampT, bool textureEdge) {
+    if (!meta.resource || meta.type != TextureType::RGBA16bpp || meta.h_byte_scale != 1.0f ||
+        meta.v_pixel_scale != 1.0f || (meta.resource->Flags & (TEX_FLAG_LOAD_AS_RAW | TEX_FLAG_LOAD_AS_IMG)) ||
+        meta.width != width || meta.height != height || width != tileWidth || height != tileHeight)
+        return KokiriLabPbrMaterial::None;
+
+    const auto& path = meta.resource->GetInitData()->Path;
+    for (size_t i = 0; i < KokiriLabPbrSurfaces.size(); ++i) {
+        const auto& surface = KokiriLabPbrSurfaces[i];
+        if (surface.width == width && surface.height == height && path == surface.texture &&
+            surface.clampT == clampT && surface.textureEdge == textureEdge)
+            return static_cast<KokiriLabPbrMaterial>(i);
+    }
+    return KokiriLabPbrMaterial::None;
+}
+#endif
+std::atomic<WorldMaterialMatcher> worldMaterialMatcher = nullptr;
+
+#if defined(_WIN32) && defined(ENABLE_DX11)
+constexpr unsigned MaxWorldCutoutBatches = 512;
+static_assert(WorldCutoutTextureSlots == SHADER_MAX_TEXTURES);
+
+void CaptureCutoutBatch(GfxRenderingAPI* renderer) {
+    auto& capture = worldGeometry;
+    const auto end = static_cast<unsigned>(capture.cutoutVertices.size());
+    if (end == capture.pendingOffset)
+        return;
+    auto* dx11 = dynamic_cast<GfxRenderingAPIDX11*>(renderer);
+    if (!dx11 || capture.cutoutBatches.size() == MaxWorldCutoutBatches) {
+        capture.cutoutVertices.resize(capture.pendingOffset);
+        return;
+    }
+
+    auto& batch = capture.cutoutBatches.emplace_back();
+    batch.offset = capture.pendingOffset;
+    batch.count = (end - batch.offset) / capture.stride;
+    batch.stride = capture.stride;
+    capture.pendingOffset = end;
+    auto& ctx = *dx11->mContext.Get();
+    ctx.VSGetShader(batch.vertex.GetAddressOf(), nullptr, nullptr);
+    if (capture.pendingPixel) {
+        batch.foliage = true;
+        batch.pixel = capture.pendingPixel;
+        std::array<ID3D11SamplerState*, 2> points{};
+        ctx.PSGetSamplers(8, 2, points.data());
+        for (unsigned i = 0; i < points.size(); ++i)
+            batch.pointSamplers[i].Attach(points[i]);
+    } else {
+        ctx.PSGetShader(batch.pixel.GetAddressOf(), nullptr, nullptr);
+    }
+    ctx.IAGetInputLayout(batch.layout.GetAddressOf());
+    std::array<ID3D11ShaderResourceView*, WorldCutoutTextureSlots> views{};
+    std::array<ID3D11SamplerState*, WorldCutoutTextureSlots> samplers{};
+    ctx.PSGetShaderResources(0, static_cast<UINT>(views.size()), views.data());
+    ctx.PSGetSamplers(0, static_cast<UINT>(samplers.size()), samplers.data());
+    for (unsigned i = 0; i < views.size(); ++i) {
+        batch.views[i].Attach(views[i]);
+        batch.samplers[i].Attach(samplers[i]);
+    }
+    // The three-point filter uses the actual uploaded texture size and the RDP linear flag.
+    for (unsigned i = 0; i < batch.filter.size(); ++i) {
+        if (!batch.views[i])
+            continue;
+        Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        batch.views[i]->GetResource(resource.GetAddressOf());
+        if (FAILED(resource.As(&texture)))
+            continue;
+        D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+        batch.filter[i] = { desc.Width, desc.Height, capture.linear[i] ? 1u : 0u, 0u };
+    }
+}
+#endif
+} // namespace
+
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         // Push the dominant toon light for this batch. The backend only consumes it
         // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
         mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        if (kokiriLabPbr.batchMaterial != KokiriLabPbrMaterial::None)
+            SetKokiriLabPbrDraw(kokiriLabPbr.batchMaterial, kokiriLabPbr.lighting);
+#endif
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        // Reuse the VBO interval just uploaded by DrawTriangles, before any state/target change.
+        // Only set when the filter already found the DX11 backend.
+        if (worldGeometry.pendingFoliageDepth)
+            static_cast<GfxRenderingAPIDX11*>(mRapi)->DrawFoliageDepth(mBufVboNumTris, MainDrawFramebuffer());
+        CaptureCutoutBatch(mRapi);
+#endif
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -495,6 +734,9 @@ void Interpreter::TextureCacheClear() {
 }
 
 void Interpreter::ShaderCacheClear() {
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    kokiriLabPbrRefused.clear();
+#endif
     mRapi->ClearShaderCache();
 }
 
@@ -1549,33 +1791,31 @@ extern "C" void Fast_SetQuantizeFloatMtx(bool on) {
     sQuantizeFloatMtx = on;
 }
 
+bool TryReadInterpolatedMatrix(const Interpreter& interpreter, const void* key, float (&matrix)[4][4]) {
+    const auto& replacements = *interpreter.mCurMtxReplacements;
+    const auto it = replacements.find(static_cast<Mtx*>(const_cast<void*>(key)));
+    if (it == replacements.end())
+        return false;
+#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
+    // Float matrices only need the original fixed-point quantization in vanilla mode.
+    if (!sQuantizeFloatMtx) {
+        memcpy(matrix, it->second.mf, sizeof(matrix));
+        return true;
+    }
+#endif
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            const int fixed = static_cast<int>(it->second.mf[i][j] * 65536.0f);
+            matrix[i][j] = fixed * (1.0f / 65536.0f);
+        }
+    }
+    return true;
+}
+
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
-    if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
-#if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
-        // Float matrices: no fixed-point quantisation (the int cast below overflows past +/-32767).
-        if (sQuantizeFloatMtx) {
-            for (int i = 0; i < 4; i++) {
-                for (int j = 0; j < 4; j++) {
-                    float v = it->second.mf[i][j];
-                    int as_int = (int)(v * 65536.0f);
-                    matrix[i][j] = as_int * (1.0f / 65536.0f);
-                }
-            }
-        } else {
-            memcpy(matrix, it->second.mf, sizeof(matrix));
-        }
-#else
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                float v = it->second.mf[i][j];
-                int as_int = (int)(v * 65536.0f);
-                matrix[i][j] = as_int * (1.0f / 65536.0f);
-            }
-        }
-#endif
-    } else {
+    if (!TryReadInterpolatedMatrix(*this, addr, matrix)) {
 #if defined(GBI_FLOATS) || defined(GBI_FLOAT_MTX)
         // For a modified GBI where fixed point values are replaced with floats
         memcpy(matrix, addr, sizeof(matrix));
@@ -1659,6 +1899,47 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
     }
 }
 
+std::span<const std::array<float, 3>> ReadWorldGeometry() {
+    // Ao encher, mantém o que já entrou: descartar tudo apagava a sombra do cenário e do Link inteiros.
+    return worldGeometry.vertices;
+}
+
+bool WorldGeometryOverflowed() {
+    return worldGeometry.overflow;
+}
+
+void SetWorldMaterialMatcher(WorldMaterialMatcher matcher) {
+    worldMaterialMatcher.store(matcher);
+}
+
+std::span<const WorldTransmissionTriangle> ReadWorldTransmission() {
+    return worldGeometry.transmissionOverflow ? std::span<const WorldTransmissionTriangle>{}
+                                              : worldGeometry.transmission;
+}
+
+#ifdef _WIN32
+WorldCutoutGeometry ReadWorldCutouts() {
+#ifdef ENABLE_DX11
+    return { worldGeometry.cutoutVertices, worldGeometry.cutoutBatches };
+#else
+    return {};
+#endif
+}
+#endif
+
+// M12: contexto do replay, fora do layout de qualquer classe. Reader atomico,
+// frame copiado no BEGIN e descartado no END/Run; nunca consulta gPlayState aqui.
+static std::atomic<WorldWaterReader> worldWaterReader{ nullptr };
+static thread_local WaterDisplace::Frame waterFrame;
+static thread_local bool waterArmed = false;
+static thread_local std::array<bool, MAX_VERTICES> waterVertices{};
+static thread_local unsigned waterSourceTriangles = 0, waterOutputTriangles = 0;
+// Diagnostico (gDeveloperTools.WaterDisplaceStats, lido no BEGIN): 1 = log; 2 = log e cores
+// (deslocado vermelho, recusado perto do plano azul) para achar costuras com vizinho plano.
+static thread_local int waterDebug = 0;
+static thread_local unsigned waterNearRejected = 0;
+void SetWorldWaterReader(WorldWaterReader callback) { worldWaterReader.store(callback); }
+
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
@@ -1687,6 +1968,25 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         }
 
         x = AdjXForAspectRatio(x);
+
+        if (dest_index < MAX_VERTICES)
+            worldGeometry.transmissionVertices[dest_index] = worldGeometry.transmissionArmed;
+        if (dest_index < MAX_VERTICES)
+            waterVertices[dest_index] = waterArmed;
+        bool labPbrVertex = false;
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        // Disarmed: no write. vertices[] is only read while armed (triangle path) and is cleared on every arm
+        // (FAST_WORLD_KOKIRI_LABPBR_BEGIN), so a stale entry left from an earlier armed span is never observed.
+        if (kokiriLabPbr.armed && dest_index < MAX_VERTICES)
+            labPbrVertex = kokiriLabPbr.vertices[dest_index] = true;
+#endif
+        if (waterArmed || worldGeometry.armed || worldGeometry.transmissionArmed || labPbrVertex ||
+            ((mRsp->geometry_mode & G_LIGHTING) && (mRdp->toon || mRdp->toon_shadow))) {
+            const auto& mv = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+            d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
+            d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
+            d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
+        }
 
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
@@ -1781,13 +2081,6 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // shader renormalizes, so uniform limb scale is harmless.)
             if (mRdp->toon || mRdp->toon_shadow) {
                 float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-                // SOH [Enhancement] Actor shadow: world-space position (same object->world transform as the
-                // normal). The shadow pass flattens these onto the ground plane; the camera lives in the
-                // projection matrix, so world pos x P_matrix later yields clip space. Computed whenever the
-                // shadow is armed, so shadows work even when the cel relight (mRdp->toon) is off.
-                d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
-                d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
-                d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
                 if (mRdp->toon) {
                     d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
                     d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
@@ -1898,6 +2191,143 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+
+    // M12: classifica o TRIANGULO, nao vertices isolados. Nunca atores/HUD,
+    // retangulos, FBOs, primitivas de profundidade ou vertices de outro escopo.
+    if (waterArmed && !mFbActive && !is_rect && vtx1_idx < MAX_VERTICES &&
+        vtx2_idx < MAX_VERTICES && vtx3_idx < MAX_VERTICES &&
+        waterVertices[vtx1_idx] && waterVertices[vtx2_idx] && waterVertices[vtx3_idx] &&
+        (mRsp->geometry_mode & G_ZBUFFER) &&
+        (mRdp->other_mode_l & (Z_CMP | Z_UPD | FORCE_BL | G_ZS_PRIM)) == (Z_CMP | FORCE_BL)) {
+        const WaterDisplace::Point a{v1->wx,v1->wy,v1->wz}, b{v2->wx,v2->wy,v2->wz}, c{v3->wx,v3->wy,v3->wz};
+        if (WaterDisplace::Eligible(waterFrame,a,b,c)) {
+            ++waterSourceTriangles;
+            const std::array<LoadedVertex,3> source{*v1,*v2,*v3};
+            const std::array<LoadedVertex,3> scratch{
+                mRsp->loaded_vertices[MAX_VERTICES], mRsp->loaded_vertices[MAX_VERTICES+1],
+                mRsp->loaded_vertices[MAX_VERTICES+2]};
+            auto build = [&](const WaterDisplace::Vertex& q) {
+                LoadedVertex d{};
+                for (unsigned k=0;k<3;++k) {
+                    const float t=q.weight[k]; const auto& v=source[k];
+                    d.u+=t*v.u; d.v+=t*v.v;
+                    if ((mRsp->geometry_mode & G_LIGHTING) && mRdp->toon) {
+                        d.nx+=t*v.nx; d.ny+=t*v.ny; d.nz+=t*v.nz;
+                    }
+                }
+                auto channel=[&](auto member) {
+                    float value=0;
+                    for(unsigned k=0;k<3;++k) value+=q.weight[k]*(source[k].color.*member);
+                    return static_cast<uint8_t>(std::clamp(value,0.0f,255.0f));
+                };
+                d.color={channel(&RGBA::r),channel(&RGBA::g),channel(&RGBA::b),channel(&RGBA::a)};
+                if (waterDebug >= 2) { d.color.r = 255; d.color.g = 40; d.color.b = 40; }
+                d.wx=q.p.x; d.wz=q.p.z;
+                d.wy=q.p.y+WaterDisplace::Displacement(waterFrame,q.p.x,q.p.z,q.p.y);
+                // Neste host a camera esta em P_matrix; wx/wy/wz sao mundo.
+                const auto& p=mRsp->P_matrix;
+                d.x=AdjXForAspectRatio(d.wx*p[0][0]+d.wy*p[1][0]+d.wz*p[2][0]+p[3][0]);
+                d.y=d.wx*p[0][1]+d.wy*p[1][1]+d.wz*p[2][1]+p[3][1];
+                d.z=d.wx*p[0][2]+d.wy*p[1][2]+d.wz*p[2][2]+p[3][2];
+                d.w=d.wx*p[0][3]+d.wy*p[1][3]+d.wz*p[2][3]+p[3][3];
+                d.clip_rej=(d.x < -d.w ? 1:0)|(d.x > d.w ? 2:0)|
+                           (d.y < -d.w ? 4:0)|(d.y > d.w ? 8:0)|(d.z > d.w ? 32:0);
+                if(mRsp->geometry_mode & G_FOG) {
+                    float w=std::abs(d.w)<0.001f?0.001f:d.w;
+                    float inv=w<0?float(std::numeric_limits<int16_t>::max()):1.0f/w;
+                    d.color.a=static_cast<uint8_t>(std::clamp(d.z*inv*mRsp->fog_mul+mRsp->fog_offset,0.0f,255.0f));
+                }
+                return d;
+            };
+            // Agua reconhecida nao deve virar cutout/folhagem ao reentrar.
+            const bool captureArmed = worldGeometry.armed;
+            worldGeometry.armed = false;
+            WaterDisplace::Tessellate(a,b,c,waterFrame,[&](const auto& x,const auto& y,const auto& z) {
+                mRsp->loaded_vertices[MAX_VERTICES]=build(x);
+                mRsp->loaded_vertices[MAX_VERTICES+1]=build(y);
+                mRsp->loaded_vertices[MAX_VERTICES+2]=build(z);
+                ++waterOutputTriangles;
+                // Indices scratch impedem recursao e captura como sombra opaca.
+                GfxSpTri1(MAX_VERTICES,MAX_VERTICES+1,MAX_VERTICES+2,false);
+            });
+            worldGeometry.armed = captureArmed;
+            for(unsigned k=0;k<3;++k) mRsp->loaded_vertices[MAX_VERTICES+k]=scratch[k];
+            return;
+        }
+        if (waterDebug) {
+            // Recusado mas encostado numa caixa (Y a menos de 4 u e AABB XZ sobreposta): candidato a
+            // costura com a agua deslocada ao lado. So diagnostico; nao muda a classificacao.
+            for (std::size_t i = 0; i < std::min(waterFrame.count, waterFrame.boxes.size()); ++i) {
+                const auto& box = waterFrame.boxes[i];
+                if (std::abs(a.y - box.y) > 4.0f || std::abs(b.y - box.y) > 4.0f || std::abs(c.y - box.y) > 4.0f)
+                    continue;
+                if (std::max({ a.x, b.x, c.x }) < box.x0 || std::min({ a.x, b.x, c.x }) > box.x1 ||
+                    std::max({ a.z, b.z, c.z }) < box.z0 || std::min({ a.z, b.z, c.z }) > box.z1)
+                    continue;
+                ++waterNearRejected;
+                if (waterDebug >= 2)
+                    for (auto* v : v_arr) { v->color.r = 40; v->color.g = 80; v->color.b = 255; }
+                break;
+            }
+        }
+    }
+
+    // Capture before camera triangle clipping and backface culling. Depth-writing opaque triangles have a
+    // usable silhouette without replaying the N64 combiner. Alpha-tested materials need a separate path.
+    const bool depthWritingWorldTriangle =
+        !mFbActive && !is_rect && vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES &&
+        vtx3_idx < MAX_VERTICES && (mRsp->geometry_mode & G_ZBUFFER) &&
+        (mRdp->other_mode_l & (Z_CMP | Z_UPD)) == (Z_CMP | Z_UPD) &&
+        (mRdp->other_mode_l & (G_ZS_PRIM | FORCE_BL)) == 0 && (mRdp->other_mode_l & ZMODE_DEC) != ZMODE_DEC;
+    const bool shadowCandidate = worldGeometry.armed && !worldGeometry.cutoutOnly && depthWritingWorldTriangle;
+    if (shadowCandidate && !worldGeometry.overflow &&
+        (mRdp->other_mode_l & (CVG_X_ALPHA | (3U << G_MDSFT_ALPHACOMPARE))) == 0) {
+        if (worldGeometry.vertices.size() + 3 > MaxWorldGeometryVertices) {
+            worldGeometry.overflow = true;
+        } else {
+            for (const auto* v : v_arr)
+                worldGeometry.vertices.push_back({ v->wx, v->wy, v->wz });
+        }
+    }
+
+    // A lamp can illuminate a receiver through a pane outside the camera frustum.
+    if (worldGeometry.transmissionArmed && !worldGeometry.transmissionOverflow && !mFbActive && !is_rect &&
+        vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES && vtx3_idx < MAX_VERTICES &&
+        worldGeometry.transmissionVertices[vtx1_idx] && worldGeometry.transmissionVertices[vtx2_idx] &&
+        worldGeometry.transmissionVertices[vtx3_idx] && (mRsp->geometry_mode & G_ZBUFFER) &&
+        (mRdp->other_mode_l & (Z_CMP | FORCE_BL | G_ZS_PRIM)) == (Z_CMP | FORCE_BL)) {
+        if (const auto match = worldMaterialMatcher.load()) {
+            const bool twoCycles = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
+            const auto baseTile = mRdp->first_tile_index;
+            for (unsigned i = 0; i < 2; ++i) {
+                const auto tile = baseTile + (baseTile >= 2 ? 0 : i);
+                const auto& resource =
+                    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata.resource;
+                if (!resource)
+                    continue;
+                auto path = GetBaseTexturePath(resource->GetInitData()->Path);
+                if (path.starts_with("__OTR__"))
+                    path.remove_prefix(7);
+                if (!match(worldGeometry.transmissionScene, path))
+                    continue;
+                const auto* combiner =
+                    LookupOrCreateColorCombiner({ mRdp->combine_mode, twoCycles ? SHADER_OPT(_2CYC) : 0u });
+                if (!combiner->usedTextures[i])
+                    continue;
+                if (worldGeometry.transmission.size() == MaxWorldTransmissionTriangles) {
+                    worldGeometry.transmissionOverflow = true;
+                    break;
+                }
+                auto& triangle = worldGeometry.transmission.emplace_back();
+                triangle.texture = path;
+                for (unsigned vertex = 0; vertex < 3; ++vertex) {
+                    const auto* v = v_arr[vertex];
+                    triangle.vertices[vertex] = { v->wx, v->wy, v->wz };
+                }
+                break;
+            }
+        }
+    }
 
     // SOH [Enhancement] Actor shadow: while the shadow pass is armed for this object, record its world-space
     // triangles here (before any culling, so the whole silhouette is captured). FlushToonShadow drains them
@@ -2048,11 +2478,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         cc_options |= SHADER_OPT(PRIM_DEPTH);
     }
 
-    if (!mShaderStack.empty()) {
-        cc_options |= (mShaderStack.top() << SHADER_ID_SHIFT);
-    } else {
-        cc_options |= -1 << SHADER_ID_SHIFT;
-    }
+    // Keep the custom shader id within its reserved 16-bit field.
+    const uint16_t customShader = mShaderStack.empty() ? 0xFFFFu : static_cast<uint16_t>(mShaderStack.top());
+    cc_options |= uint64_t{customShader} << SHADER_ID_SHIFT;
     if (use_toon) {
         cc_options |= SHADER_OPT(TOON);
     }
@@ -2201,10 +2629,53 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
-    struct ShaderProgram* prg = comb->prg[tm];
+    const uint64_t shaderOptions = comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S);
+    struct ShaderProgram* prg = nullptr;
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    KokiriLabPbrLighting labPbrLighting{};
+    auto labPbrMaterial = KokiriLabPbrMaterial::None;
+    // A native texture-edge combiner discards holes and sets the alpha of surviving samples to 1.
+    // Depth-writing LabPBR draws can preserve that path for a catalogued cutout without adding blended surfaces.
+    if (kokiriLabPbr.armed && depthWritingWorldTriangle && (!use_alpha || texture_edge) && !alpha_threshold &&
+        !use_noise && !invisible &&
+        !use_grayscale && !use_toon && mShaderStack.empty() && comb->usedTextures[0] &&
+        kokiriLabPbr.vertices[vtx1_idx] && kokiriLabPbr.vertices[vtx2_idx] && kokiriLabPbr.vertices[vtx3_idx] &&
+        (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_OPA && mRenderingState.mTextures[0] &&
+        (cc_options & (SHADER_OPT(TEXEL0_MASK) | SHADER_OPT(TEXEL1_MASK) |
+                       SHADER_OPT(TEXEL0_BLEND) | SHADER_OPT(TEXEL1_BLEND))) == 0) {
+        const auto& tile = mRdp->texture_tile[effective_tile[0]];
+        if (tile.cms == G_TX_WRAP && (tile.cmt == G_TX_WRAP || tile.cmt == G_TX_CLAMP) &&
+            tile.uls == 0 && tile.ult == 0) {
+            labPbrMaterial = FindKokiriLabPbrSurface(mRdp->loaded_texture[tile.tmem_index].raw_tex_metadata,
+                                                     tex_width[0], tex_height[0], tex_width2[0], tex_height2[0],
+                                                     tile.cmt == G_TX_CLAMP, texture_edge);
+        }
+        if (labPbrMaterial != KokiriLabPbrMaterial::None &&
+            ReadKokiriLabPbrLighting(mRsp->P_matrix, labPbrLighting) &&
+            PrepareKokiriLabPbr(*kokiriLabPbr.renderer, labPbrMaterial)) {
+            const uint64_t id = shaderOptions | KokiriLabPbrShaderBit;
+            const auto key = std::make_pair(comb->shader_id0, id);
+            if (!kokiriLabPbrRefused.contains(key)) {
+                prg = mRapi->LookupShader(comb->shader_id0, id);
+                if (!prg) {
+                    Flush();
+                    prg = LookupOrCreateShaderProgram(comb->shader_id0, id);
+                    if (!prg)
+                        kokiriLabPbrRefused.insert(key);
+                }
+            }
+        }
+    }
+    const bool useLabPbr = prg != nullptr;
+    if (!useLabPbr)
+        labPbrMaterial = KokiriLabPbrMaterial::None;
+#endif
     if (prg == NULL) {
-        comb->prg[tm] = prg =
-            LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
+        prg = comb->prg[tm];
+        if (prg == nullptr) {
+            Flush();
+            comb->prg[tm] = prg = LookupOrCreateShaderProgram(comb->shader_id0, shaderOptions);
+        }
     }
     if (prg != mRenderingState.mShaderProgram) {
         Flush();
@@ -2217,6 +2688,24 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
     }
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    if (labPbrMaterial != KokiriLabPbrMaterial::None) {
+        if (kokiriLabPbr.batchMaterial != labPbrMaterial ||
+            std::memcmp(&kokiriLabPbr.lighting, &labPbrLighting, sizeof(labPbrLighting)) != 0) {
+            Flush();
+            kokiriLabPbr.lighting = labPbrLighting;
+        }
+
+        const auto index = static_cast<size_t>(labPbrMaterial);
+        if (!kokiriLabPbrReported[index]) {
+            SPDLOG_INFO("Fast3D LabPBR: material nativo em {}, eye=({}, {}, {})",
+                        KokiriLabPbrSurfaces[index].texture, labPbrLighting.eye[0],
+                        labPbrLighting.eye[1], labPbrLighting.eye[2]);
+            kokiriLabPbrReported[index] = true;
+        }
+    }
+    kokiriLabPbr.batchMaterial = labPbrMaterial;
+#endif
     uint8_t numInputs;
     bool usedTextures[2];
 
@@ -2224,6 +2713,85 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    const bool legacyCutout = shadowCandidate && use_alpha && (texture_edge || alpha_threshold) &&
+                              !use_noise && !invisible && (usedTextures[0] || usedTextures[1]);
+    ID3D11PixelShader* foliagePixel = nullptr;
+    bool foliageMaterial = false;
+    // XLU ranges are explicitly cutout-only. Never admit ordinary XLU as solid casters.
+    const bool xluCandidate = worldGeometry.armed && worldGeometry.cutoutOnly &&
+                              (worldGeometry.foliageEnabled || worldGeometry.foliageDepthEnabled) &&
+                              !mFbActive && !is_rect && zbuffer_enabled && depth_test && !depth_mask &&
+                              !prim_depth_enabled && !use_noise && !invisible && use_alpha && !use_blend_color &&
+                              (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU &&
+                              (mRdp->other_mode_l & FORCE_BL) != 0 && mShaderStack.empty() &&
+                              !mRdp->loaded_texture[0].masked && !mRdp->loaded_texture[1].masked &&
+                              !mRdp->loaded_texture[0].blended && !mRdp->loaded_texture[1].blended;
+    const uint32_t blendMask = use_2cyc ? 0x33330000u : 0xCCCC0000u;
+    const uint32_t surfaceBlend = use_2cyc ? GBL_c2(G_BL_CLR_IN, G_BL_A_IN, G_BL_CLR_MEM, G_BL_1MA)
+                                         : GBL_c1(G_BL_CLR_IN, G_BL_A_IN, G_BL_CLR_MEM, G_BL_1MA);
+    if (xluCandidate && (mRdp->other_mode_l & blendMask) == surfaceBlend) {
+        using Source = AlphaCutout::Source;
+        CCFeatures features{};
+        gfx_cc_get_features(comb->shader_id0, comb->shader_id1, &features);
+        auto combined = Source::Unknown;
+        for (unsigned cycle = 0; cycle < (use_2cyc ? 2u : 1u); ++cycle) {
+            const auto resolve = [&](int selector) {
+                if (selector == SHADER_0)
+                    return Source::Zero;
+                if (selector == SHADER_1)
+                    return Source::One;
+                if (selector == SHADER_COMBINED)
+                    return combined;
+                if (selector == SHADER_TEXEL0 || selector == SHADER_TEXEL0A)
+                    return cycle == 0 ? Source::Texture0 : Source::Texture1;
+                if (selector == SHADER_TEXEL1 || selector == SHADER_TEXEL1A)
+                    return cycle == 0 ? Source::Texture1 : Source::Texture0;
+                if (selector < SHADER_INPUT_1 || selector > SHADER_INPUT_7)
+                    return Source::Unknown;
+                const auto mapping = comb->shader_input_mapping[1][selector - SHADER_INPUT_1];
+                unsigned alpha = 256;
+                if (mapping == G_ACMUX_PRIMITIVE)
+                    alpha = mRdp->prim_color.a;
+                else if (mapping == G_ACMUX_ENVIRONMENT)
+                    alpha = mRdp->env_color.a;
+                else if (mapping == G_ACMUX_SHADE) {
+                    // Matches the alpha actually packed below, including the fog override.
+                    if (use_fog && !use_blend_color)
+                        alpha = 255;
+                    else if (v1->color.a == v2->color.a && v2->color.a == v3->color.a)
+                        alpha = v1->color.a;
+                }
+                return alpha == 255 ? Source::One : alpha == 0 ? Source::Zero : Source::Unknown;
+            };
+            const auto* c = features.c[cycle][1];
+            combined = AlphaCutout::Formula(resolve(c[0]), resolve(c[1]), resolve(c[2]), resolve(c[3]));
+        }
+        const int alphaTexture = combined == Source::Texture0 ? 0 : combined == Source::Texture1 ? 1 : -1;
+        auto* dx11 = dynamic_cast<GfxRenderingAPIDX11*>(mRapi);
+        // A failed import can leave a stale GPU slot. Require the interpreter cache node too.
+        if (alphaTexture >= 0 && usedTextures[alphaTexture] && mRenderingState.mTextures[alphaTexture] && dx11 &&
+            dx11->IsCutoutTexture(static_cast<unsigned>(alphaTexture))) {
+            foliageMaterial = true;
+            if (worldGeometry.foliageEnabled)
+                foliagePixel = dx11->GetFoliageShadowShader();
+        }
+    }
+    // Eligibility can change with per-vertex alpha even when the GPU state did not change.
+    // Split on BOTH transitions before packing, so an ineligible triangle never reaches the extra draw.
+    const bool foliageDepth = foliageMaterial && worldGeometry.foliageDepthEnabled;
+    if (worldGeometry.pendingFoliageDepth != foliageDepth)
+        Flush();
+    worldGeometry.pendingFoliageDepth = foliageDepth;
+    const bool captureCutout = legacyCutout || foliagePixel;
+    if (captureCutout) {
+        // A normal draw may batch OPA/XLU cutouts. Split before packing when the shadow PS changes.
+        if (worldGeometry.pendingPixel.Get() != foliagePixel)
+            Flush();
+        worldGeometry.pendingPixel = foliagePixel;
+    }
+    const size_t cutoutStart = mBufVboLen;
+#endif
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (clip_parameters.z_is_from_0_to_1) {
@@ -2405,6 +2973,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
 
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        if (useLabPbr) {
+            mBufVbo[mBufVboLen++] = v_arr[i]->wx;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wy;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wz;
+        }
+#endif
+
         // struct RGBA *color = &v_arr[i]->color;
         // mBufVbo[mBufVboLen++] = color->r / 255.0f;
         // mBufVbo[mBufVboLen++] = color->g / 255.0f;
@@ -2412,6 +2988,37 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // mBufVbo[mBufVboLen++] = color->a / 255.0f;
     }
 
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    // Keep the original packed attributes. Only the first four floats will be projected from the light.
+    if (captureCutout && worldGeometry.foliageEnabled && !worldGeometry.cutoutOverflowReported &&
+        (worldGeometry.cutoutBatches.size() >= MaxWorldCutoutBatches ||
+         worldGeometry.cutoutVertices.size() + mBufVboLen - cutoutStart > MaxWorldCutoutFloats)) {
+        worldGeometry.cutoutOverflowReported = true;
+        // Once per interpreter replay, including interpolated replays. Never discard earlier casters.
+        SPDLOG_WARN("World cutout capture full: {} floats, {} batches (limits {}, {})",
+                    worldGeometry.cutoutVertices.size(), worldGeometry.cutoutBatches.size(),
+                    MaxWorldCutoutFloats, MaxWorldCutoutBatches);
+    }
+    if (captureCutout && worldGeometry.cutoutBatches.size() < MaxWorldCutoutBatches) {
+        auto& capture = worldGeometry;
+        const size_t size = mBufVboLen - cutoutStart;
+        if (capture.cutoutVertices.size() + size <= MaxWorldCutoutFloats) {
+            capture.stride = static_cast<unsigned>(size / 3);
+            for (unsigned i = 0; i < capture.linear.size(); ++i) {
+                const auto* node = mRenderingState.mTextures[i];
+                capture.linear[i] = node && node->second.linear_filter;
+            }
+            const auto first = capture.cutoutVertices.size();
+            capture.cutoutVertices.insert(capture.cutoutVertices.end(), mBufVbo + cutoutStart, mBufVbo + mBufVboLen);
+            for (unsigned i = 0; i < 3; ++i) {
+                auto* vertex = capture.cutoutVertices.data() + first + i * capture.stride;
+                vertex[0] = v_arr[i]->wx;
+                vertex[1] = v_arr[i]->wy;
+                vertex[2] = v_arr[i]->wz;
+            }
+        }
+    }
+#endif
     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
         // if (++mBufVbo_num_tris == 1) {
         Flush();
@@ -2443,8 +3050,9 @@ void Interpreter::AdjustVIewportOrScissor(XYWidthHeight* area) {
         area->x *= RATIO_X(mActiveFrameBuffer, mCurDimensions);
         area->y *= RATIO_Y(mActiveFrameBuffer, mCurDimensions);
 
-        if (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                              mCurDimensions.height == mGameWindowViewport.height)) {
+        if (!mWorldPresentationActive &&
+            (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
+                               mCurDimensions.height == mGameWindowViewport.height))) {
             area->x += mGameWindowViewport.x;
             area->y += mGfxCurrentWindowDimensions.height - (mGameWindowViewport.y + mGameWindowViewport.height);
         }
@@ -4285,6 +4893,104 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
     return false;
 }
 
+static WorldPostProcess worldPostProcess = nullptr;
+static uint64_t worldPostProcessReplay = 0;
+
+uint64_t WorldPostProcessReplay() {
+    return worldPostProcessReplay;
+}
+
+void SetWorldPostProcess(WorldPostProcess callback) {
+    worldPostProcess = callback;
+}
+
+static bool gfx_world_postprocess(F3DGfx** command) {
+    auto gfx = mInstance.lock();
+    switch ((*command)->words.w0 & 0xFFu) {
+#if defined(_WIN32) && defined(ENABLE_DX11)
+        case FAST_WORLD_KOKIRI_LABPBR_BEGIN: {
+            if (kokiriLabPbr.armed)
+                gfx->Flush();
+            kokiriLabPbr.armed = kokiriLabPbr.renderer && !gfx->mFbActive;
+            if (kokiriLabPbr.armed) {
+                kokiriLabPbr.vertices.fill(false);
+                const auto packed = static_cast<uint32_t>((*command)->words.w1);
+                for (unsigned i = 0; i < 3; ++i) {
+                    const int component = (packed >> (i * 10)) & 0x3FFu;
+                    kokiriLabPbr.sun[i] = static_cast<float>(component < 512 ? component : component - 1024);
+                }
+            }
+            return false;
+        }
+        case FAST_WORLD_KOKIRI_LABPBR_END:
+            if (kokiriLabPbr.armed)
+                gfx->Flush();
+            kokiriLabPbr.armed = false;
+            kokiriLabPbr.batchMaterial = KokiriLabPbrMaterial::None;
+            return false;
+#endif
+        case FAST_WORLD_WATER_BEGIN: {
+            waterArmed = false;
+            waterFrame = {};
+            waterVertices.fill(false);
+            const auto read = worldWaterReader.load();
+            if (!gfx->mFbActive && read)
+                waterArmed = read(*gfx, static_cast<uint32_t>((*command)->words.w1), waterFrame);
+            waterDebug = waterArmed ? Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                                          "gDeveloperTools.WaterDisplaceStats", 0)
+                                    : 0;
+            return false;
+        }
+        case FAST_WORLD_WATER_END:
+            waterArmed = false;
+            waterVertices.fill(false);
+            if (waterDebug)
+                SPDLOG_INFO("M12 agua: replay={} fontes={} saida={} recusados_perto={}", WorldPostProcessReplay(),
+                            waterSourceTriangles, waterOutputTriangles, waterNearRejected);
+            waterDebug = 0;
+            return false;
+        case Interpreter::WorldPresentCommand:
+            gfx->PresentWorldBeforeHud();
+            return false;
+        case FAST_WORLD_GEOMETRY_BEGIN:
+            // End the old scope while its target and depth eligibility are still current.
+            if (worldGeometry.foliageDepthEnabled)
+                gfx->Flush();
+            worldGeometry.armed = !gfx->mFbActive;
+            worldGeometry.cutoutOnly = ((*command)->words.w1 & FAST_WORLD_GEOMETRY_CUTOUT_ONLY) != 0;
+            return false;
+        case FAST_WORLD_GEOMETRY_END:
+            if (worldGeometry.foliageDepthEnabled)
+                gfx->Flush();
+            worldGeometry.armed = false;
+            worldGeometry.cutoutOnly = false;
+            return false;
+        case FAST_WORLD_TRANSMISSION_BEGIN:
+            worldGeometry.transmissionArmed = !gfx->mFbActive;
+            worldGeometry.transmissionScene = static_cast<uint16_t>((*command)->words.w1);
+            return false;
+        case FAST_WORLD_TRANSMISSION_END:
+            worldGeometry.transmissionArmed = false;
+            return false;
+        case FAST_WORLD_DRAW:
+        case FAST_WORLD_PREPARE:
+        case FAST_WORLD_COMPOSE:
+            break;
+        default:
+            return false;
+    }
+    worldGeometry.armed = false;
+    worldGeometry.cutoutOnly = false;
+    worldGeometry.transmissionArmed = false;
+    if (worldPostProcess && !gfx->mFbActive) {
+        gfx->FlushToonShadow();
+        gfx->Flush();
+        const auto phase = static_cast<WorldPostProcessPhase>((*command)->words.w0 & 0xFFu);
+        worldPostProcess(*gfx, static_cast<uint32_t>((*command)->words.w1), phase);
+    }
+    return false;
+}
+
 bool gfx_push_shader(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4933,7 +5639,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     gfx->Flush();
     gfx->mFbActive = false;
     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
-    gfx->mRapi->StartDrawToFramebuffer(gfx->mRendersToFb ? gfx->mGameFb : 0,
+    gfx->mRapi->StartDrawToFramebuffer(gfx->MainDrawFramebuffer(),
                                        (float)gfx->mCurDimensions.height / gfx->mNativeDimensions.height);
     // Force viewport and scissor to reapply against the main framebuffer, in case a previous smaller
     // framebuffer truncated the values
@@ -5125,6 +5831,54 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
 }
 
 // SOH [Enhancement] World light casting: set the stencil mode for the stencil light-volume technique.
+bool gfx_draw_fog_volume(F3DGfx** cmd0) {
+    auto* gfx = mInstance.lock().get();
+    FastFogVolume volume{};
+    thread_local FastFogFlow flow;
+    bool hasFlow = false;
+    Mtx* viewing = nullptr;
+    Mtx* projection = nullptr;
+    if (ReadFogSnapshot(static_cast<uint32_t>((*cmd0)->words.w1), volume, flow, hasFlow, viewing, projection)) {
+        const auto& matrices = *gfx->mCurMtxReplacements;
+        if (const auto it = matrices.find(viewing); it != matrices.end()) {
+            const auto& m = it->second.mf;
+            // Linear interpolation of the view matrix does not preserve an orthonormal basis.
+            float cofactors[3][3];
+            for (int axis = 0; axis < 3; ++axis) {
+                const int j = (axis + 1) % 3, k = (axis + 2) % 3;
+                for (int i = 0; i < 3; ++i) {
+                    const int a = (i + 1) % 3, b = (i + 2) % 3;
+                    cofactors[axis][i] = m[a][j] * m[b][k] - m[b][j] * m[a][k];
+                }
+            }
+            const float determinant = m[0][0] * cofactors[0][0] + m[1][0] * cofactors[0][1] + m[2][0] * cofactors[0][2];
+            if (std::abs(determinant) > 0.0001f) {
+                for (int i = 0; i < 3; ++i) {
+                    volume.right[i] = cofactors[0][i] / determinant;
+                    volume.up[i] = cofactors[1][i] / determinant;
+                    volume.forward[i] = -cofactors[2][i] / determinant;
+                    volume.eye[i] = -m[3][0] * volume.right[i] - m[3][1] * volume.up[i] + m[3][2] * volume.forward[i];
+                }
+            }
+        }
+        if (const auto it = matrices.find(projection); it != matrices.end()) {
+            const auto& m = it->second.mf;
+            if (std::abs(m[0][0]) > 0.0001f && std::abs(m[1][1]) > 0.0001f && m[2][3] < 0.0f) {
+                volume.right[3] = -m[2][3] / m[0][0];
+                volume.up[3] = -m[2][3] / m[1][1];
+                volume.depth[0] = m[2][2];
+                volume.depth[1] = m[2][3];
+                volume.depth[2] = m[3][2];
+            }
+        }
+        volume.right[3] = Fast::MapFogRayScaleX(volume.right[3], gfx->AdjXForAspectRatio(1.0f));
+        volume.interpolation = gfx->mInterpolationT;
+        gfx->Flush();
+        gfx->mRapi->DrawFogVolume(volume, hasFlow ? &flow : nullptr);
+    }
+    return false;
+}
+
 // Mirrors the toon-key handler's flush-then-set: the mode change must not retroactively apply to already
 // batched geometry, so flush the pending tris (under the previous mode) before switching.
 bool gfx_set_stencil_handler_custom(F3DGfx** cmd0) {
@@ -5631,6 +6385,8 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },
     { OTR_G_SETTOONSHADOW, { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } },
     { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } },
+    { OPCODE(FAST_GFX_FOG_VOLUME), { "G_DRAW_FOG_VOLUME", gfx_draw_fog_volume } },
+    { OPCODE(FAST_GFX_WORLD_POSTPROCESS), { "G_WORLD_POSTPROCESS", gfx_world_postprocess } },
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } }, // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
@@ -5950,6 +6706,67 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 void Interpreter::StartFrame() {
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const bool dynamic = cvars->GetInteger("gSettings.DynamicResolution", 0) != 0;
+    mSpatialUpscale = cvars->GetInteger("gSettings.SpatialUpscale", 0) == 1;
+    // The host currently provides no unconditional world/HUD split. Never infer
+    // one from depth-test state, shaderpack callbacks or last frame's commands.
+    const bool requested = (dynamic || mSpatialUpscale) && mNextFrameHasWorldBoundary;
+    if ((dynamic || mSpatialUpscale) && !mNextFrameHasWorldBoundary) {
+        if (!mMissingWorldBoundaryWarned)
+            SPDLOG_WARN("R069/R070: host has no world/HUD boundary; keeping legacy presentation");
+        mMissingWorldBoundaryWarned = true;
+    } else {
+        mMissingWorldBoundaryWarned = false;
+    }
+    mNextFrameHasWorldBoundary = false;
+    const bool wasActive = mWorldPresentationActive;
+    const bool wasDynamic = mDynamicResolution;
+    mWorldPresented = false;
+    mWorldPresentationActive = requested && mGameWindowViewport.width > 0 && mGameWindowViewport.height > 0 &&
+                               mCurDimensions.width > 0 && mCurDimensions.height > 0 &&
+                               // Pixel-perfect presentation intentionally uses integer sampling, not this path.
+                               !(cvars->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0) &&
+                                 cvars->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".PixelPerfectMode", 0)) &&
+                               mRapi->PrepareWorldPresentation();
+    mDynamicResolution = dynamic && mWorldPresentationActive;
+    if (mWorldPresentationActive) {
+        // Fit native output inside the game viewport, preserving the requested aspect.
+        const double aspect = double(mCurDimensions.width) / mCurDimensions.height;
+        uint32_t outWidth = mGameWindowViewport.width, outHeight = mGameWindowViewport.height;
+        if (double(outWidth) / outHeight > aspect)
+            outWidth = std::max(1u, uint32_t(outHeight * aspect));
+        else
+            outHeight = std::max(1u, uint32_t(outWidth / aspect));
+        if (!wasActive || wasDynamic != mDynamicResolution || outWidth != mPresentationWidth ||
+            outHeight != mPresentationHeight) {
+            mDynresController.Reset();
+        }
+        mPresentationWidth = outWidth;
+        mPresentationHeight = outHeight;
+        mDynresController.SetBudget(cvars->GetFloat("gSettings.DynamicResolutionBudgetMs", 16.6f));
+        const uint64_t configuration = (uint64_t(outWidth) << 32) ^ (uint64_t(outHeight) << 8) ^ mMsaaLevel;
+        // Invalidate queries from the old output size BEFORE reading a delayed sample.
+        mRapi->SetGpuFrameTiming(mDynamicResolution, mDynresController.Scale(), configuration);
+        mDynresController.Tick();
+        double gpuMs;
+        float measuredScale;
+        if (mDynamicResolution && mRapi->GetGpuFrameTime(gpuMs, measuredScale))
+            mDynresController.Observe(gpuMs, measuredScale);
+        if (mDynamicResolution) {
+            // 1/32 scale steps and 8-pixel sizing reduce resource churn. 1.0 is exact native.
+            mCurDimensions.width = mDynresController.ScaledDimension(outWidth);
+            mCurDimensions.height = mDynresController.ScaledDimension(outHeight);
+        }
+        if (mPresentationFb < 0)
+            mPresentationFb = mRapi->CreateFramebuffer();
+        mRapi->UpdateFramebufferParameters(mPresentationFb, outWidth, outHeight, 1, false, true, true, false);
+    } else {
+        mDynresController.Reset();
+    }
+    const uint64_t timingConfiguration =
+        (uint64_t(mPresentationWidth) << 32) ^ (uint64_t(mPresentationHeight) << 8) ^ mMsaaLevel;
+    mRapi->SetGpuFrameTiming(mDynamicResolution, mDynresController.Scale(), timingConfiguration);
     if (mCurDimensions.height == 0) {
         // Avoid division by zero
         mCurDimensions.height = 1;
@@ -5976,9 +6793,9 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    if (mWorldPresentationActive || !ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
         mRendersToFb = true;
-        if (!ViewportMatchesRendererResolution()) {
+        if (mWorldPresentationActive || !ViewportMatchesRendererResolution()) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
                                                true, true, true);
         } else {
@@ -5987,7 +6804,7 @@ void Interpreter::StartFrame() {
             mRapi->UpdateFramebufferParameters(mGameFb, mGfxCurrentWindowDimensions.width,
                                                mGfxCurrentWindowDimensions.height, mMsaaLevel, false, true, true, true);
         }
-        if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
+        if (mMsaaLevel > 1 && (mWorldPresentationActive || !ViewportMatchesRendererResolution())) {
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
                                                false, false, false, false);
         }
@@ -5996,6 +6813,30 @@ void Interpreter::StartFrame() {
     }
 
     mFbActive = false;
+    mWorldDimensions = mCurDimensions;
+}
+
+bool Interpreter::PresentWorldBeforeHud() {
+    if (!mWorldPresentationActive || mWorldPresented || mFbActive)
+        return false;
+    FlushToonShadow();
+    Flush();
+    if (!mRapi->PresentWorld(mGameFb, mPresentationFb, mSpatialUpscale)) {
+        // Resource failure: retain a visible frame at internal resolution.
+        // The host must treat a false return as a failed presentation, not success.
+        SPDLOG_ERROR("R069/R070: world presentation failed; frame kept at internal resolution");
+        return false;
+    }
+    mWorldPresented = true;
+    mCurDimensions.width = mPresentationWidth;
+    mCurDimensions.height = mPresentationHeight;
+    mCurDimensions.aspect_ratio = float(mPresentationWidth) / mPresentationHeight;
+    mRapi->StartDrawToFramebuffer(mPresentationFb, float(mPresentationHeight) / mNativeDimensions.height);
+    mRapi->ClearFramebuffer(false, true); // native HUD has its own depth, world depth stays intact
+    mRdp->viewport_or_scissor_changed = true;
+    mRenderingState.viewport = {};
+    mRenderingState.scissor = {};
+    return true;
 }
 
 GfxExecStack g_exec_stack = {};
@@ -6009,7 +6850,7 @@ void Interpreter::RunGuiOnly() {
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
-    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
+    mRapi->StartDrawToFramebuffer(MainDrawFramebuffer(), (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
@@ -6018,11 +6859,15 @@ void Interpreter::RunGuiOnly() {
     Flush();
     mGfxFrameBuffer = 0;
 
-    if (mRendersToFb) {
+    if (mWorldPresented) {
+        mRapi->StartDrawToFramebuffer(0, 1);
+        mRapi->ClearFramebuffer(true, true);
+        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mPresentationFb);
+    } else if (mRendersToFb) {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (mWorldPresentationActive || !ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
@@ -6041,7 +6886,42 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+    if (++worldPostProcessReplay == 0)
+        ++worldPostProcessReplay;
+#ifdef _WIN32
+    worldFogSun = {};
+#endif
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    kokiriLabPbr = {};
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(FAST_KOKIRI_LABPBR_CVAR, 0) != 0)
+        kokiriLabPbr.renderer = dynamic_cast<GfxRenderingAPIDX11*>(mRapi);
+    else
+        kokiriLabPbrReported.fill(false);
+#endif
+    waterArmed = false;
+    waterFrame = {};
+    waterVertices.fill(false);
+    waterSourceTriangles = waterOutputTriangles = waterNearRejected = 0;
+    waterDebug = 0;
     SpReset();
+    worldGeometry.armed = worldGeometry.overflow = false;
+    worldGeometry.cutoutOnly = false;
+    worldGeometry.foliageEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gDeveloperTools.FoliageShadows", 1) != 0;
+    worldGeometry.foliageDepthEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gDeveloperTools.FoliageDepth", 1) != 0;
+    worldGeometry.vertices.clear();
+    worldGeometry.transmissionArmed = worldGeometry.transmissionOverflow = false;
+    worldGeometry.transmissionVertices.fill(false);
+    worldGeometry.transmission.clear();
+#if defined(_WIN32) && defined(ENABLE_DX11)
+    worldGeometry.cutoutBatches.clear();
+    worldGeometry.cutoutOverflowReported = false;
+    worldGeometry.cutoutVertices.clear();
+    worldGeometry.pendingOffset = 0;
+    worldGeometry.pendingPixel.Reset();
+    worldGeometry.pendingFoliageDepth = false;
+#endif
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -6051,7 +6931,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
-    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
+    mRapi->StartDrawToFramebuffer(MainDrawFramebuffer(), (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
@@ -6069,7 +6949,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
                 // soft locking the renderer
                 if (mFbActive) {
                     mFbActive = 0;
-                    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, 1);
+                    mRapi->StartDrawToFramebuffer(MainDrawFramebuffer(), 1);
                 }
 
                 break;
@@ -6082,12 +6962,19 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     Flush();
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
+    if (mWorldPresentationActive && !mWorldPresented) {
+        SPDLOG_ERROR("R069/R070: host promised but did not complete the world/HUD boundary");
+    }
 
-    if (mRendersToFb) {
+    if (mWorldPresented) {
+        mRapi->StartDrawToFramebuffer(0, 1);
+        mRapi->ClearFramebuffer(true, true);
+        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mPresentationFb);
+    } else if (mRendersToFb) {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (mWorldPresentationActive || !ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
@@ -6157,7 +7044,7 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 
     if (fb_src_id == 0 && mRendersToFb) {
         // read from the framebuffer we've been rendering to
-        fb_src_id = mGameFb;
+        fb_src_id = MainDrawFramebuffer();
     }
 
     int srcX0, srcY0, srcX1, srcY1;
@@ -6165,8 +7052,9 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 
     // When rendering to the main window buffer or MSAA is enabled with a buffer size equal to the view port,
     // then the source coordinates must account for any docked ImGui elements
-    if (fb_src_id == 0 || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                           mCurDimensions.height == mGameWindowViewport.height)) {
+    if (fb_src_id == 0 ||
+        (!mWorldPresentationActive && mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
+         mCurDimensions.height == mGameWindowViewport.height)) {
         srcX0 = mGameWindowViewport.x;
         srcY0 = mGameWindowViewport.y;
         srcX1 = mGameWindowViewport.x + mGameWindowViewport.width;
@@ -6192,15 +7080,18 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 }
 
 void Interpreter::ResetFrameBuffer() {
-    mRapi->StartDrawToFramebuffer(0, (float)mCurDimensions.height / mNativeDimensions.height);
+    mRapi->StartDrawToFramebuffer(mWorldPresentationActive ? MainDrawFramebuffer() : 0,
+                                  (float)mCurDimensions.height / mNativeDimensions.height);
 }
 
 void Interpreter::AdjustPixelDepthCoordinates(float& x, float& y) {
-    x = x * RATIO_X(mActiveFrameBuffer, mCurDimensions) -
-        (mNativeDimensions.width * RATIO_X(mActiveFrameBuffer, mCurDimensions) - mCurDimensions.width) / 2;
-    y *= RATIO_Y(mActiveFrameBuffer, mCurDimensions);
-    if (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                          mCurDimensions.height == mGameWindowViewport.height)) {
+    const auto& depthDimensions = mWorldPresented ? mWorldDimensions : mCurDimensions;
+    x = x * RATIO_X(mActiveFrameBuffer, depthDimensions) -
+        (mNativeDimensions.width * RATIO_X(mActiveFrameBuffer, depthDimensions) - depthDimensions.width) / 2;
+    y *= RATIO_Y(mActiveFrameBuffer, depthDimensions);
+    if (!mWorldPresentationActive &&
+        (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
+                           mCurDimensions.height == mGameWindowViewport.height))) {
         x += mGameWindowViewport.x;
         y += mGfxCurrentWindowDimensions.height - (mGameWindowViewport.y + mGameWindowViewport.height);
     }
@@ -6403,7 +7294,7 @@ extern "C" void gfx_shader_cache_clear() {
     instance->mColorCombinerPool.clear();
     instance->mPrevCombiner = Fast::mInstance.lock().get()->mColorCombinerPool.end();
     instance->mRenderingState.mShaderProgram = nullptr;
-    instance->mRapi->ClearShaderCache();
+    instance->ShaderCacheClear();
 }
 
 extern "C" void gfx_register_fb_texture(const void* cpuAddr, int fbId) {

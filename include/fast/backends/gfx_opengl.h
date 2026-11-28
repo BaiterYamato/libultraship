@@ -108,6 +108,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
     void* GetFramebufferTextureId(int fbId) override;
+    bool SupportsFogVolume() const override;
+    void DrawFogVolume(const FastFogVolume& volume, const FastFogFlow*) override;
     void SelectTextureFb(int fbId) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
@@ -119,6 +121,19 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
+#if !USE_OPENGLES
+    bool PrepareFogDepth(const FramebufferOGL& fb);
+
+    struct FogProgram {
+        GLuint id = 0;
+        GLint parameters = -1, view = -1, flipY = -1;
+    };
+    FogProgram mFogPrograms[2];
+    GLuint mFogDepthFb = 0, mFogDepth = 0, mFogGrid = 0, mFogVao = 0;
+    uint32_t mFogWidth = 0, mFogHeight = 0, mFogSamples = 0, mFogLastSamples = 0;
+    GLint mFogMaxSamples = 1;
+    bool mFogSupported = false, mFogFailed = false;
+#endif
 
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};

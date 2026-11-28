@@ -17,6 +17,7 @@
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
 #include "fast/debug/GfxDebugger.h"
+#include "fast/dynres_controller.h"
 
 #include "fast/resource/type/Texture.h"
 #include "ship/resource/Resource.h"
@@ -438,6 +439,17 @@ class Interpreter {
         mShadowShowVolume = showVolume;
     }
     void StartFrame();
+    // Host must promise a world/HUD boundary for THIS replay before StartFrame.
+    // Emit (FAST_GFX_WORLD_POSTPROCESS << 24) | WorldPresentCommand after ALL
+    // world effects (including fog) and before the first HUD draw. Default false.
+    static constexpr uint8_t WorldPresentCommand = 5;
+    void SetWorldPresentationForNextFrame(bool hasBoundary) {
+        mNextFrameHasWorldBoundary = hasBoundary;
+    }
+    bool PresentWorldBeforeHud();
+    int MainDrawFramebuffer() const {
+        return mWorldPresented ? mPresentationFb : (mRendersToFb ? mGameFb : 0);
+    }
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
     void EndFrame();
@@ -633,6 +645,13 @@ class Interpreter {
 
     int mGameFb{};             // game_framebuffer;
     int mGameFbMsaaResolved{}; // game_framebuffer_msaa_resolved;
+    DynresController mDynresController;
+    bool mNextFrameHasWorldBoundary = false, mWorldPresentationActive = false, mWorldPresented = false;
+    bool mSpatialUpscale = false, mDynamicResolution = false;
+    bool mMissingWorldBoundaryWarned = false;
+    int mPresentationFb = -1;
+    uint32_t mPresentationWidth = 0, mPresentationHeight = 0;
+    GfxDimensions mWorldDimensions{};
 
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;

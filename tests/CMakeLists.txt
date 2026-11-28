@@ -59,3 +59,8 @@ gtest_discover_tests(lus_tests
     TEST_FILTER "ArchiveManagerLifetime.*"
     PROPERTIES TIMEOUT 20
 )
+
+add_executable(screen_projection_test fast/screen_projection_test.cpp)
+target_include_directories(screen_projection_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+target_compile_features(screen_projection_test PRIVATE cxx_std_11)
+add_test(NAME screen_projection_test COMMAND screen_projection_test)

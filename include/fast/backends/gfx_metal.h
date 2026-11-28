@@ -10,6 +10,7 @@
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
+#include <map>
 #include <imgui_impl_sdl2.h>
 #include <simd/simd.h>
 
@@ -32,6 +33,7 @@ class SamplerState;
 class ScissorRect;
 class Device;
 class Function;
+class Library;
 class Buffer;
 class RenderPipelineState;
 class ComputePipelineState;
@@ -105,6 +107,7 @@ struct FramebufferMetal {
 
     // State
     bool mHasEndedEncoding;
+    bool mFogStoresAttachments = false;
     bool mHasBoundVertexShader;
     bool mHasBoundFragShader;
 
@@ -188,6 +191,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
     void* GetFramebufferTextureId(int fbId) override;
+    bool SupportsFogVolume() const override;
+    void DrawFogVolume(const FastFogVolume& volume, const FastFogFlow*) override;
     void SelectTextureFb(int fbId) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
@@ -203,6 +208,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
   private:
     bool NonUniformThreadGroupSupported();
     void SetupScreenFramebuffer(uint32_t width, uint32_t height);
+    MTL::RenderCommandEncoder* BeginFramebufferPass(FramebufferMetal& fb);
+    MTL::RenderPipelineState* GetFogPipeline(MTL::Texture& target);
     // Elements that only need to be setup once
     SDL_Renderer* mRenderer;
     CA::MetalLayer* mLayer; // CA::MetalLayer*
@@ -264,6 +271,12 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     // driver object on every change. Key: depthTest | depthMask<<1 | zmodeDecal<<2 | stencilMode<<3
     // (three stencil bits — StencilMode currently reaches 4, VolumeIncrDecr).
     MTL::DepthStencilState* mDepthStencilStates[64] = {};
+
+    MTL::Library* mFogLibrary = nullptr;
+    std::map<std::pair<uint32_t, uint32_t>, MTL::RenderPipelineState*> mFogPipelines;
+    uint32_t mFogReportedSamples = 0;
+    bool mFogMsaaSupported = false;
+    bool mFogFailed = false;
 
     bool mNonUniformThreadgroupSupported;
 };

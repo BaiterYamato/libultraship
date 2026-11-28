@@ -16,6 +16,7 @@
 #include <time.h>
 #include <math.h>
 #include <cmath>
+#include <cstring>
 #include <stddef.h>
 
 #ifndef _LANGUAGE_C
@@ -39,11 +40,27 @@
 #include "ship/config/ConsoleVariable.h"
 
 #include "fast/Fast3dWindow.h"
+#include "fast/fog_volume.h"
+#include "fog_volume_msl.h"
 
 #define ARRAY_COUNT(arr) (int32_t)(sizeof(arr) / sizeof(arr[0]))
 
 // MARK: - Helpers
 namespace Fast {
+
+static void ResetEncoderBindings(FramebufferMetal& framebuffer) {
+    framebuffer.mHasBoundVertexShader = false;
+    framebuffer.mHasBoundFragShader = false;
+    framebuffer.mLastShaderProgram = nullptr;
+    for (int i = 0; i < SHADER_MAX_TEXTURES; ++i) {
+        framebuffer.mLastBoundTextures[i] = nullptr;
+        framebuffer.mLastBoundSamplers[i] = nullptr;
+    }
+    framebuffer.mLastDepthTest = -1;
+    framebuffer.mLastDepthMask = -1;
+    framebuffer.mLastZmodeDecal = -1;
+    framebuffer.mLastStencilMode = -1;
+}
 
 static MTL::SamplerAddressMode gfx_cm_to_metal(uint32_t val) {
     switch (val) {
@@ -93,6 +110,9 @@ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
 
     autorelease_pool->release();
     mNonUniformThreadgroupSupported = NonUniformThreadGroupSupported();
+#ifndef __IOS__
+    mFogMsaaSupported = mDevice->supportsFamily(MTL::GPUFamilyApple3) || mDevice->supportsFamily(MTL::GPUFamilyMac2);
+#endif
 
     return ImGui_ImplMetal_Init(mDevice);
 }
@@ -132,6 +152,8 @@ void GfxRenderingAPIMetal::RenderDrawData(ImDrawData* drawData) {
 // MARK: - Metal Graphics Rendering API
 
 GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
+    for (const auto& pipeline : mFogPipelines) pipeline.second->release();
+    if (mFogLibrary) mFogLibrary->release();
     // SOH [Enhancement] Release the cached depth-stencil states (see DrawTriangles).
     for (auto*& state : mDepthStencilStates) {
         if (state != nullptr) {
@@ -1063,7 +1085,7 @@ void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) 
             fb.mCommandBuffer->enqueue();
         }
 
-        fb.mCommandEncoder = fb.mCommandBuffer->renderCommandEncoder(fb.mRenderPassDescriptor);
+        fb.mCommandEncoder = BeginFramebufferPass(fb);
         std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder", fb_id);
         fb.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
         fb.mCommandEncoder->setDepthClipMode(MTL::DepthClipModeClamp);
@@ -1074,6 +1096,179 @@ void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) 
     }
 
     memcpy(mFrameUniformBuffer->contents(), &mFrameUniforms, sizeof(FrameUniforms));
+}
+
+bool GfxRenderingAPIMetal::SupportsFogVolume() const {
+#ifdef __IOS__
+    return false;
+#else
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    return !mFogFailed && cvars->GetInteger("gDeveloperTools.FogMetalExperimental", 0) != 0 &&
+           (mFogMsaaSupported || cvars->GetInteger(CVAR_MSAA_VALUE, 1) <= 1);
+#endif
+}
+
+MTL::RenderCommandEncoder* GfxRenderingAPIMetal::BeginFramebufferPass(FramebufferMetal& fb) {
+    auto* pass = fb.mRenderPassDescriptor;
+    fb.mFogStoresAttachments = false;
+    if (!fb.mHasDepthBuffer || !SupportsFogVolume()) return fb.mCommandBuffer->renderCommandEncoder(pass);
+    auto* depth = pass->depthAttachment();
+    auto* texture = depth ? depth->texture() : nullptr;
+    if (!texture || (texture->sampleCount() > 1 && !mFogMsaaSupported)) {
+        return fb.mCommandBuffer->renderCommandEncoder(pass);
+    }
+
+    // An extra encoder can read the depth texture and resume with the same stencil contents.
+    const auto depthStore = depth->storeAction();
+    if (texture->sampleCount() > 1) depth->setStoreAction(MTL::StoreActionStoreAndMultisampleResolve);
+    auto* stencil = pass->stencilAttachment();
+    const bool hasStencil = stencil && stencil->texture();
+    const auto stencilStore = hasStencil ? stencil->storeAction() : MTL::StoreActionDontCare;
+    if (hasStencil) stencil->setStoreAction(MTL::StoreActionStore);
+    auto* encoder = fb.mCommandBuffer->renderCommandEncoder(pass);
+    depth->setStoreAction(depthStore);
+    if (hasStencil) stencil->setStoreAction(stencilStore);
+    fb.mFogStoresAttachments = encoder != nullptr;
+    return encoder;
+}
+
+MTL::RenderPipelineState* GfxRenderingAPIMetal::GetFogPipeline(MTL::Texture& target) {
+    const uint32_t samples = static_cast<uint32_t>(target.sampleCount());
+    const auto key = std::make_pair(static_cast<uint32_t>(target.pixelFormat()), samples);
+    if (auto it = mFogPipelines.find(key); it != mFogPipelines.end()) return it->second;
+
+    NS::Error* error = nullptr;
+    if (!mFogLibrary) {
+        mFogLibrary = mDevice->newLibrary(NS::String::string(FogVolumeMSL, NS::UTF8StringEncoding), nullptr, &error);
+        if (!mFogLibrary) {
+            SPDLOG_ERROR("Fast3D Metal fog library: {}",
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "no diagnostic");
+            return nullptr;
+        }
+    }
+
+    const char* fragment = samples > 1 ? "fogFragmentMSAA" : "fogFragment";
+    auto* vs = mFogLibrary->newFunction(NS::String::string("fogVertex", NS::UTF8StringEncoding));
+    auto* fs = mFogLibrary->newFunction(NS::String::string(fragment, NS::UTF8StringEncoding));
+    MTL::RenderPipelineState* pipeline = nullptr;
+    if (vs && fs) {
+        auto* descriptor = MTL::RenderPipelineDescriptor::alloc()->init();
+        descriptor->setVertexFunction(vs);
+        descriptor->setFragmentFunction(fs);
+        descriptor->setRasterSampleCount(samples);
+        auto* attachment = descriptor->colorAttachments()->object(0);
+        attachment->setPixelFormat(target.pixelFormat());
+        attachment->setBlendingEnabled(true);
+        attachment->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+        attachment->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        attachment->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        attachment->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        error = nullptr;
+        pipeline = mDevice->newRenderPipelineState(descriptor, &error);
+        descriptor->release();
+    }
+    if (vs) vs->release();
+    if (fs) fs->release();
+    if (!pipeline) {
+        SPDLOG_ERROR("Fast3D Metal fog pipeline samples={}: {}", samples,
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "missing shader entry");
+        return nullptr;
+    }
+    mFogPipelines.emplace(key, pipeline);
+    return pipeline;
+}
+
+void GfxRenderingAPIMetal::DrawFogVolume(const FastFogVolume& volume, const FastFogFlow*) {
+    if (!SupportsFogVolume()) return;
+    auto& fb = mFramebuffers[mCurrentFramebuffer];
+    if (!fb.mFogStoresAttachments || !fb.mCommandEncoder || fb.mHasEndedEncoding) return;
+    auto* worldPass = fb.mRenderPassDescriptor;
+    auto* color = worldPass->colorAttachments()->object(0);
+    auto* depth = worldPass->depthAttachment();
+    auto* stencil = worldPass->stencilAttachment();
+    auto* target = color->texture();
+    auto* worldDepth = depth ? depth->texture() : nullptr;
+    const bool hasStencil = stencil && stencil->texture();
+    const auto& viewport = *fb.mViewport;
+    if (!target || !worldDepth || viewport.width <= 0.0 || viewport.height <= 0.0) return;
+    const auto samples = target->sampleCount();
+    if (samples != worldDepth->sampleCount() || samples > METAL_MAX_MULTISAMPLE_SAMPLE_COUNT ||
+        (samples > 1 && !mFogMsaaSupported)) return;
+
+    auto* pipeline = GetFogPipeline(*target);
+    if (!pipeline) {
+        mFogFailed = true;
+        return;
+    }
+    struct alignas(16) {
+        float parameters[9][4];
+        float viewport[4];
+        float samplePositions[METAL_MAX_MULTISAMPLE_SAMPLE_COUNT][2];
+    } constants{};
+    static_assert(sizeof(constants.parameters) == offsetof(FastFogVolume, cells));
+    static_assert(sizeof(constants) == 224 && offsetof(decltype(constants), samplePositions) == 160);
+    std::memcpy(constants.parameters, &volume, sizeof(constants.parameters));
+    constants.viewport[0] = static_cast<float>(viewport.originX);
+    constants.viewport[1] = static_cast<float>(viewport.originY);
+    constants.viewport[2] = static_cast<float>(viewport.width);
+    constants.viewport[3] = static_cast<float>(viewport.height);
+    if (samples > 1) {
+        MTL::SamplePosition positions[METAL_MAX_MULTISAMPLE_SAMPLE_COUNT];
+        mDevice->getDefaultSamplePositions(positions, samples);
+        for (size_t i = 0; i < samples; ++i) {
+            constants.samplePositions[i][0] = positions[i].x;
+            constants.samplePositions[i][1] = positions[i].y;
+        }
+    }
+    const auto cells = std::max<size_t>(1, static_cast<size_t>(volume.grid[0]) * static_cast<size_t>(volume.grid[1]));
+    auto* field = mDevice->newBuffer(volume.cells, cells * sizeof(volume.cells[0]), MTL::ResourceStorageModeShared);
+    if (!field) return;
+
+    // The fog encoder samples depth while it is detached from the render pass.
+    fb.mCommandEncoder->endEncoding();
+
+    auto* fogPass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* fogColor = fogPass->colorAttachments()->object(0);
+    fogColor->setTexture(target);
+    fogColor->setLoadAction(MTL::LoadActionLoad);
+    fogColor->setStoreAction(MTL::StoreActionStore);
+    if (auto* fog = fb.mCommandBuffer->renderCommandEncoder(fogPass)) {
+        fog->setLabel(NS::String::string("Fast3D fog volume", NS::UTF8StringEncoding));
+        fog->setViewport(viewport);
+        fog->setScissorRect(*fb.mScissorRect);
+        fog->setRenderPipelineState(pipeline);
+        fog->setFragmentTexture(worldDepth, 0);
+        fog->setFragmentBytes(&constants, sizeof(constants), 0);
+        fog->setFragmentBuffer(field, 0, 1);
+        fog->drawPrimitives(MTL::PrimitiveTypeTriangle, 0, 3);
+        fog->endEncoding();
+        if (mFogReportedSamples != samples) {
+            SPDLOG_INFO("Fast3D Metal fog volume samples={} grid={}x{}", samples, int(volume.grid[0]),
+                        int(volume.grid[1]));
+            mFogReportedSamples = static_cast<uint32_t>(samples);
+        }
+    } else {
+        SPDLOG_ERROR("Fast3D Metal fog encoder could not be created");
+        mFogFailed = true;
+    }
+    // Command buffers retain their resources until execution completes.
+    field->release();
+
+    const auto colorLoad = color->loadAction();
+    const auto depthLoad = depth->loadAction();
+    const auto stencilLoad = hasStencil ? stencil->loadAction() : MTL::LoadActionDontCare;
+    color->setLoadAction(MTL::LoadActionLoad);
+    depth->setLoadAction(MTL::LoadActionLoad);
+    if (hasStencil) stencil->setLoadAction(MTL::LoadActionLoad);
+    fb.mCommandEncoder = BeginFramebufferPass(fb);
+    color->setLoadAction(colorLoad);
+    depth->setLoadAction(depthLoad);
+    if (hasStencil) stencil->setLoadAction(stencilLoad);
+    fb.mCommandEncoder->setDepthClipMode(MTL::DepthClipModeClamp);
+    fb.mCommandEncoder->setViewport(viewport);
+    fb.mCommandEncoder->setScissorRect(*fb.mScissorRect);
+    ResetEncoderBindings(fb);
+    mPrimDepthDirty = true;
 }
 
 void GfxRenderingAPIMetal::ClearFramebuffer(bool color, bool depth) {
@@ -1102,7 +1297,7 @@ void GfxRenderingAPIMetal::ClearFramebuffer(bool color, bool depth) {
     }
 
     // Create a new render encoder back onto the framebuffer
-    framebuffer.mCommandEncoder = framebuffer.mCommandBuffer->renderCommandEncoder(framebuffer.mRenderPassDescriptor);
+    framebuffer.mCommandEncoder = BeginFramebufferPass(framebuffer);
 
     std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder After Clear", mCurrentFramebuffer);
     framebuffer.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
@@ -1117,17 +1312,7 @@ void GfxRenderingAPIMetal::ClearFramebuffer(bool color, bool depth) {
     }
 
     // Reset the framebuffer so the encoder is setup again when rendering triangles
-    framebuffer.mHasBoundVertexShader = false;
-    framebuffer.mHasBoundFragShader = false;
-    framebuffer.mLastShaderProgram = nullptr;
-    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
-        framebuffer.mLastBoundTextures[i] = nullptr;
-        framebuffer.mLastBoundSamplers[i] = nullptr;
-    }
-    framebuffer.mLastDepthTest = -1;
-    framebuffer.mLastDepthMask = -1;
-    framebuffer.mLastZmodeDecal = -1;
-    framebuffer.mLastStencilMode = -1; // SOH [Enhancement] world light casting / actor shadows
+    ResetEncoderBindings(framebuffer);
 }
 
 void GfxRenderingAPIMetal::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
@@ -1313,8 +1498,7 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     }
 
     // Create a new render encoder back onto the framebuffer
-    source_framebuffer.mCommandEncoder =
-        source_framebuffer.mCommandBuffer->renderCommandEncoder(source_framebuffer.mRenderPassDescriptor);
+    source_framebuffer.mCommandEncoder = BeginFramebufferPass(source_framebuffer);
 
     std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder After Copy", fb_src_id);
     source_framebuffer.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
@@ -1329,17 +1513,7 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     }
 
     // Reset the framebuffer so the encoder is setup again when rendering triangles
-    source_framebuffer.mHasBoundVertexShader = false;
-    source_framebuffer.mHasBoundFragShader = false;
-    source_framebuffer.mLastShaderProgram = nullptr;
-    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
-        source_framebuffer.mLastBoundTextures[i] = nullptr;
-        source_framebuffer.mLastBoundSamplers[i] = nullptr;
-    }
-    source_framebuffer.mLastDepthTest = -1;
-    source_framebuffer.mLastDepthMask = -1;
-    source_framebuffer.mLastZmodeDecal = -1;
-    source_framebuffer.mLastStencilMode = -1; // SOH [Enhancement] world light casting / actor shadows
+    ResetEncoderBindings(source_framebuffer);
 }
 
 void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {

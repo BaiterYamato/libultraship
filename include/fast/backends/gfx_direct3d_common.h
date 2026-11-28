@@ -4,7 +4,15 @@
 
 #ifdef __cplusplus
 #include "../interpreter.h"
+#include "../fog_volume.h"
+#include "../alpha_cutout.h"
+#include "../foliage_depth_diagnostics.h"
+#include <array>
 #include <cstdint>
+#include <chrono>
+#include <filesystem>
+#include <future>
+#include <memory>
 #include <string>
 #include "gfx_rendering_api.h"
 #include "d3d11.h"
@@ -39,7 +47,7 @@ struct PerDrawCB {
         uint32_t width;
         uint32_t height;
         uint32_t linear_filtering;
-        uint32_t padding;
+        uint32_t mipmaps; // R018: per-draw eligibility, same 16-byte layout
     } mTextures[SHADER_MAX_TEXTURES];
 };
 
@@ -56,9 +64,14 @@ struct TextureData {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> resource_view;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_state;
-    uint32_t width;
-    uint32_t height;
-    bool linear_filtering;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> point_sampler_state;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mip_levels = 1;
+    uint32_t cms = 0, cmt = 0;
+    bool linear_filtering = false;
+    bool is_framebuffer = false;
+    AlphaCutout::Statistics alphaCoverage{};
 };
 
 struct FramebufferDX11 {
@@ -82,6 +95,12 @@ struct ShaderProgramD3D11 {
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool opt_toon = false; // SOH [Enhancement] toon lighting variant
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> foliage_shadow;
+    bool foliage_shadow_attempted = false;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> foliage_depth_msaa;
+    bool foliage_depth_msaa_attempted = false;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> foliage_depth_debug[2];
+    bool foliage_depth_debug_attempted[2]{};
 };
 
 class GfxWindowBackendDXGI;
@@ -100,6 +119,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     struct ShaderProgram* LookupShader(uint64_t shaderId0, uint64_t shaderId1) override;
     void ShaderGetInfo(struct ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) override;
     void ClearShaderCache() override;
+    bool IsCutoutTexture(unsigned tile) const;
+    // Borrowed, cached per shader program; never binds it to the main draw.
+    ID3D11PixelShader* GetFoliageShadowShader();
+    ID3D11PixelShader* GetFoliageDepthShader(bool multisampled, bool debug = false);
+    // Not virtual on purpose: a new GfxRenderingAPI slot would shift the vtable for every prebuilt caller.
+    void DrawFoliageDepth(size_t numTris, int worldFramebuffer);
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
@@ -116,6 +141,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void StartFrame() override;
     void EndFrame() override;
     void FinishRender() override;
+    bool PrepareWorldPresentation() override;
+    bool PresentWorld(int source, int destination, bool reconstruct) override;
+    void SetGpuFrameTiming(bool enabled, float measuredScale, uint64_t configuration = 0) override;
+    bool GetGpuFrameTime(double& milliseconds, float& measuredScale) override;
     int CreateFramebuffer() override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
@@ -129,12 +158,34 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
     void* GetFramebufferTextureId(int fbId) override;
+    bool SupportsFogVolume() const override {
+        return true;
+    }
+    bool SupportsFogFlow() const override {
+        return true;
+    }
+    void DrawFogVolume(const FastFogVolume& volume, const FastFogFlow* flow) override;
+    // Recursos da variante linear: uma vez por dispositivo, antes de ativar o pack.
+    bool PrepareWorldFogLayer();
     void SelectTextureFb(int fbId) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+
+    // Lease compartilhado: queries nao sao reutilizadas enquanto algum consumidor as le.
+    // R069 e WorldPass usam UM disjoint por StartFrame/EndFrame, inclusive sem Compose.
+    struct GpuTimingClock {
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+        uint64_t frame = 0;
+        bool ended = false;
+    };
+    std::shared_ptr<GpuTimingClock> AcquireGpuTimingClock();
+    uint64_t GpuTimingFrame() const { return mTimingFrame; }
+    // Nao virtuais. Resultado do quadro inteiro, publicado no giro de oito frames.
+    bool ReadFoliageDepthTiming(uint64_t frame, FoliageDepth::Sample& sample) const;
+    unsigned FoliageDepthDiagnosticMode() const { return mFoliageDiagnosticMode; }
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -143,6 +194,232 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     D3D_FEATURE_LEVEL mFeatureLevel;
 
   private:
+    using FoliageQuery = Microsoft::WRL::ComPtr<ID3D11Query>;
+    struct FoliageTimingSlot {
+        std::array<std::array<FoliageQuery, 2>, FoliageDepth::MaxIntervals> timestamps{};
+        std::shared_ptr<GpuTimingClock> clock;
+        FoliageDepth::Sample sample{};
+        std::size_t intervals = 0;
+        bool pending = false, discard = false;
+    };
+    std::array<FoliageTimingSlot, FoliageDepth::RingSize> mFoliageTiming{};
+    std::array<FoliageDepth::Sample, FoliageDepth::RingSize> mFoliageResults{};
+    FoliageDepth::Counts mFoliageFrameCounts{};
+    FoliageDepth::CountBatch mFoliageCountBatch{};
+    uint64_t mFoliageCountRun = 0, mFoliageCountBatchId = 0;
+    uint64_t mFoliageOverflowFrames = 0, mFoliageSkippedFrames = 0;
+    unsigned mFoliageDiagnosticMode = 0;
+    int mActiveFoliageTiming = -1;
+    bool mFoliageQueriesReady = false, mFoliageQueriesFailed = false;
+    bool InitFoliageDepthTiming();
+    bool CollectFoliageDepthTiming(FoliageTimingSlot& slot);
+    void BeginFoliageDepthFrame();
+    void EndFoliageDepthFrame();
+    void BeginFoliageDepthDraw(const FramebufferDX11& fb);
+    void EndFoliageDepthDraw(std::size_t numTris);
+
+    struct FrameTiming {
+        std::shared_ptr<GpuTimingClock> clock;
+        Microsoft::WRL::ComPtr<ID3D11Query> begin, end;
+        uint64_t frame = 0;
+        uint64_t epoch = 0;
+        float scale = 1.0f;
+        bool pending = false;
+    };
+    // O pack colhe em Prepare, depois do StartFrame do R069. Uma reserva separada
+    // evita que os oito leases do pack impeçam o R069 de comecar o quadro seguinte.
+    std::array<std::shared_ptr<GpuTimingClock>, 16> mGpuTimingClocks{};
+    std::shared_ptr<GpuTimingClock> mGpuFrameClock;
+    bool mGpuClockFailed = false;
+    std::array<FrameTiming, 8> mFrameTiming{};
+    int mActiveFrameTiming = -1;
+    uint64_t mTimingFrame = 0;
+    uint64_t mTimingEpoch = 0, mTimingConfiguration = 0;
+    bool mFrameTimingEnabled = false, mFrameTimingFailed = false;
+    float mFrameTimingScale = 1.0f;
+    void BeginGpuFrameTiming();
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mSpatialVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mSpatialLinear, mSpatialReconstruct, mSpatialSharpen;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mSpatialCb;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mSpatialSampler;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mSpatialRaster;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mSpatialDepth;
+    struct SpatialTarget {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
+        UINT width = 0, height = 0;
+    };
+    SpatialTarget mSpatialResolved, mSpatialIntermediate;
+    bool EnsureSpatialTarget(SpatialTarget& target, UINT width, UINT height);
+    bool mSpatialFailed = false;
+    bool CompileFogShader(const char* entry, const char* profile, ID3DBlob** blob, bool multisampled = false);
+    bool InitFogVolume();
+    void UpdateFogSupportRanges(const FastFogVolume& volume, const FastFogFlow& flow, UINT width, UINT height);
+    void UpdateFogLift(const FastFogFlow& flow, FogFlowAction action, UINT width, UINT height);
+    void UpdateFogUpper(const FastFogVolume& volume, FogFlowAction action, UINT width, UINT height);
+    enum class FogMsaaShader { Full, Low, Upscale, Uniform, CachedUpscale, Count };
+    struct FogMsaaBytecode {
+        Microsoft::WRL::ComPtr<ID3DBlob> code, diagnostic;
+        HRESULT status = E_FAIL;
+        bool diskHit = false;
+        double milliseconds = 0.0;
+    };
+    struct FogMsaaJob {
+        std::future<FogMsaaBytecode> future;
+        bool started = false;
+        bool failed = false;
+    };
+    static FogMsaaBytecode CompileFogMsaaBytecode(pD3DCompile compiler, decltype(&D3DCreateBlob) createBlob,
+                                                  const std::filesystem::path& cacheDirectory, FogMsaaShader kind);
+    void StartFogMsaaShader(FogMsaaShader kind);
+    bool PrepareFogMsaaShader(FogMsaaShader kind, Microsoft::WRL::ComPtr<ID3D11PixelShader>& shader);
+    bool InitFogMsaa();
+    bool InitFogLod(UINT width, UINT height, bool multisampled, bool useSun);
+    bool InitFogMsaaCache(UINT width, UINT height);
+    bool DrawFogLod(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction action,
+                    const D3D11_VIEWPORT& viewport, int mode, float fieldFraction, float extinction, bool useSun,
+                    ID3D11Query* lowEnd, ID3D11RenderTargetView* target, ID3D11BlendState* blend,
+                    bool multisampled, bool linearLayer);
+    bool InitFogFlow();
+    bool InitFogVertical();
+    bool InitFogParticles();
+    bool InitFogFieldBlend();
+    ID3D11ShaderResourceView* BlendFogField(ID3D11ShaderResourceView* current, UINT width, UINT height, float fraction);
+    ID3D11ShaderResourceView* UpdateFogFlow(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowAction& action,
+                                            ID3D11Query* particleBegin, bool& particles);
+    void AuditFogFlow(const FastFogVolume& volume, const FastFogFlow& flow, FogFlowCursor cursor,
+                      ID3D11ShaderResourceView* source);
+    void CollectFogTiming();
+    struct FogTiming {
+        // Quando o pack ja abriu um relogio de quadro, evitar disjoint aninhado.
+        std::shared_ptr<GpuTimingClock> frameClock;
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+        Microsoft::WRL::ComPtr<ID3D11Query> begin;
+        Microsoft::WRL::ComPtr<ID3D11Query> fieldEnd;
+        Microsoft::WRL::ComPtr<ID3D11Query> particleBegin;
+        Microsoft::WRL::ComPtr<ID3D11Query> lowEnd;
+        Microsoft::WRL::ComPtr<ID3D11Query> end;
+        bool advanced = false;
+        bool particles = false;
+        bool reduced = false;
+        bool pending = false;
+    };
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mFogVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogPs, mFogMsaaPs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogLayerPs, mFogLayerUpscalePs;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFogLayerBlend;
+    bool mFogLayerFailed = false;
+    bool mFogLastLinearLayer = false;
+    struct FogLodShaders {
+        Microsoft::WRL::ComPtr<ID3D11PixelShader> low, upscale;
+        bool failed = false;
+    };
+    std::array<FogLodShaders, 2> mFogLodShaders{};
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogTemporalCb;
+    struct FogHistoryTarget {
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
+    };
+    std::array<FogHistoryTarget, 2> mFogHistory{};
+    FogHistoryTarget mFogReducedSun{};
+    bool mFogReducedSunFailed = false;
+    FogHistoryTarget mFogUniformCache{};
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mFogUniformPs, mFogCachedUpscalePs;
+    UINT mFogCacheWidth = 0, mFogCacheHeight = 0;
+    bool mFogMsaaCacheFailed = false;
+    FogTemporalConstants mFogLastCamera{};
+    std::array<float, 4> mFogLastDepth{};
+    float mFogLastFieldFraction = 1.0f;
+    D3D11_VIEWPORT mFogLastViewport{};
+    UINT mFogHistoryWidth = 0, mFogHistoryHeight = 0;
+    UINT mFogLodWidth = 0, mFogLodHeight = 0;
+    UINT mFogLastMsaa = 0, mFogReportedMsaa = 0;
+    UINT mFogReportedLights = 0;
+    bool mFogAtmosphereLogged = false;
+    uint64_t mFogFrame = 0, mFogLastFrame = 0, mFogLastStream = 0;
+    int mFogLastFramebuffer = -1, mFogLodMode = -1;
+    unsigned mFogHistoryIndex = 0, mFogHistoryFrames = 0, mFogHistoryResets = 0;
+    bool mFogLodFailed = false;
+    std::array<FogMsaaJob, static_cast<size_t>(FogMsaaShader::Count)> mFogMsaaJobs{};
+    std::chrono::steady_clock::time_point mFogPathStart;
+    UINT mFogPathSamples = 0;
+    bool mFogPathLinear = false;
+    bool mFogPathFirstDraw = false;
+    bool mFogPathUsedMsaaCache = false;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFogBlend;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mFogRaster;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mFogDepth;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogGridTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogGridView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogSupportTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogSupportView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogLiftTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogLiftView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogUpperTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogUpperView;
+    std::array<std::array<float, 2>, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogUpperLatest{};
+    bool mFogUpperHasHistory = false, mFogUpperLogged = false;
+    std::array<std::array<float, 2>, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogLiftLatest{};
+    bool mFogLiftCurrent = false, mFogLiftPrevious = false;
+    bool mFogCpuField = false;
+    float mFogDomainX = 0.0f, mFogDomainZ = 0.0f;
+    float mFogStepX = 0.0f, mFogStepZ = 0.0f;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mFogGridSampler;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogNoiseView;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mFogNoiseSampler;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogFlowCS;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogFlowCb, mFogFlowInput;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogFlowInputView;
+    struct FogFlowTexture {
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> target;
+    };
+    std::array<FogFlowTexture, 2> mFogFlowTextures{};
+    std::array<FogFlowTexture, 2> mFogVerticalTextures{};
+    FogFlowTexture mFogBlendedVertical{};
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogVerticalCS;
+    bool mFogVerticalActive = false, mFogVerticalFailed = false, mFogVerticalLogged = false;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogParticleStepCS, mFogParticleDepositCS, mFogParticlePathsCS;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogParticleView;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mFogParticleTarget;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mFogParticlePathsView;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mFogParticlePathsTarget;
+    std::array<std::pair<float, uint32_t>, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogParticleTopology{};
+    bool mFogParticlePathsReady = false;
+    std::array<FogFlowTexture, 2> mFogParticleFields{};
+    FogFlowTexture mFogBlendedField{};
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mFogFieldBlendCS;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFogFieldBlendCb;
+    bool mFogCanBlend = false, mFogFieldBlendFailed = false, mFogBlendLogged = false;
+    std::array<float, 2> mFogExtinction{};
+    bool mFogExtinctionLogged = false;
+    unsigned mFogParticleSteps = 0;
+    bool mFogParticlesFailed = false, mFogParticlesActive = false;
+    FogFlowCursor mFogFlowCursor{};
+    unsigned mFogFlowIndex = 0;
+    unsigned mFogFlowSteps = 0, mFogFlowSeeds = 0, mFogFlowReuses = 0;
+    bool mFogFlowFailed = false;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mFogAuditStaging;
+    Microsoft::WRL::ComPtr<ID3D11Query> mFogAuditReady;
+    FogFlowCursor mFogAuditCursor{}, mFogAuditPrevious{};
+    std::array<uint8_t, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogAuditMask{};
+    std::array<float, FAST_FOG_GRID_SIDE * FAST_FOG_GRID_SIDE> mFogAuditDensity{}, mFogAuditSpeed{};
+    float mFogAuditRestDensity = 1.0f;
+    bool mFogAuditPending = false, mFogAuditFailed = false;
+    std::array<FogTiming, 4> mFogTiming{};
+    std::array<double, 120> mFogSamples{};
+    std::array<double, 120> mFogFieldSamples{}, mFogRaymarchSamples{};
+    std::array<double, 120> mFogParticleSamples{};
+    std::array<double, 120> mFogLowSamples{}, mFogUpscaleSamples{};
+    size_t mFogSampleCount = 0;
+    size_t mFogFlowSampleCount = 0;
+    size_t mFogParticleSampleCount = 0;
+    size_t mFogLodSampleCount = 0;
+    unsigned mFogTimingReports = 0;
+    bool mFogInitFailed = false;
+    bool mFogGridLogged = false;
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
 
@@ -159,6 +436,13 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // CreateDepthStencilState). Key: depthTest | depthMask<<1 | zmodeDecal<<2 | stencilMode<<3 — same
     // scheme as the Metal backend's cache.
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilStates[64];
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFoliageDepthBlend;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFoliageDepthDebugBlend;
+    bool mFoliageDepthDebugBlendFailed = false;
+    // Index is the actual bound comparison function (1..8), including the legacy decal cache behavior.
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mFoliageDepthStates[9];
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mFoliageDepthRasterSource, mFoliageDepthRaster;
+    bool mFoliageDepthStateFailed = false;
     int mLastStencilMode = -1; // SOH [Enhancement] world light casting: cache tracker for mStencilMode
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
@@ -180,7 +464,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 #endif
 
     PerFrameCB mPerFrameCbData;
-    PerDrawCB mPerDrawCbData;
+    PerDrawCB mPerDrawCbData{};
     PerPrimDepthCB mPerPrimDepthCbData;
     PerToonCB mPerToonCbData; // Wind Waker Style toon lighting
 
@@ -199,6 +483,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     int32_t mRenderTargetHeight;
     int mCurrentFramebuffer;
     FilteringMode mCurrentFilterMode = FILTER_NONE;
+    // R018: cache shared sampler descriptors; HUD/world switches never allocate
+    // a new sampler after the corresponding descriptor has been seen once.
+    bool mTextureMipmaps = true;
+    uint32_t mTextureAnisotropy = 8;
+    std::map<uint32_t, Microsoft::WRL::ComPtr<ID3D11SamplerState>> mTextureSamplerCache;
+    void UpdateTextureSampler(TextureData& texture, bool mipmaps);
 
     // Previous states (to prevent setting states needlessly)
 

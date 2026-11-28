@@ -1,10 +1,14 @@
 #include "fast/Fast3dWindow.h"
+#include "fast/FlyCameraInput.h"
 
 #include "ship/Context.h"
 #include "ship/config/Config.h"
 #include "ship/controller/controldeck/ControlDeck.h"
 #include "ship/config/ConsoleVariable.h"
 #include "fast/interpreter.h"
+#include "fast/world_postprocess.h"
+#include "fast/world_presentation.h"
+#include "fast/world_presentation_gate.h"
 #include "fast/backends/gfx_sdl.h"
 #include "fast/backends/gfx_dxgi.h"
 #include "fast/backends/gfx_opengl.h"
@@ -15,9 +19,59 @@
 
 #include "fast/Fast3dGui.h"
 
+#include <atomic>
 #include <fstream>
 
+namespace {
+Fast::WorldPresentationGate<Fast::F3DGfx> gWorldPresentationGate;
+std::atomic_bool gFlyCameraToggle = false;
+// F8 key-down seen (and consumed) while the fly camera was enabled. Only its matching key-up arms the toggle, so
+// releasing F8 after an alt-tab, or a key-up with no key-down in this window, never flips the camera.
+std::atomic_bool gFlyCameraF8Down = false;
+// Mirrors CVAR_DEVELOPER_TOOLS("DebugEnabled") from the host; the prefix macro lives in soh, not in libultraship.
+constexpr const char* kFlyCameraDebugCvar = "gDeveloperTools.DebugEnabled";
+// Low 16 bits are currently held. High 16 bits retain presses until the game consumes them.
+constexpr uint32_t kHeldFlyCameraMask = 0xFFFFu;
+constexpr uint32_t kPendingFlyCameraShift = 16;
+std::atomic_uint32_t gFlyCameraKeys = 0;
+
+constexpr int32_t kExtendedControlScanCode = Ship::KbScancode::LUS_KB_CONTROL | 0x100;
+
+uint32_t FlyCameraKeyBit(int32_t scancode) {
+    switch (scancode) {
+        case Ship::KbScancode::LUS_KB_W: return Fast::FlyForward;
+        case Ship::KbScancode::LUS_KB_S: return Fast::FlyBackward;
+        case Ship::KbScancode::LUS_KB_A: return Fast::FlyLeft;
+        case Ship::KbScancode::LUS_KB_D: return Fast::FlyRight;
+        case Ship::KbScancode::LUS_KB_SPACE: return Fast::FlyUp;
+        case Ship::KbScancode::LUS_KB_CONTROL: return Fast::FlyDownLeft;
+        case kExtendedControlScanCode: return Fast::FlyDownRight;
+        case Ship::KbScancode::LUS_KB_SHIFT: return Fast::FlyBoostLeft;
+        case Ship::KbScancode::LUS_KB_RSHIFT: return Fast::FlyBoostRight;
+        default: return 0;
+    }
+}
+
+bool FlyCameraEnabled() {
+    return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(kFlyCameraDebugCvar, 0) != 0;
+}
+}
+
+void FastBeginWorldPresentationFrame(const void* root) {
+    gWorldPresentationGate.Begin(root);
+}
+
+void FastSetWorldPresentationBoundary(const void* root, const void* marker) {
+    gWorldPresentationGate.Publish(root, marker);
+}
+
+void FastEndWorldPresentationFrame(void) {
+    gWorldPresentationGate.End();
+}
+
 namespace Fast {
+
+static_assert(Interpreter::WorldPresentCommand == FAST_WORLD_PRESENT_COMMAND);
 
 extern void GfxSetInstance(std::shared_ptr<Interpreter> gfx);
 
@@ -178,10 +232,13 @@ void Fast3dWindow::Close() {
 }
 
 void Fast3dWindow::RunGuiOnly() {
+    mInterpreter->SetWorldPresentationForNextFrame(false);
     mInterpreter->RunGuiOnly();
 }
 
 void Fast3dWindow::StartFrame() {
+    // Entrada sem lista: não pode herdar a autorização de DrawAndRunGraphicsCommands.
+    mInterpreter->SetWorldPresentationForNextFrame(false);
     mInterpreter->StartFrame();
 }
 
@@ -195,6 +252,7 @@ bool Fast3dWindow::IsFrameReady() {
 
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
+    mInterpreter->SetWorldPresentationForNextFrame(false);
 
     // Skip dropped frames
     if (!wnd->IsFrameReady()) {
@@ -207,6 +265,11 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     // Setup of the backend frames and draw initial Window and GUI menus
     gui->StartDraw();
     // Setup game framebuffers to match available window space
+    // StartFrame consome a autorização: recalcular para CADA replay interpolado.
+    // Um pedido de debugger surgido após a construção também invalida este replay.
+    const bool debugging = mGfxDebugger->IsDebugging() || mGfxDebugger->IsDebuggingRequested();
+    mInterpreter->SetWorldPresentationForNextFrame(gWorldPresentationGate.Authorize(
+        commands, debugging, (uint32_t(FAST_GFX_WORLD_POSTPROCESS) << 24) | Interpreter::WorldPresentCommand));
     mInterpreter->StartFrame();
     // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
@@ -344,7 +407,32 @@ const char* Fast3dWindow::GetKeyName(int32_t scancode) {
     return mWindowManagerApi->GetKeyName(scancode);
 }
 
+bool TakeFlyCameraToggle() {
+    return gFlyCameraToggle.exchange(false);
+}
+
+uint32_t TakeFlyCameraKeys() {
+    const auto keys = gFlyCameraKeys.fetch_and(kHeldFlyCameraMask);
+    return (keys & kHeldFlyCameraMask) | (keys >> kPendingFlyCameraShift);
+}
+
+bool FlyCameraKeysHeld() {
+    return (gFlyCameraKeys.load() & kHeldFlyCameraMask) != 0;
+}
+
 bool Fast3dWindow::KeyUp(int32_t scancode) {
+    if (const auto key = FlyCameraKeyBit(scancode)) {
+        gFlyCameraKeys.fetch_and(~key);
+    }
+    // F8 is the fly camera toggle: its key-down was consumed, so the key-up is consumed too and the control deck
+    // never sees half of the pair. Without a prior key-down (focus regained mid-press) it falls through untouched.
+    if (scancode == Ship::KbScancode::LUS_KB_F8 && gFlyCameraF8Down.exchange(false)) {
+        if (FlyCameraEnabled()) {
+            gFlyCameraToggle.store(true);
+        }
+        return true;
+    }
+
     if (scancode == Ship::Context::GetRawInstance()->GetWindow()->GetFullscreenScancode()) {
         Ship::Context::GetRawInstance()->GetWindow()->ToggleFullscreen();
     }
@@ -359,6 +447,14 @@ bool Fast3dWindow::KeyUp(int32_t scancode) {
 }
 
 bool Fast3dWindow::KeyDown(int32_t scancode) {
+    if (const auto key = FlyCameraKeyBit(scancode)) {
+        gFlyCameraKeys.fetch_or(key | (key << kPendingFlyCameraShift));
+    }
+    // Consume F8 only while the toggle is live; with debug off the key stays available to bindings.
+    if (scancode == Ship::KbScancode::LUS_KB_F8 && FlyCameraEnabled()) {
+        gFlyCameraF8Down.store(true);
+        return true;
+    }
     bool isProcessed = Ship::Context::GetRawInstance()->GetControlDeck()->ProcessKeyboardEvent(
         Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN, static_cast<Ship::KbScancode>(scancode));
     Ship::Context::GetRawInstance()->GetWindow()->SetLastScancode(scancode);
@@ -367,6 +463,9 @@ bool Fast3dWindow::KeyDown(int32_t scancode) {
 }
 
 void Fast3dWindow::AllKeysUp() {
+    gFlyCameraToggle.store(false);
+    gFlyCameraF8Down.store(false);
+    gFlyCameraKeys.store(0);
     Ship::Context::GetRawInstance()->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_ALL_KEYS_UP,
                                                                             Ship::KbScancode::LUS_KB_UNKNOWN);
 }
