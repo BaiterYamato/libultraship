@@ -57,6 +57,8 @@
 #include <utility>
 #include "fast/fog_volume.h"
 #include "fast/fog_detail.h"
+#include "fast/fog_flow_presence.h"
+#include "fast/render_overrides.h"
 #include "fast/world_postprocess.h"
 #include "fog_field_blend_shader.h"
 #include "fog_volume_shader.h"
@@ -139,6 +141,14 @@ static_assert(sizeof(KokiriLabPbrLighting) == 32);
 bool KokiriLabPbrMaterialBufferEnabled() {
     return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(FAST_KOKIRI_LABPBR_BUFFER_CVAR, 0) != 0;
 }
+
+// Nested-grid detail advection cap. The default is the original 120 u per 72-tick cycle, expressed as a speed.
+constexpr const char* FogFlowDetailMaxSpeedCVar = "gDeveloperTools.FogFlowDetailMaxSpeed";
+constexpr float FogFlowDetailDefaultShift = 120.0f;
+constexpr float FogFlowDetailDefaultTicks = 72.0f;
+constexpr int32_t FogFlowDetailMinSpeed = 5;
+constexpr int32_t FogFlowDetailMaxSpeedLimit = 200;
+constexpr const char* FogFlowCycleTicksCVar = "gDeveloperTools.FogFlowCycleTicks";
 
 constexpr const char* KokiriLabPbrMaterialBufferMaxMiBCVar = "gDeveloperTools.KokiriLabPbrMaterialBufferMaxMiB";
 constexpr int32_t KokiriLabPbrMaterialBufferMaxMiBDefault = 1024;
@@ -2543,7 +2553,7 @@ struct FogConstants {
     std::array<std::array<float, 4>, 4> sunProjection;
     std::array<float, 4> sunRadiance;
     float detailBounds[4]; // x min, z min, x max, z max
-    float detailGrid[4];   // width, depth, blend band, enabled
+    float detailGrid[4];   // width, depth, blend band, flow cap in u per cycle (> 0.5 = enabled)
     float solarStyle[4];  // x: Kokiri upper fog sunlight gain, y: canopy shaft strength
     float upscaleTuning[4]; // x: upscale tolerance mode, y: heatmap; mirrors upscaleTuning in fog_volume_shader.h
 };
@@ -2600,6 +2610,24 @@ void StoreFogDetail(const FastFogVolume& volume, const FastFogFlow& flow) {
     }
     std::memcpy(state.previous, shifted, sizeof(float) * 4 * width * height);
     std::memcpy(state.current, gFastFogDetailReplay.cells, sizeof(float) * 4 * width * height);
+    // The free 4th channel carries the flowing-detail weight (fast/fog_flow_presence.h), moved with the window like
+    // the rest of the history; the shader reads it as detailField.w.
+    const uint32_t elapsedTicks = sameShape ? std::clamp(flow.tick - state.tick, 1u, 20u) : 1u;
+    const float elapsed = std::max(flow.dt, 0.001f) * static_cast<float>(elapsedTicks);
+    for (UINT z = 0; z < height; ++z) {
+        for (UINT x = 0; x < width; ++x) {
+            const UINT i = z * width + x;
+            const int oldX = int(x) + shiftX, oldZ = int(z) + shiftZ;
+            const bool history = translates && oldX >= 0 && oldZ >= 0 && oldX < int(width) && oldZ < int(height);
+            float* cell = state.current[i];
+            if (history) {
+                cell[3] = Fast::AdvanceFogFlowPresence(shifted[i][3], cell[1], cell[2], elapsed);
+            } else {
+                cell[3] = Fast::FogFlowPresenceTarget(cell[1], cell[2]);
+                state.previous[i][3] = cell[3]; // no history: start at the target instead of ramping from 0
+            }
+        }
+    }
     std::copy_n(volume.detailBounds, 4, state.bounds);
     state.width = width;
     state.height = height;
@@ -3977,10 +4005,18 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         constants.parameters[7][3] = 1.0f;
         if (mFogNoiseView) {
             // Flow-map clock in cycles of 120/240 ticks, wrapped at 64 cycles (the noise period) on a whole tick.
-            // Long cycles avoid rapid crossfade churn while keeping smooth motion when wind is non-zero.
+            // Long cycles avoid rapid crossfade churn while keeping smooth motion when wind is non-zero, but the
+            // phase offset (velocity x time into the cycle) grows with the cycle, so a changing velocity slides the
+            // detail further. A/B knob for the nested grid: gDeveloperTools.FogFlowCycleTicks (0 = 240).
             const bool nested = (flow->flags & FAST_FOG_FLOW_CPU_FIELD) && volume.detailGrid[0] >= 2.0f &&
                                 volume.detailGrid[1] >= 2.0f;
-            const uint32_t cycleTicks = nested ? 240u : 120u;
+            const int requestedCycle =
+                nested ? Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(FogFlowCycleTicksCVar, 0)
+                       : 0;
+            const uint32_t cycleTicks = !nested ? 120u
+                                        : requestedCycle > 0
+                                            ? static_cast<uint32_t>(std::clamp(requestedCycle, 36, 480))
+                                            : 240u;
             const double ticks = double(flow->tick % (64u * cycleTicks)) + double(fieldFraction);
             constants.visual[1] = 1.0f;
             constants.visual[2] = float(std::fmod(ticks / double(cycleTicks), 64.0));
@@ -4079,7 +4115,28 @@ void GfxRenderingAPIDX11::DrawFogVolume(const FastFogVolume& volume, const FastF
         constants.detailGrid[0] = volume.detailGrid[0];
         constants.detailGrid[1] = volume.detailGrid[1];
         constants.detailGrid[2] = volume.detailGrid[2];
-        constants.detailGrid[3] = 1.0f;
+        // Detail advection cap (FlowDetail in fog_volume_shader.h), in u per cycle. Defined as a speed so the cycle
+        // length does not change it: the default keeps the old 120 u per 72-tick cycle (~33 u/s at 20 Hz). A mod tunes
+        // it with a session override (fast/render_overrides.h), which never reaches the saved config; without one,
+        // gDeveloperTools.FogFlowDetailMaxSpeed (u/s, 0 = default) applies. At least 1 u keeps w > 0.5.
+        const float tickSeconds = std::max(flow->dt, 0.001f);
+        int32_t requestedSpeed = 0;
+        const bool speedOverride = Fast::GetRenderIntOverride(FogFlowDetailMaxSpeedCVar, requestedSpeed);
+        if (!speedOverride) {
+            requestedSpeed =
+                Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(FogFlowDetailMaxSpeedCVar, 0);
+        }
+        const float maxSpeed =
+            requestedSpeed > 0
+                ? static_cast<float>(std::clamp(requestedSpeed, FogFlowDetailMinSpeed, FogFlowDetailMaxSpeedLimit))
+                : FogFlowDetailDefaultShift / (FogFlowDetailDefaultTicks * tickSeconds);
+        constants.detailGrid[3] = std::max(maxSpeed * constants.visual[3], 1.0f);
+        thread_local float lastMaxSpeed = 0.0f;
+        if (maxSpeed != lastMaxSpeed) {
+            SPDLOG_INFO("Fast3D fog detail flow cap {:.1f} u/s ({:.0f} u per cycle, requested={}, source={})", maxSpeed,
+                        constants.detailGrid[3], requestedSpeed, speedOverride ? "override" : "cvar");
+            lastMaxSpeed = maxSpeed;
+        }
         if (!gFogDetail.logged) {
             gFogDetail.logged = true;
             SPDLOG_INFO("Fast3D fog detail grid {}x{} blend={:.1f}", state.width, state.height, volume.detailGrid[2]);

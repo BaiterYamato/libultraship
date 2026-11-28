@@ -64,7 +64,7 @@ cbuffer FogConstants : register(b0) {
     float4 sunProjection[4];
     float4 sunRadiance;
     float4 detailBounds; // x min, z min, x max, z max of the nested fine grid
-    float4 detailGrid;   // width, depth, blend band, enabled
+    float4 detailGrid;   // width, depth, blend band, flow cap in u per cycle (> 0.5 = nested grid on)
     float4 solarStyle;   // x: Kokiri upper fog sunlight gain, y: canopy shaft strength
     float4 upscaleTuning; // x: upscale tolerance mode (gDeveloperTools.FogUpscaleTolerance), y: heatmap (FogUpscaleHeatmap)
 };
@@ -352,33 +352,38 @@ float2 AmbientFlowWind() { return detailGrid.w > 0.5 ? float2(0.0, 0.0) : FogFlo
 // Limitar a variacao local entre nos vizinhos evita dobras na bilinear sem frear o vento uniforme da cena.
 static const float FogFlowMaxCellShift = 1.5;
 
+// The reference each node is limited against must not depend on which cell the sample falls in. A per-cell mean
+// gives the same node two values on the two sides of an edge: the flow map jumps at every cell border wherever the
+// limit acts (the wake behind a walking Link), and the advected detail shows rectangular plates that flicker as the
+// wake moves. A 2x2-cell tent of filtered samples is continuous across edges and still follows the uniform wind.
+float2 FineFlowReference(float2 fineCell) {
+    float2 last = detailGrid.xy - 1.0;
+    float2 reference = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        float2 tap = clamp(fineCell + float2((i & 1) ? 0.5 : -0.5, (i & 2) ? 0.5 : -0.5), 0.0, last);
+        reference += detailField.SampleLevel(fogSampler, (tap + 0.5) / 128.0, 0.0).yz; // FAST_FOG_DETAIL_SIDE
+    }
+    return 0.25 * reference;
+}
+
 float2 FineFlowVelocity(float2 fineCell) {
     float2 cellSize = (detailBounds.zw - detailBounds.xy) / (detailGrid.xy - 1.0);
     float maxDiffSpeed = FogFlowMaxCellShift * min(cellSize.x, cellSize.y) / visual.w;
     int2 base = int2(floor(fineCell));
     float2 fraction = frac(fineCell);
-    float2 v[4];
-    float2 weights[4];
-    float2 meanVel = 0.0;
+    float2 reference = FineFlowReference(fineCell);
+    float2 result = 0.0;
     [unroll]
     for (int z = 0; z < 2; ++z) {
         [unroll]
         for (int x = 0; x < 2; ++x) {
             int2 coord = min(base + int2(x, z), int2(detailGrid.xy) - 1);
-            int idx = z * 2 + x;
-            v[idx] = detailField.Load(int3(coord, 0)).yz;
-            weights[idx] = 1.0 - abs(float2(x, z) - fraction);
-            meanVel += v[idx];
+            float2 diff = detailField.Load(int3(coord, 0)).yz - reference;
+            float scale = maxDiffSpeed / max(length(diff), maxDiffSpeed);
+            float2 weight = 1.0 - abs(float2(x, z) - fraction);
+            result += (reference + diff * scale) * weight.x * weight.y;
         }
-    }
-    meanVel *= 0.25;
-    float2 result = 0.0;
-    [unroll]
-    for (int i = 0; i < 4; ++i) {
-        float2 diff = v[i] - meanVel;
-        float diffSpeed = length(diff);
-        float scale = maxDiffSpeed / max(diffSpeed, maxDiffSpeed);
-        result += (meanVel + diff * scale) * weights[i].x * weights[i].y;
     }
     return result;
 }
@@ -410,16 +415,20 @@ FlowPhases FogFlowPhases() {
     return f;
 }
 
-void FlowDetail(float2 world, float2 velocity, FlowPhases f, float cloudScale, float detailScale, float warpScale,
-                float2 warp, out float cloud, out float detail) {
+// presence: weight of the flowing noise against the static one. A negative value derives it from the speed; the
+// nested grid passes the host's per-cell weight (detailField.w), which a weak flow can only move slowly, so the
+// pressure answer to Link's first step does not swap the two patterns across the whole window in one tick.
+void FlowDetail(float2 world, float2 velocity, float presence, FlowPhases f, float cloudScale, float detailScale,
+                float warpScale, float2 warp, out float cloud, out float detail) {
     if (detailGrid.w > 0.5) {
-        // Longer cycle with the nested grid: cap the shift per cycle so a slash (100+ u/s) does not smear the
-        // noise across the hole, while the eddy it leaves (15-40 u/s) still turns the detail; the density field
-        // carries the real motion either way.
+        // Nested grid: cap the detail advection speed so a slash (100+ u/s) does not smear the noise across the
+        // hole. detailGrid.w is the cap in u per cycle (speed cap x seconds per cycle), so the speed cap holds
+        // whatever the cycle length; the default (~33 u/s, the old 120 u per 72-tick cycle) lets the eddy the
+        // slash leaves (15-40 u/s) turn the detail. The density field carries the real motion either way.
         float shift = length(velocity) * visual.w;
-        velocity *= min(1.0, 120.0 / max(shift, 0.001));
+        velocity *= min(1.0, detailGrid.w / max(shift, 0.001));
     }
-    float flowBlend = smoothstep(0.05, 0.4, length(velocity));
+    float flowBlend = presence >= 0.0 ? saturate(presence) : smoothstep(0.05, 0.4, length(velocity));
     float flowCloud = 0.0, flowDetail = 0.0;
     [branch]
     if (flowBlend > 0.0) {
@@ -619,6 +628,7 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
             float2 textureUv = (sampleCell + 0.5) / float2(textureWidth, textureHeight);
             float4 cell = fogField.SampleLevel(fogSampler, textureUv, 0.0);
             float2 flowVelocity = cell.zw + AmbientFlowWind();
+            float flowPresence = -1.0;
             density = clamp(cell.x, 0.0, 1.5);
             floorY = cell.y / max(cell.x, 0.0001);
             thickness = grid.z;
@@ -636,8 +646,13 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                     float4 fine = detailField.SampleLevel(fogSampler, (fineCell + 0.5) / 128.0, 0.0); // FAST_FOG_DETAIL_SIDE
                     density = lerp(density, clamp(fine.x, 0.0, 1.5), fineWeight);
                     cell.zw = lerp(cell.zw, fine.yz, fineWeight);
-                    if (visual.y > 0.0)
+                    if (visual.y > 0.0) {
+                        // The main grid keeps FlowDetail's speed ramp on its share of the blended velocity, so at rest
+                        // the blend band looks as before; the fine share is the host's weight.
+                        float mainPresence = smoothstep(0.05, 0.4, length(flowVelocity) * (1.0 - fineWeight));
                         flowVelocity = lerp(flowVelocity, FineFlowVelocity(fineCell), fineWeight);
+                        flowPresence = max(mainPresence, fine.w * fineWeight);
+                    }
                 }
             }
             [branch]
@@ -651,8 +666,8 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                     wideWeight = 1.0 - smoothstep(420.0, 980.0, distance);
                     [branch]
                     if (wideWeight > 0.0) {
-                        FlowDetail(samplePoint.xz, flowVelocity, FogFlowPhases(), 0.009, 0.021, 0.4, 0.0,
-                                   wideCloud, wideDetail);
+                        FlowDetail(samplePoint.xz, flowVelocity, flowPresence, FogFlowPhases(), 0.009, 0.021, 0.4,
+                                   0.0, wideCloud, wideDetail);
                         thickness *= 1.0 + wideWeight * (0.26 * wideCloud + 0.12 * wideDetail);
                     }
                 }
@@ -689,7 +704,7 @@ float4 March(float3 ray, float zView, float offset, int steps, out float sunligh
                     float cloud = 0.0, detail = 0.0;
                     [branch]
                     if (detailWeight > 0.0) {
-                        FlowDetail(samplePoint.xz, flowVelocity, phases, 0.015, 0.032, 0.45,
+                        FlowDetail(samplePoint.xz, flowVelocity, flowPresence, phases, 0.015, 0.032, 0.45,
                                    float2(0.032, -0.021) * heightScale, cloud, detail);
                     }
                     float ribbon = saturate(0.5 + detailWeight * (0.30 * cloud + 0.16 * detail));
